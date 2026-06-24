@@ -2,7 +2,7 @@ import os
 from flask import Flask, request
 from threading import Thread
 from dotenv import load_dotenv
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from groq import Groq
 
@@ -32,13 +32,10 @@ SYSTEM_PROMPT = """
 """
 
 # =========================
-# TELEGRAM APP (no polling!)
+# TELEGRAM BOT (no polling)
 # =========================
 app_telegram = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-# =========================
-# HANDLERS
-# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привіт 👋 Я AI-бот з пам'яттю.")
 
@@ -59,9 +56,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=user_history[user_id],
             temperature=0.7
         )
-
         answer = response.choices[0].message.content
-
     except Exception as e:
         answer = f"AI error: {str(e)}"
 
@@ -69,20 +64,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(answer)
 
-# register handlers
 app_telegram.add_handler(CommandHandler("start", start))
 app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 # =========================
-# FLASK WEB SERVER (Render needs this)
+# FLASK SERVER (Render entry point)
 # =========================
 flask_app = Flask(__name__)
 
-@app.route("/")
+@flask_app.route("/")
 def home():
     return "Bot is running"
 
-@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
+@flask_app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), app_telegram.bot)
     app_telegram.update_queue.put_nowait(update)
@@ -93,16 +87,14 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=port)
 
 # =========================
-# START EVERYTHING
+# START
 # =========================
 if __name__ == "__main__":
     print("Bot starting...")
 
-    # start telegram app (no polling!)
     app_telegram.initialize()
     app_telegram.start()
 
-    # start flask in background
     Thread(target=run_flask).start()
 
     print("Bot is running...")
