@@ -1,20 +1,9 @@
 import os
+from flask import Flask, request
 from threading import Thread
-from flask import Flask
-
-# FIX для Windows SSL
-os.environ["PYTHONHTTPSVERIFY"] = "0"
-
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
-
+from telegram import Update, Bot
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from groq import Groq
 
 # =========================
@@ -28,19 +17,6 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 print("GROQ LOADED:", GROQ_API_KEY is not None)
 
 # =========================
-# WEB SERVER FOR RENDER
-# =========================
-web_app = Flask(__name__)
-
-@web_app.route("/")
-def home():
-    return "Bot is running"
-
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
-
-# =========================
 # GROQ CLIENT
 # =========================
 client = Groq(api_key=GROQ_API_KEY)
@@ -52,44 +28,30 @@ user_history = {}
 
 SYSTEM_PROMPT = """
 Ти уважний, логічний і корисний AI-помічник.
-
-Правила:
-- Відповідай українською мовою
-- Давай чіткі та структуровані відповіді
-- Якщо не знаєш — прямо скажи
-- Не вигадуй факти
-- Якщо питання неясне — уточнюй
-- Пам’ятай контекст розмови
+Відповідай українською, чітко і без вигадок.
 """
 
 # =========================
-# START
+# TELEGRAM APP (no polling!)
+# =========================
+app_telegram = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+# =========================
+# HANDLERS
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привіт 👋 Я AI-бот з пам’яттю. Напиши щось."
-    )
+    await update.message.reply_text("Привіт 👋 Я AI-бот з пам'яттю.")
 
-# =========================
-# HANDLE MESSAGE
-# =========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     user_id = update.effective_chat.id
-    user_text = update.message.text
+    text = update.message.text
 
     if user_id not in user_history:
-        user_history[user_id] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
+        user_history[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    user_history[user_id].append(
-        {"role": "user", "content": user_text}
-    )
+    user_history[user_id].append({"role": "user", "content": text})
 
-    user_history[user_id] = (
-        user_history[user_id][:1] + user_history[user_id][-20:]
-    )
+    user_history[user_id] = user_history[user_id][:1] + user_history[user_id][-20:]
 
     try:
         response = client.chat.completions.create(
@@ -100,35 +62,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         answer = response.choices[0].message.content
 
-        user_history[user_id].append(
-            {"role": "assistant", "content": answer}
-        )
-
     except Exception as e:
         answer = f"AI error: {str(e)}"
 
+    user_history[user_id].append({"role": "assistant", "content": answer})
+
     await update.message.reply_text(answer)
 
+# register handlers
+app_telegram.add_handler(CommandHandler("start", start))
+app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
 # =========================
-# BOT START
+# FLASK WEB SERVER (Render needs this)
 # =========================
-app = (
-    ApplicationBuilder()
-    .token(TELEGRAM_TOKEN)
-    .concurrent_updates(False)
-    .build()
-)
+flask_app = Flask(__name__)
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle_message
-    )
-)
+@app.route("/")
+def home():
+    return "Bot is running"
 
-# Запускаємо вебсервер для Render
-Thread(target=run_web, daemon=True).start()
+@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), app_telegram.bot)
+    app_telegram.update_queue.put_nowait(update)
+    return "ok"
 
-print("Бот запущений...")
-app.run_polling()
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
+
+# =========================
+# START EVERYTHING
+# =========================
+if __name__ == "__main__":
+    print("Bot starting...")
+
+    # start telegram app (no polling!)
+    app_telegram.initialize()
+    app_telegram.start()
+
+    # start flask in background
+    Thread(target=run_flask).start()
+
+    print("Bot is running...")
