@@ -27,13 +27,28 @@ user_history = {}
 SYSTEM_PROMPT = "Ти корисний AI-помічник. Відповідай українською."
 
 # =========================
+# KEYBOARD
+# =========================
+MAIN_KEYBOARD = {
+    "keyboard": [
+        ["🛒 Покупки", "🧊 Запаси"],
+        ["🍽️ Що приготувати", "ℹ️ Допомога"]
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True
+}
+
+# =========================
 # FLASK APP
 # =========================
 app = Flask(__name__)
 
-def send_message(chat_id, text):
+def send_message(chat_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text})
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    requests.post(url, json=payload)
 
 @app.route("/")
 def home():
@@ -43,12 +58,71 @@ def home():
 def webhook():
     data = request.get_json()
 
-    if "message" not in data:
+    message = data.get("message")
+    if not message:
         return "ok"
 
-    chat_id = data["message"]["chat"]["id"]
-    text = data["message"].get("text", "")
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "")
 
+    if not text:
+        return "ok"
+
+    # =========================
+    # COMMANDS & BUTTONS
+    # =========================
+    if text == "/start":
+        send_message(
+            chat_id,
+            "Привіт! Я твій домашній помічник 🏠\n\n"
+            "Обери дію на клавіатурі або напиши будь-яке запитання — я відповім за допомогою AI.",
+            reply_markup=MAIN_KEYBOARD
+        )
+        return "ok"
+
+    if text == "/menu":
+        send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
+        return "ok"
+
+    if text == "/help":
+        send_message(
+            chat_id,
+            "ℹ️ Як користуватися ботом:\n\n"
+            "🛒 Покупки — список покупок (буде реалізовано)\n"
+            "🧊 Запаси — що є вдома (буде реалізовано)\n"
+            "🍽️ Що приготувати — ідеї страв на основі запасів\n"
+            "ℹ️ Допомога — ця інструкція\n\n"
+            "Будь-яке звичайне повідомлення надсилається AI і ти отримаєш відповідь."
+        )
+        return "ok"
+
+    if text == "🛒 Покупки":
+        send_message(chat_id, "Список покупок буде реалізований наступним етапом.")
+        return "ok"
+
+    if text == "🧊 Запаси":
+        send_message(chat_id, "Облік запасів буде доданий після підключення постійної бази даних.")
+        return "ok"
+
+    if text == "🍽️ Що приготувати":
+        send_message(chat_id, "Напиши, які продукти зараз є вдома, і я запропоную кілька страв.")
+        return "ok"
+
+    if text == "ℹ️ Допомога":
+        send_message(
+            chat_id,
+            "ℹ️ Як користуватися ботом:\n\n"
+            "🛒 Покупки — список покупок (буде реалізовано)\n"
+            "🧊 Запаси — що є вдома (буде реалізовано)\n"
+            "🍽️ Що приготувати — ідеї страв на основі запасів\n"
+            "ℹ️ Допомога — ця інструкція\n\n"
+            "Будь-яке звичайне повідомлення надсилається AI і ти отримаєш відповідь."
+        )
+        return "ok"
+
+    # =========================
+    # GROQ AI
+    # =========================
     if chat_id not in user_history:
         user_history[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
