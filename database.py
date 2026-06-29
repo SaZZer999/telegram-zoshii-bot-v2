@@ -144,3 +144,32 @@ def delete_active_item(household_id, item_number):
             )
         conn.commit()
     return item["name"]
+
+def mark_item_by_id(item_id, completed_by_user_id):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE shopping_items
+                SET is_completed = TRUE,
+                    completed_by_user_id = %s,
+                    completed_at = NOW()
+                WHERE id = %s AND is_completed = FALSE
+                RETURNING name
+                """,
+                (completed_by_user_id, item_id)
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return row[0] if row else None
+
+def delete_item_by_id(item_id):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM shopping_items WHERE id = %s AND is_completed = FALSE RETURNING name",
+                (item_id,)
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return row[0] if row else None
