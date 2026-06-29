@@ -12,9 +12,12 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+_raw_allowed = os.getenv("ALLOWED_USER_IDS", "")
+ALLOWED_USER_IDS = set(int(i.strip()) for i in _raw_allowed.split(",") if i.strip().isdigit())
 
 print("GROQ LOADED:", GROQ_API_KEY is not None)
 print("GEMINI LOADED:", GEMINI_API_KEY is not None)
+print("ACCESS RESTRICTED:", bool(ALLOWED_USER_IDS))
 
 # =========================
 # AI CLIENTS
@@ -113,6 +116,20 @@ def webhook():
     text = message.get("text", "")
 
     if not text:
+        return "ok"
+
+    user_id = message.get("from", {}).get("id")
+
+    # /myid works for everyone, before access check
+    if text == "/myid":
+        send_message(chat_id, f"Твій Telegram ID: {user_id}")
+        return "ok"
+
+    # =========================
+    # ACCESS CHECK
+    # =========================
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        send_message(chat_id, "Цей бот приватний і доступний лише для дозволених користувачів.")
         return "ok"
 
     # =========================
