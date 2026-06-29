@@ -11,20 +11,36 @@ load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 print("GROQ LOADED:", GROQ_API_KEY is not None)
+print("GEMINI LOADED:", GEMINI_API_KEY is not None)
 
 # =========================
-# AI CLIENT
+# AI CLIENTS
 # =========================
 client = Groq(api_key=GROQ_API_KEY)
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
 # =========================
 # MEMORY
 # =========================
 user_history = {}
+waiting_for_ingredients = {}
 
 SYSTEM_PROMPT = "Ти корисний AI-помічник. Відповідай українською."
+
+COOKING_SYSTEM_PROMPT = (
+    "Ти кулінарний помічник. Користувач надсилає перелік продуктів, які є вдома. "
+    "Запропонуй максимум 3 реалістичні страви з цих продуктів. "
+    "Якщо є м'ясо, риба, яйця, сир, вершки або овочі — не пропонуй десерт, якщо користувач прямо не просить солодке. "
+    "«Сливки» поруч із куркою, сиром або м'ясом трактуй як вершки. "
+    "Не вигадуй продукти, яких немає в списку, крім солі, перцю, олії та води. "
+    "Для кожної страви вкажи: назву, короткі кроки приготування, приблизний час. "
+    "Не радь мити сиру курку або іншу сиру птицю під краном. "
+    "Відповідай природною українською мовою."
+)
 
 # =========================
 # KEYBOARD
@@ -50,6 +66,34 @@ def send_message(chat_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     requests.post(url, json=payload)
 
+def call_gemini(history, system_prompt, temperature=0.7):
+    if not GEMINI_API_KEY:
+        return None
+    contents = []
+    for msg in history:
+        role = "model" if msg["role"] == "assistant" else "user"
+        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+    payload = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": contents,
+        "generationConfig": {"temperature": temperature}
+    }
+    try:
+        resp = requests.post(
+            GEMINI_URL,
+            headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+            json=payload,
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        if not text or not text.strip():
+            return None
+        return text.strip()
+    except Exception:
+        return None
+
 @app.route("/")
 def home():
     return "Bot is running"
@@ -72,6 +116,7 @@ def webhook():
     # COMMANDS & BUTTONS
     # =========================
     if text == "/start":
+        waiting_for_ingredients.pop(chat_id, None)
         send_message(
             chat_id,
             "Привіт! Я твій домашній помічник 🏠\n\n"
@@ -81,6 +126,7 @@ def webhook():
         return "ok"
 
     if text == "/menu":
+        waiting_for_ingredients.pop(chat_id, None)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -105,6 +151,7 @@ def webhook():
         return "ok"
 
     if text == "🍽️ Що приготувати":
+        waiting_for_ingredients[chat_id] = True
         send_message(chat_id, "Напиши, які продукти зараз є вдома, і я запропоную кілька страв.")
         return "ok"
 
@@ -121,7 +168,32 @@ def webhook():
         return "ok"
 
     # =========================
-    # GROQ AI
+    # COOKING MODE
+    # =========================
+    if waiting_for_ingredients.pop(chat_id, False):
+        answer = call_gemini(
+            [{"role": "user", "content": text}],
+            COOKING_SYSTEM_PROMPT,
+            temperature=0.4
+        )
+        if answer is None:
+            try:
+                resp = client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[
+                        {"role": "system", "content": COOKING_SYSTEM_PROMPT},
+                        {"role": "user", "content": text}
+                    ],
+                    temperature=0.4
+                )
+                answer = resp.choices[0].message.content
+            except Exception:
+                answer = "Не вдалося отримати відповідь. Спробуй ще раз."
+        send_message(chat_id, answer)
+        return "ok"
+
+    # =========================
+    # AI (Gemini primary → Groq fallback)
     # =========================
     if chat_id not in user_history:
         user_history[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -129,17 +201,22 @@ def webhook():
     user_history[chat_id].append({"role": "user", "content": text})
     user_history[chat_id] = user_history[chat_id][:1] + user_history[chat_id][-20:]
 
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=user_history[chat_id],
-            temperature=0.7
-        )
+    gemini_history = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in user_history[chat_id][1:]
+    ]
+    answer = call_gemini(gemini_history, SYSTEM_PROMPT)
 
-        answer = response.choices[0].message.content
-
-    except Exception as e:
-        answer = f"AI error: {str(e)}"
+    if answer is None:
+        try:
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=user_history[chat_id],
+                temperature=0.7
+            )
+            answer = resp.choices[0].message.content
+        except Exception as e:
+            answer = f"AI error: {str(e)}"
 
     user_history[chat_id].append({"role": "assistant", "content": answer})
 
