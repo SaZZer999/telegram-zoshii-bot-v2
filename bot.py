@@ -3,6 +3,7 @@ from flask import Flask, request
 from dotenv import load_dotenv
 from groq import Groq
 import requests
+from database import init_db
 
 # =========================
 # ENV
@@ -18,6 +19,12 @@ ALLOWED_USER_IDS = set(int(i.strip()) for i in _raw_allowed.split(",") if i.stri
 print("GROQ LOADED:", GROQ_API_KEY is not None)
 print("GEMINI LOADED:", GEMINI_API_KEY is not None)
 print("ACCESS RESTRICTED:", bool(ALLOWED_USER_IDS))
+
+try:
+    init_db()
+    print("DATABASE READY: True")
+except Exception:
+    print("DATABASE READY: False")
 
 # =========================
 # AI CLIENTS
