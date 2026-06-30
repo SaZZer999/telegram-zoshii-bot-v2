@@ -148,8 +148,8 @@ SELECTION_PROMPT = (
     "- Якщо нічого не підходить — відповідай {\"selected_numbers\": []}\n"
 )
 
-MERGE_DETECT_PROMPT = (
-    "Ти аналізуєш список товарів з унікальними id і визначаєш:\n"
+INTENT_ROUTER_PROMPT = (
+    "Ти аналізуєш список товарів і визначаєш:\n"
     "1. Чи хоче користувач об'єднати однакові або дублюючі позиції?\n"
     "2. Якщо так — які позиції можна безпечно об'єднати?\n\n"
     "Фрази об'єднання: «об'єднай», «злий дублікати», «прибери дублікати», «згрупуй повтори», "
@@ -162,11 +162,11 @@ MERGE_DETECT_PROMPT = (
     "- Якщо обидві порожні → merged_quantity_text = \"\"\n"
     "- Не об'єднуй: різні важливі уточнення в назві («Вершки 18%» і «Вершки 30%»), різні одиниці\n"
     "- Не вигадуй кількості\n"
-    "- У item_ids вказуй числа id із рядків у форматі «id=N»\n\n"
-    "Якщо користувач НЕ просить об'єднати → {\"merge_groups\": []}\n"
-    "Якщо просить, але безпечних дублікатів немає → {\"merge_groups\": []}\n\n"
+    "- У item_refs вказуй числа з рядків у форматі «#N»\n\n"
+    "Якщо користувач НЕ просить об'єднати → {\"intent\": \"none\", \"merge_groups\": []}\n"
+    "Якщо просить, але безпечних дублікатів немає → {\"intent\": \"merge_duplicates\", \"merge_groups\": []}\n\n"
     "Відповідай ТІЛЬКИ валідним JSON без жодного тексту:\n"
-    "{\"merge_groups\": [{\"item_ids\": [101, 102], \"merged_name\": \"Вершки\", \"merged_quantity_text\": \"\", \"merged_category\": \"Молочне та яйця\"}]}"
+    "{\"intent\": \"merge_duplicates\", \"merge_groups\": [{\"item_refs\": [1, 2], \"merged_name\": \"Вершки\", \"merged_quantity_text\": \"\", \"merged_category\": \"Молочне та яйця\"}]}"
 )
 
 # =========================
@@ -412,22 +412,71 @@ def _compute_merged_quantity(merge_items):
 # MERGE HELPERS
 # =========================
 
-def _validate_merge_groups(raw_groups, items_by_id):
-    """Validate Gemini merge suggestions against the loaded item list.
+def _auto_merge_in_place(items):
+    """Merge duplicate items within a pending list (pure Python, no Gemini).
 
-    Returns validated groups with Python-computed quantities.
+    Groups by (lowercase name, category). Compatible quantities are summed.
+    Incompatible quantities block the merge — those items stay separate.
+    """
+    from collections import OrderedDict
+    seen = OrderedDict()
+    for item in items:
+        key = (item["name"].strip().lower(), item.get("category") or DEFAULT_CATEGORY)
+        seen.setdefault(key, []).append(item)
+    result = []
+    for group in seen.values():
+        if len(group) == 1:
+            result.append(group[0])
+            continue
+        merged_qty = _compute_merged_quantity(group)
+        if merged_qty is None:
+            result.extend(group)
+            continue
+        merged = dict(group[0])
+        merged["quantity_text"] = merged_qty
+        result.append(merged)
+    return result
+
+
+def _apply_pending_merge(items, validated_groups):
+    """Apply merge groups to a pending RAM list. Returns new filtered list."""
+    items = list(items)
+    for group in validated_groups:
+        indices = group["item_indices"]
+        main_idx = indices[0]
+        if main_idx >= len(items) or items[main_idx] is None:
+            continue
+        items[main_idx] = dict(items[main_idx])
+        items[main_idx]["name"] = group["merged_name"]
+        items[main_idx]["quantity_text"] = group["merged_quantity_text"]
+        items[main_idx]["category"] = group["merged_category"]
+        for idx in indices[1:]:
+            if idx < len(items):
+                items[idx] = None
+    return [it for it in items if it is not None]
+
+
+def _validate_merge_groups(raw_groups, items_list, is_pending=False):
+    """Validate Gemini merge suggestions against an ordered item list.
+
+    raw_groups use sequential item_refs (#1, #2, ...).
+    is_pending=True  → store item_indices (0-based list indices).
+    is_pending=False → store item_ids (actual DB ids).
     """
     validated = []
+    used_refs = set()
+    items_by_ref = {i + 1: items_list[i] for i in range(len(items_list))}
     for group in raw_groups:
-        ids = group.get("item_ids")
-        if not isinstance(ids, list) or len(ids) < 2:
+        refs = group.get("item_refs")
+        if not isinstance(refs, list) or len(refs) < 2:
             continue
         try:
-            ids = [int(i) for i in ids]
+            refs = [int(r) for r in refs]
         except (TypeError, ValueError):
             continue
-
-        merge_items = [items_by_id.get(i) for i in ids]
+        if any(r in used_refs for r in refs):
+            continue
+        merge_items = [items_by_ref.get(r) for r in refs]
         if any(m is None for m in merge_items):
             continue
 
@@ -448,33 +497,36 @@ def _validate_merge_groups(raw_groups, items_by_id):
         if merged_qty is None:
             continue
 
-        validated.append({
-            "item_ids": ids,
+        used_refs.update(refs)
+        entry = {
             "merged_name": merged_name,
             "merged_quantity_text": merged_qty,
             "merged_category": merged_category,
             "items": merge_items,
-        })
+        }
+        if is_pending:
+            entry["item_indices"] = [r - 1 for r in refs]
+        else:
+            entry["item_ids"] = [item["id"] for item in merge_items]
+        validated.append(entry)
     return validated
 
-def _ask_gemini_for_merge(user_text, items):
-    """One Gemini call: detect merge intent AND return merge groups.
 
-    Returns raw list (may be empty — no intent or no duplicates).
-    """
+def _ask_gemini_intent_router(user_text, items):
+    """One Gemini call: detect merge intent and return merge groups (sequential #N refs)."""
     if len(items) < 2:
-        return []
+        return {"intent": "none", "merge_groups": []}
     lines = []
-    for item in items:
-        label = f"id={item['id']}. {item['name']}"
+    for i, item in enumerate(items):
+        label = f"#{i + 1}. {item['name']}"
         if item.get("quantity_text"):
             label += f" — {item['quantity_text']}"
         label += f" [{item.get('category') or DEFAULT_CATEGORY}]"
         lines.append(label)
     prompt = "Список:\n" + "\n".join(lines) + f"\n\nКористувач написав: {user_text}"
-    raw = call_gemini([{"role": "user", "content": prompt}], MERGE_DETECT_PROMPT, temperature=0.1)
+    raw = call_gemini([{"role": "user", "content": prompt}], INTENT_ROUTER_PROMPT, temperature=0.1)
     if not raw:
-        return []
+        return {"intent": "none", "merge_groups": []}
     cleaned = raw.strip()
     if "```" in cleaned:
         m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
@@ -482,10 +534,13 @@ def _ask_gemini_for_merge(user_text, items):
             cleaned = m.group(1).strip()
     try:
         data = json.loads(cleaned)
-        groups = data.get("merge_groups")
-        return groups if isinstance(groups, list) else []
+        return {
+            "intent": data.get("intent", "none"),
+            "merge_groups": data.get("merge_groups") if isinstance(data.get("merge_groups"), list) else [],
+        }
     except (json.JSONDecodeError, ValueError, TypeError):
-        return []
+        return {"intent": "none", "merge_groups": []}
+
 
 def _format_merge_preview(validated_groups):
     lines = [f"🧹 Буде об'єднано груп: {len(validated_groups)}", ""]
@@ -499,7 +554,8 @@ def _format_merge_preview(validated_groups):
         result = group["merged_name"]
         if group["merged_quantity_text"]:
             result += f" — {group['merged_quantity_text']}"
-        lines.append(f"{i + 1}. {' + '.join(parts)} → {result}")
+        lines.append(f"{i + 1}. {' + '.join(parts)}")
+        lines.append(f"   → {result}")
     return "\n".join(lines)
 
 # =========================
@@ -660,15 +716,34 @@ def webhook():
         if chat_id in pending_merge:
             merge_data = pending_merge.pop(chat_id)
             list_type = merge_data["list_type"]
-            keyboard = SHOPPING_KEYBOARD if list_type == "shopping" else INVENTORY_KEYBOARD
-            try:
-                if list_type == "shopping":
-                    count = execute_merge_shopping(merge_data["household_id"], merge_data["groups"])
+            if list_type == "shopping_pending_add":
+                batch = pending_batch.get(chat_id)
+                if batch:
+                    batch["items"] = _apply_pending_merge(batch["items"], merge_data["groups"])
+                    preview = format_batch_preview(batch["items"], batch.get("ignored_items"))
+                    send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
                 else:
+                    send_message(chat_id, "Список вже не в пам'яті.", reply_markup=SHOPPING_KEYBOARD)
+            elif list_type == "inventory_pending_add":
+                batch = pending_inventory_batch.get(chat_id)
+                if batch:
+                    batch["items"] = _apply_pending_merge(batch["items"], merge_data["groups"])
+                    preview = format_inventory_preview(batch["items"], batch.get("ignored_items"))
+                    send_message(chat_id, preview, reply_markup=ADD_INVENTORY_PREVIEW_KEYBOARD)
+                else:
+                    send_message(chat_id, "Список вже не в пам'яті.", reply_markup=INVENTORY_KEYBOARD)
+            elif list_type == "shopping_saved":
+                try:
+                    count = execute_merge_shopping(merge_data["household_id"], merge_data["groups"])
+                    send_message(chat_id, f"✅ Об'єднано груп: {count}", reply_markup=SHOPPING_KEYBOARD)
+                except Exception:
+                    send_message(chat_id, "Не вдалося виконати об'єднання. Спробуйте ще раз.", reply_markup=SHOPPING_KEYBOARD)
+            elif list_type == "inventory_saved":
+                try:
                     count = execute_merge_inventory(merge_data["household_id"], merge_data["groups"])
-                send_message(chat_id, f"✅ Об'єднано груп: {count}", reply_markup=keyboard)
-            except Exception:
-                send_message(chat_id, "Не вдалося виконати об'єднання. Спробуйте ще раз.", reply_markup=keyboard)
+                    send_message(chat_id, f"✅ Об'єднано груп: {count}", reply_markup=INVENTORY_KEYBOARD)
+                except Exception:
+                    send_message(chat_id, "Не вдалося виконати об'єднання. Спробуйте ще раз.", reply_markup=INVENTORY_KEYBOARD)
         return "ok"
 
     if text == "✅ Додати все":
@@ -710,8 +785,24 @@ def webhook():
     if text == "❌ Скасувати":
         if chat_id in pending_merge:
             merge_data = pending_merge.pop(chat_id)
-            keyboard = SHOPPING_KEYBOARD if merge_data["list_type"] == "shopping" else INVENTORY_KEYBOARD
-            send_message(chat_id, "Об'єднання скасовано.", reply_markup=keyboard)
+            list_type = merge_data["list_type"]
+            if list_type == "shopping_pending_add":
+                batch = pending_batch.get(chat_id)
+                if batch:
+                    preview = format_batch_preview(batch["items"], batch.get("ignored_items"))
+                    send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
+                else:
+                    send_message(chat_id, "Об'єднання скасовано.", reply_markup=SHOPPING_KEYBOARD)
+            elif list_type == "inventory_pending_add":
+                batch = pending_inventory_batch.get(chat_id)
+                if batch:
+                    preview = format_inventory_preview(batch["items"], batch.get("ignored_items"))
+                    send_message(chat_id, preview, reply_markup=ADD_INVENTORY_PREVIEW_KEYBOARD)
+                else:
+                    send_message(chat_id, "Об'єднання скасовано.", reply_markup=INVENTORY_KEYBOARD)
+            else:
+                keyboard = SHOPPING_KEYBOARD if list_type == "shopping_saved" else INVENTORY_KEYBOARD
+                send_message(chat_id, "Об'єднання скасовано.", reply_markup=keyboard)
         elif chat_id in pending_inventory_batch:
             clear_inventory_state(chat_id)
             send_message(chat_id, "Додавання продуктів скасовано.", reply_markup=INVENTORY_KEYBOARD)
@@ -1011,6 +1102,7 @@ def webhook():
                 msg += "\n\nНе додано: " + ", ".join(ignored)
             send_message(chat_id, msg)
             return "ok"
+        items = _auto_merge_in_place(items)
         try:
             household_id, user_db_id = get_household_and_user(user_id, display_name)
             pending_batch[chat_id] = {
@@ -1115,6 +1207,7 @@ def webhook():
                 msg += "\n\nНе додано: " + ", ".join(ignored)
             send_message(chat_id, msg)
             return "ok"
+        items = _auto_merge_in_place(items)
         try:
             household_id, user_db_id = get_household_and_user(user_id, display_name)
             pending_inventory_batch[chat_id] = {
@@ -1148,38 +1241,68 @@ def webhook():
 
     # =========================
     # MERGE INTENT DETECTION
-    # Runs before cooking/AI chat when user is in shopping or inventory context
-    # and no specific mode is active. One Gemini call detects intent and returns
-    # merge groups. Empty result → not a merge request → fall through to AI chat.
+    # Case 1: pending shopping batch (RAM items, no DB access).
+    # Case 2: pending inventory batch (RAM items, no DB access).
+    # Case 3: saved list context (load from DB).
+    # intent=="merge_duplicates" → intercept; intent=="none" → fall through to AI chat.
     # =========================
-    ctx = active_list_context.get(chat_id)
-    if ctx in ("shopping", "inventory"):
+    _merge_intercepted = False
+    if chat_id in pending_batch and len(pending_batch[chat_id]["items"]) >= 2:
         try:
-            household_id, user_db_id = get_household_and_user(user_id, display_name)
-            list_items = (
-                get_active_shopping_items(household_id)
-                if ctx == "shopping"
-                else get_inventory_items(household_id)
-            )
-            if len(list_items) >= 2:
-                raw_groups = _ask_gemini_for_merge(text, list_items)
-                if raw_groups:
-                    items_by_id = {item["id"]: item for item in list_items}
-                    validated = _validate_merge_groups(raw_groups, items_by_id)
-                    if validated:
-                        pending_merge[chat_id] = {
-                            "groups": validated,
-                            "household_id": household_id,
-                            "user_db_id": user_db_id,
-                            "list_type": ctx,
-                        }
-                        send_message(chat_id, _format_merge_preview(validated), reply_markup=MERGE_PREVIEW_KEYBOARD)
-                        return "ok"
-                    else:
-                        send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
-                        return "ok"
+            raw = _ask_gemini_intent_router(text, pending_batch[chat_id]["items"])
+            if raw["intent"] == "merge_duplicates":
+                _merge_intercepted = True
+                validated = _validate_merge_groups(raw["merge_groups"], pending_batch[chat_id]["items"], is_pending=True)
+                if validated:
+                    pending_merge[chat_id] = {"groups": validated, "list_type": "shopping_pending_add"}
+                    send_message(chat_id, _format_merge_preview(validated), reply_markup=MERGE_PREVIEW_KEYBOARD)
+                else:
+                    send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
         except Exception:
-            pass  # Fall through to AI chat on any error
+            pass
+    elif chat_id in pending_inventory_batch and len(pending_inventory_batch[chat_id]["items"]) >= 2:
+        try:
+            raw = _ask_gemini_intent_router(text, pending_inventory_batch[chat_id]["items"])
+            if raw["intent"] == "merge_duplicates":
+                _merge_intercepted = True
+                validated = _validate_merge_groups(raw["merge_groups"], pending_inventory_batch[chat_id]["items"], is_pending=True)
+                if validated:
+                    pending_merge[chat_id] = {"groups": validated, "list_type": "inventory_pending_add"}
+                    send_message(chat_id, _format_merge_preview(validated), reply_markup=MERGE_PREVIEW_KEYBOARD)
+                else:
+                    send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
+        except Exception:
+            pass
+    else:
+        ctx = active_list_context.get(chat_id)
+        if ctx in ("shopping", "inventory"):
+            try:
+                household_id, user_db_id = get_household_and_user(user_id, display_name)
+                list_items = (
+                    get_active_shopping_items(household_id)
+                    if ctx == "shopping"
+                    else get_inventory_items(household_id)
+                )
+                if len(list_items) >= 2:
+                    raw = _ask_gemini_intent_router(text, list_items)
+                    if raw["intent"] == "merge_duplicates":
+                        _merge_intercepted = True
+                        list_type = "shopping_saved" if ctx == "shopping" else "inventory_saved"
+                        validated = _validate_merge_groups(raw["merge_groups"], list_items, is_pending=False)
+                        if validated:
+                            pending_merge[chat_id] = {
+                                "groups": validated,
+                                "household_id": household_id,
+                                "user_db_id": user_db_id,
+                                "list_type": list_type,
+                            }
+                            send_message(chat_id, _format_merge_preview(validated), reply_markup=MERGE_PREVIEW_KEYBOARD)
+                        else:
+                            send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
+            except Exception:
+                pass
+    if _merge_intercepted:
+        return "ok"
 
     # =========================
     # COOKING MODE
