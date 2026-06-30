@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import difflib
 from flask import Flask, request
 from dotenv import load_dotenv
 from groq import Groq
@@ -10,14 +9,10 @@ from database import (
     init_db,
     get_or_create_household,
     get_or_create_user,
-    add_shopping_item,
     get_active_shopping_items,
-    mark_item_by_id,
-    delete_item_by_id,
     add_shopping_items_batch,
     get_inventory_items,
     add_inventory_items_batch,
-    delete_inventory_item_by_id,
     add_or_merge_inventory_item,
     mark_items_batch,
     delete_items_batch,
@@ -58,17 +53,13 @@ GEMINI_COOKING_URL = "https://generativelanguage.googleapis.com/v1beta/models/ge
 # =========================
 user_history = {}
 waiting_for_ingredients = {}
-shopping_mode = {}      # chat_id -> "adding" | "marking" | "deleting"
-pending_confirm = {}    # chat_id -> {action, item_id, item_name, item_quantity_text?, item_category?, household_id, user_db_id}
-pending_candidates = {} # chat_id -> {action, items, household_id, user_db_id}
-pending_batch = {}      # chat_id -> {items, ignored_items, household_id, user_db_id}
+shopping_mode = {}        # chat_id -> "adding" | "marking" | "deleting"
+pending_batch = {}        # chat_id -> {items, ignored_items, household_id, user_db_id}
 pending_mark_batch = {}   # chat_id -> {items, household_id, user_db_id}
 pending_delete_batch = {} # chat_id -> {items, household_id, user_db_id}
-inventory_mode = {}              # chat_id -> "adding" | "removing"
-pending_inventory_batch = {}     # chat_id -> {items, ignored_items, household_id, user_db_id}
-pending_inventory_confirm = {}   # chat_id -> {item_id, item_name, item_quantity_text, item_category, household_id, user_db_id}
-pending_inventory_candidates = {} # chat_id -> {items, household_id, user_db_id}
-pending_remove_batch = {}        # chat_id -> {items, household_id, user_db_id}
+inventory_mode = {}           # chat_id -> "adding" | "removing"
+pending_inventory_batch = {}  # chat_id -> {items, ignored_items, household_id, user_db_id}
+pending_remove_batch = {}     # chat_id -> {items, household_id, user_db_id}
 
 SYSTEM_PROMPT = "Ти корисний AI-помічник. Відповідай українською."
 
@@ -85,6 +76,7 @@ COOKING_SYSTEM_PROMPT = (
 
 DB_ERROR_MSG = "Не вдалося виконати дію зі списком покупок. Спробуйте ще раз трохи пізніше."
 INVENTORY_ERROR_MSG = "Не вдалося виконати дію із запасами. Спробуйте ще раз трохи пізніше."
+SELECTION_ERROR_MSG = "Не зміг точно зрозуміти, які товари ти маєш на увазі. Спробуй написати інакше."
 
 DEFAULT_CATEGORY = "Інше їстівне"
 
@@ -139,6 +131,19 @@ SHOPPING_PARSE_PROMPT = (
     '],"ignored_items":["Навушники"]}'
 )
 
+SELECTION_PROMPT = (
+    "Визнач, які позиції зі списку користувач хоче вибрати.\n"
+    "Правила інтерпретації:\n"
+    "- «всі», «все», «усе», «прибери все», «видали все», «все купив» тощо → всі номери списку\n"
+    "- «все крім X» або «залиш X, решту прибери» → всі номери, крім позицій, що відповідають X\n"
+    "- числа і діапазони: «1 2 3», «1-4», «2, 5-7» → відповідні номери\n"
+    "- назви або фрази → знайди відповідні позиції за назвою або змістом\n"
+    "Правила відповіді:\n"
+    "- Відповідай ТІЛЬКИ валідним JSON без жодного тексту: {\"selected_numbers\": [1, 3, 5]}\n"
+    "- Вказуй тільки номери, які є в списку; без дублікатів; за зростанням\n"
+    "- Якщо нічого не підходить — відповідай {\"selected_numbers\": []}\n"
+)
+
 # =========================
 # KEYBOARDS
 # =========================
@@ -159,12 +164,6 @@ SHOPPING_KEYBOARD = {
     ],
     "resize_keyboard": True,
     "is_persistent": True
-}
-
-CONFIRM_KEYBOARD = {
-    "keyboard": [["✅ Так", "❌ Ні"]],
-    "resize_keyboard": True,
-    "one_time_keyboard": True
 }
 
 ADD_PREVIEW_KEYBOARD = {
@@ -220,47 +219,6 @@ ADD_INVENTORY_PREVIEW_KEYBOARD = {
     "resize_keyboard": True,
     "one_time_keyboard": True,
 }
-
-# =========================
-# SYNONYM DICTIONARY
-# (easily extendable — keys and values must be lowercase)
-# =========================
-SYNONYMS = {
-    "сливки":    "вершки",
-    "вершки":    "вершки",
-    "яйца":      "яйця",
-    "яйця":      "яйця",
-    "картошка":  "картопля",
-    "картопля":  "картопля",
-    "лук":       "цибуля",
-    "цибуля":    "цибуля",
-    "помидори":  "помідори",
-    "помідори":  "помідори",
-    "сыр":       "сир",
-    "сир":       "сир",
-}
-
-_APOSTROPHE_RE = re.compile(r"[''`ʼ]")
-
-_ALL_PHRASES = {
-    "все", "усе", "всі",
-    "всі товари", "всі продукти",
-    "купив все", "купила все", "купили все", "куплено все",
-    "всі куплені", "всі продукти куплені", "все куплено",
-    "все купив", "все купила",
-    "все використав", "все використала",
-    "все прибрати",
-}
-
-SELECTION_PROMPT = (
-    "Визнач, які позиції зі списку користувач хоче вибрати на основі свого запиту.\n"
-    "Правила:\n"
-    "- Відповідай ТІЛЬКИ валідним JSON: {\"selected_numbers\": [1, 3, 5]}\n"
-    "- Вказуй тільки номери, які є в списку\n"
-    "- Без дублікатів, відсортовані за зростанням\n"
-    "- Якщо нічого підходящого — відповідай {\"selected_numbers\": []}\n"
-    "- Не вигадуй номерів, яких немає в списку\n"
-)
 
 # =========================
 # FLASK APP
@@ -355,8 +313,6 @@ def get_household_and_user(user_id, display_name=None):
 
 def clear_shopping_state(chat_id):
     shopping_mode.pop(chat_id, None)
-    pending_confirm.pop(chat_id, None)
-    pending_candidates.pop(chat_id, None)
     pending_batch.pop(chat_id, None)
     pending_mark_batch.pop(chat_id, None)
     pending_delete_batch.pop(chat_id, None)
@@ -364,74 +320,10 @@ def clear_shopping_state(chat_id):
 def clear_inventory_state(chat_id):
     inventory_mode.pop(chat_id, None)
     pending_inventory_batch.pop(chat_id, None)
-    pending_inventory_confirm.pop(chat_id, None)
-    pending_inventory_candidates.pop(chat_id, None)
     pending_remove_batch.pop(chat_id, None)
 
-def normalize_name(text):
-    text = _APOSTROPHE_RE.sub("'", text)
-    text = " ".join(text.split())
-    text = text.lower()
-    return SYNONYMS.get(text, text)
-
-def find_items_by_name(query, items):
-    """Returns (exact_matches, fuzzy_matches). Exact list is non-empty OR fuzzy list is."""
-    norm_query = normalize_name(query)
-    exact = [item for item in items if normalize_name(item["name"]) == norm_query]
-    if exact:
-        return exact, []
-    fuzzy = [
-        item for item in items
-        if difflib.SequenceMatcher(None, norm_query, normalize_name(item["name"])).ratio() >= 0.6
-    ]
-    return [], fuzzy
-
-def _is_all_phrase(text):
-    return text.strip().lower() in _ALL_PHRASES
-
-def _parse_number_ranges(text, total):
-    """Parse '1 2-4, 6' into sorted zero-based indices.
-
-    Returns:
-        sorted list of 0-based indices  — valid pure number/range input
-        "out_of_range"                  — purely numeric but some numbers outside 1..total
-        None                            — not a pure number/range pattern
-    """
-    cleaned = text.strip().replace(",", " ")
-    tokens = [t for t in cleaned.split() if t]
-    if not tokens:
-        return None
-    indices = set()
-    for token in tokens:
-        if "-" in token:
-            parts = token.split("-", 1)
-            if len(parts) != 2:
-                return None
-            try:
-                start, end = int(parts[0]), int(parts[1])
-            except ValueError:
-                return None
-            if start > end:
-                return "out_of_range"
-            if start < 1 or end > total:
-                return "out_of_range"
-            for i in range(start, end + 1):
-                indices.add(i - 1)
-        else:
-            try:
-                n = int(token)
-            except ValueError:
-                return None
-            if n < 1 or n > total:
-                return "out_of_range"
-            indices.add(n - 1)
-    return sorted(indices) if indices else None
-
-def _ask_gemini_for_selection(user_text, items, list_label="Список"):
-    """Ask Gemini which items the user wants to select.
-
-    Returns sorted zero-based index list or None on failure.
-    """
+def _ask_gemini_for_selection(user_text, items, list_label, action_label):
+    """Send list + user text to Gemini; return sorted zero-based index list or None."""
     lines = []
     for i, item in enumerate(items):
         label = f"{i + 1}. {item['name']}"
@@ -440,7 +332,11 @@ def _ask_gemini_for_selection(user_text, items, list_label="Список"):
         if item.get("category"):
             label += f" [{item['category']}]"
         lines.append(label)
-    prompt = f"{list_label}:\n" + "\n".join(lines) + f"\n\nКористувач написав: {user_text}"
+    prompt = (
+        f"{list_label} (дія: {action_label}):\n"
+        + "\n".join(lines)
+        + f"\n\nКористувач написав: {user_text}"
+    )
     raw = call_gemini([{"role": "user", "content": prompt}], SELECTION_PROMPT, temperature=0.1)
     if not raw:
         return None
@@ -472,8 +368,7 @@ def _show_mark_preview(chat_id, items, household_id, user_db_id):
         "household_id": household_id,
         "user_db_id": user_db_id,
     }
-    n = len(items)
-    preview = format_grouped_list(items, f"🛒 Буде позначено купленими: {n}")
+    preview = format_grouped_list(items, f"🛒 Буде позначено купленими: {len(items)}")
     send_message(chat_id, preview + "\n\nЩо зробити з цими товарами?", reply_markup=MARK_PREVIEW_KEYBOARD)
 
 def _show_delete_preview(chat_id, items, household_id, user_db_id):
@@ -482,8 +377,7 @@ def _show_delete_preview(chat_id, items, household_id, user_db_id):
         "household_id": household_id,
         "user_db_id": user_db_id,
     }
-    n = len(items)
-    preview = format_grouped_list(items, f"🗑️ Буде видалено зі списку покупок: {n}")
+    preview = format_grouped_list(items, f"🗑️ Буде видалено зі списку покупок: {len(items)}")
     send_message(chat_id, preview, reply_markup=DELETE_PREVIEW_KEYBOARD)
 
 def _show_remove_preview(chat_id, items, household_id, user_db_id):
@@ -492,8 +386,7 @@ def _show_remove_preview(chat_id, items, household_id, user_db_id):
         "household_id": household_id,
         "user_db_id": user_db_id,
     }
-    n = len(items)
-    preview = format_grouped_list(items, f"🧊 Буде прибрано із запасів: {n}")
+    preview = format_grouped_list(items, f"🧊 Буде прибрано із запасів: {len(items)}")
     send_message(chat_id, preview, reply_markup=REMOVE_PREVIEW_KEYBOARD)
 
 def parse_shopping_list_with_gemini(text):
@@ -585,50 +478,6 @@ def webhook():
     # =========================
     # COMMANDS & BUTTONS
     # =========================
-
-    # Confirmation buttons — must come before any clear_shopping_state calls
-    if text == "✅ Так":
-        if chat_id in pending_inventory_confirm:
-            confirm = pending_inventory_confirm.pop(chat_id)
-            try:
-                item = {
-                    "id": confirm["item_id"],
-                    "name": confirm["item_name"],
-                    "quantity_text": confirm.get("item_quantity_text", ""),
-                    "category": confirm.get("item_category", DEFAULT_CATEGORY),
-                }
-                _show_remove_preview(chat_id, [item], confirm["household_id"], confirm["user_db_id"])
-            except Exception:
-                send_message(chat_id, INVENTORY_ERROR_MSG)
-        elif chat_id in pending_confirm:
-            confirm = pending_confirm.pop(chat_id)
-            try:
-                item = {
-                    "id": confirm["item_id"],
-                    "name": confirm["item_name"],
-                    "quantity_text": confirm.get("item_quantity_text", ""),
-                    "category": confirm.get("item_category", DEFAULT_CATEGORY),
-                }
-                if confirm["action"] == "marking":
-                    _show_mark_preview(chat_id, [item], confirm["household_id"], confirm["user_db_id"])
-                else:
-                    _show_delete_preview(chat_id, [item], confirm["household_id"], confirm["user_db_id"])
-            except Exception:
-                send_message(chat_id, DB_ERROR_MSG)
-        return "ok"
-
-    if text == "❌ Ні":
-        if chat_id in pending_inventory_confirm:
-            confirm = pending_inventory_confirm.pop(chat_id)
-            if confirm.get("household_id"):
-                inventory_mode[chat_id] = "removing"
-            send_message(chat_id, "Добре. Напиши номер або назву продукту.")
-        elif chat_id in pending_confirm:
-            confirm = pending_confirm.pop(chat_id)
-            if confirm.get("action") in ("marking", "deleting") and confirm.get("household_id"):
-                shopping_mode[chat_id] = confirm["action"]
-            send_message(chat_id, "Добре. Напиши номер або назву товару.")
-        return "ok"
 
     if text == "✅ Додати все":
         if chat_id in pending_inventory_batch:
@@ -752,10 +601,7 @@ def webhook():
                 if not items:
                     send_message(chat_id, "Список покупок поки порожній.")
                 else:
-                    send_message(
-                        chat_id,
-                        format_shopping_list(items) + '\n\nНапиши "все", кілька номерів, назву або фразу про куплені товари:'
-                    )
+                    send_message(chat_id, format_shopping_list(items) + "\n\nНапиши, що саме купив:")
             except Exception:
                 send_message(chat_id, DB_ERROR_MSG)
         elif chat_id in pending_delete_batch:
@@ -766,10 +612,7 @@ def webhook():
                 if not items:
                     send_message(chat_id, "Список покупок поки порожній.")
                 else:
-                    send_message(
-                        chat_id,
-                        format_shopping_list(items) + '\n\nНапиши "все", кілька номерів або назву товарів для видалення:'
-                    )
+                    send_message(chat_id, format_shopping_list(items) + "\n\nНапиши, що видалити:")
             except Exception:
                 send_message(chat_id, DB_ERROR_MSG)
         elif chat_id in pending_remove_batch:
@@ -780,10 +623,7 @@ def webhook():
                 if not items:
                     send_message(chat_id, "Запаси поки порожні.")
                 else:
-                    send_message(
-                        chat_id,
-                        format_inventory_list(items) + '\n\nНапиши "все", кілька номерів або назву продуктів для видалення із запасів:'
-                    )
+                    send_message(chat_id, format_inventory_list(items) + "\n\nНапиши, що прибрати із запасів:")
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
@@ -812,7 +652,7 @@ def webhook():
             chat_id,
             "ℹ️ Як користуватися ботом:\n\n"
             "🛒 Покупки — спільний список покупок\n"
-            "🧊 Запаси — що є вдома (буде реалізовано)\n"
+            "🧊 Запаси — що є вдома\n"
             "🍽️ Що приготувати — ідеї страв на основі запасів\n"
             "ℹ️ Допомога — ця інструкція\n\n"
             "Будь-яке звичайне повідомлення надсилається AI і ти отримаєш відповідь."
@@ -850,10 +690,7 @@ def webhook():
             if not items:
                 send_message(chat_id, "Список покупок поки порожній.")
             else:
-                send_message(
-                    chat_id,
-                    format_shopping_list(items) + '\n\nНапиши "все", кілька номерів, назву або фразу про куплені товари:'
-                )
+                send_message(chat_id, format_shopping_list(items) + "\n\nНапиши, що купив:")
                 shopping_mode[chat_id] = "marking"
         except Exception:
             send_message(chat_id, DB_ERROR_MSG)
@@ -867,10 +704,7 @@ def webhook():
             if not items:
                 send_message(chat_id, "Список покупок поки порожній.")
             else:
-                send_message(
-                    chat_id,
-                    format_shopping_list(items) + '\n\nНапиши "все", кілька номерів, назву або фразу про товари для видалення:'
-                )
+                send_message(chat_id, format_shopping_list(items) + "\n\nНапиши, що видалити:")
                 shopping_mode[chat_id] = "deleting"
         except Exception:
             send_message(chat_id, DB_ERROR_MSG)
@@ -917,10 +751,7 @@ def webhook():
             if not items:
                 send_message(chat_id, "Запаси поки порожні.")
             else:
-                send_message(
-                    chat_id,
-                    format_inventory_list(items) + '\n\nНапиши "все", кілька номерів або назву продуктів для видалення із запасів:'
-                )
+                send_message(chat_id, format_inventory_list(items) + "\n\nНапиши, що прибрати із запасів:")
                 inventory_mode[chat_id] = "removing"
         except Exception:
             send_message(chat_id, INVENTORY_ERROR_MSG)
@@ -937,7 +768,7 @@ def webhook():
             chat_id,
             "ℹ️ Як користуватися ботом:\n\n"
             "🛒 Покупки — спільний список покупок\n"
-            "🧊 Запаси — що є вдома (буде реалізовано)\n"
+            "🧊 Запаси — що є вдома\n"
             "🍽️ Що приготувати — ідеї страв на основі запасів\n"
             "ℹ️ Допомога — ця інструкція\n\n"
             "Будь-яке звичайне повідомлення надсилається AI і ти отримаєш відповідь."
@@ -947,50 +778,6 @@ def webhook():
     # =========================
     # SHOPPING MODE
     # =========================
-
-    # Inventory candidates: user picks from a shortlist of fuzzy matches
-    if chat_id in pending_inventory_candidates:
-        cands = pending_inventory_candidates.pop(chat_id)
-        candidate_items = cands["items"]
-        try:
-            num = int(text.strip())
-            if num < 1 or num > len(candidate_items):
-                send_message(chat_id, "Такого номера немає. Напиши номер зі списку або повну назву продукту.")
-                pending_inventory_candidates[chat_id] = cands
-            else:
-                _show_remove_preview(
-                    chat_id,
-                    [candidate_items[num - 1]],
-                    cands["household_id"],
-                    cands["user_db_id"],
-                )
-        except ValueError:
-            send_message(chat_id, "Напиши число — номер зі списку варіантів:")
-            pending_inventory_candidates[chat_id] = cands
-        return "ok"
-
-    # Shopping candidates sub-list: user picks from a previously shown shortlist
-    if chat_id in pending_candidates:
-        cands = pending_candidates.pop(chat_id)
-        candidate_items = cands["items"]
-        action = cands["action"]
-        user_db_id = cands["user_db_id"]
-        try:
-            num = int(text.strip())
-            if num < 1 or num > len(candidate_items):
-                send_message(chat_id, "Такого номера немає у списку. Напиши номер зі списку або повну назву товару.")
-                pending_candidates[chat_id] = cands
-            else:
-                selected = candidate_items[num - 1]
-                if action == "marking":
-                    _show_mark_preview(chat_id, [selected], cands["household_id"], user_db_id)
-                else:
-                    _show_delete_preview(chat_id, [selected], cands["household_id"], user_db_id)
-        except ValueError:
-            send_message(chat_id, "Напиши число — номер зі списку варіантів:")
-            pending_candidates[chat_id] = cands
-        return "ok"
-
     mode = shopping_mode.pop(chat_id, None)
 
     if mode == "adding":
@@ -1065,51 +852,9 @@ def webhook():
             if not items:
                 send_message(chat_id, "Список покупок поки порожній.")
                 return "ok"
-            # 1. "All" phrases
-            if _is_all_phrase(text):
-                _show_mark_preview(chat_id, items, household_id, user_db_id)
-                return "ok"
-            # 2. Numbers / ranges
-            result = _parse_number_ranges(text, len(items))
-            if result == "out_of_range":
-                send_message(chat_id, f"Такий номер не існує. Напиши числа від 1 до {len(items)}.")
-                shopping_mode[chat_id] = "marking"
-                return "ok"
-            if result is not None:
-                _show_mark_preview(chat_id, [items[i] for i in result], household_id, user_db_id)
-                return "ok"
-            # 3. Exact or fuzzy name match
-            exact, fuzzy = find_items_by_name(text, items)
-            if exact:
-                _show_mark_preview(chat_id, exact, household_id, user_db_id)
-                return "ok"
-            if fuzzy and len(fuzzy) == 1:
-                item = fuzzy[0]
-                pending_confirm[chat_id] = {
-                    "action": "marking",
-                    "item_id": item["id"],
-                    "item_name": item["name"],
-                    "item_quantity_text": item.get("quantity_text", ""),
-                    "item_category": item.get("category", DEFAULT_CATEGORY),
-                    "user_db_id": user_db_id,
-                    "household_id": household_id,
-                }
-                send_message(chat_id, f"Маєш на увазі «{item['name']}»?", reply_markup=CONFIRM_KEYBOARD)
-                return "ok"
-            if fuzzy:
-                pending_candidates[chat_id] = {
-                    "action": "marking",
-                    "items": [{"id": c["id"], "name": c["name"], "quantity_text": c.get("quantity_text", ""), "category": c.get("category", DEFAULT_CATEGORY)} for c in fuzzy],
-                    "user_db_id": user_db_id,
-                    "household_id": household_id,
-                }
-                lines = [f"{i + 1}. {c['name']}" for i, c in enumerate(fuzzy)]
-                send_message(chat_id, "Знайшов кілька варіантів:\n\n" + "\n".join(lines) + "\n\nНапиши номер потрібного товару.")
-                return "ok"
-            # 4. Gemini for natural language
-            indices = _ask_gemini_for_selection(text, items, "Список покупок")
+            indices = _ask_gemini_for_selection(text, items, "Список покупок", "позначити купленими")
             if indices is None:
-                send_message(chat_id, 'Не зміг точно зрозуміти, які товари куплені. Напиши "все", номери або назви товарів.')
+                send_message(chat_id, SELECTION_ERROR_MSG)
                 shopping_mode[chat_id] = "marking"
             else:
                 _show_mark_preview(chat_id, [items[i] for i in indices], household_id, user_db_id)
@@ -1124,51 +869,9 @@ def webhook():
             if not items:
                 send_message(chat_id, "Список покупок поки порожній.")
                 return "ok"
-            # 1. "All" phrases
-            if _is_all_phrase(text):
-                _show_delete_preview(chat_id, items, household_id, user_db_id)
-                return "ok"
-            # 2. Numbers / ranges
-            result = _parse_number_ranges(text, len(items))
-            if result == "out_of_range":
-                send_message(chat_id, f"Такий номер не існує. Напиши числа від 1 до {len(items)}.")
-                shopping_mode[chat_id] = "deleting"
-                return "ok"
-            if result is not None:
-                _show_delete_preview(chat_id, [items[i] for i in result], household_id, user_db_id)
-                return "ok"
-            # 3. Exact or fuzzy name match
-            exact, fuzzy = find_items_by_name(text, items)
-            if exact:
-                _show_delete_preview(chat_id, exact, household_id, user_db_id)
-                return "ok"
-            if fuzzy and len(fuzzy) == 1:
-                item = fuzzy[0]
-                pending_confirm[chat_id] = {
-                    "action": "deleting",
-                    "item_id": item["id"],
-                    "item_name": item["name"],
-                    "item_quantity_text": item.get("quantity_text", ""),
-                    "item_category": item.get("category", DEFAULT_CATEGORY),
-                    "user_db_id": user_db_id,
-                    "household_id": household_id,
-                }
-                send_message(chat_id, f"Маєш на увазі «{item['name']}»?", reply_markup=CONFIRM_KEYBOARD)
-                return "ok"
-            if fuzzy:
-                pending_candidates[chat_id] = {
-                    "action": "deleting",
-                    "items": [{"id": c["id"], "name": c["name"], "quantity_text": c.get("quantity_text", ""), "category": c.get("category", DEFAULT_CATEGORY)} for c in fuzzy],
-                    "user_db_id": user_db_id,
-                    "household_id": household_id,
-                }
-                lines = [f"{i + 1}. {c['name']}" for i, c in enumerate(fuzzy)]
-                send_message(chat_id, "Знайшов кілька варіантів:\n\n" + "\n".join(lines) + "\n\nНапиши номер потрібного товару.")
-                return "ok"
-            # 4. Gemini for natural language
-            indices = _ask_gemini_for_selection(text, items, "Список покупок")
+            indices = _ask_gemini_for_selection(text, items, "Список покупок", "видалити зі списку")
             if indices is None:
-                send_message(chat_id, 'Не зміг точно зрозуміти вибір. Напиши "все", номери або назви товарів.')
+                send_message(chat_id, SELECTION_ERROR_MSG)
                 shopping_mode[chat_id] = "deleting"
             else:
                 _show_delete_preview(chat_id, [items[i] for i in indices], household_id, user_db_id)
@@ -1220,52 +923,9 @@ def webhook():
             if not items:
                 send_message(chat_id, "Запаси поки порожні.")
                 return "ok"
-            # 1. "All" phrases
-            if _is_all_phrase(text):
-                _show_remove_preview(chat_id, items, household_id, user_db_id)
-                return "ok"
-            # 2. Numbers / ranges
-            result = _parse_number_ranges(text, len(items))
-            if result == "out_of_range":
-                send_message(chat_id, f"Такий номер не існує. Напиши числа від 1 до {len(items)}.")
-                inventory_mode[chat_id] = "removing"
-                return "ok"
-            if result is not None:
-                _show_remove_preview(chat_id, [items[i] for i in result], household_id, user_db_id)
-                return "ok"
-            # 3. Exact or fuzzy name match
-            exact, fuzzy = find_items_by_name(text, items)
-            if exact:
-                _show_remove_preview(chat_id, exact, household_id, user_db_id)
-                return "ok"
-            if fuzzy and len(fuzzy) == 1:
-                item = fuzzy[0]
-                pending_inventory_confirm[chat_id] = {
-                    "item_id": item["id"],
-                    "item_name": item["name"],
-                    "item_quantity_text": item.get("quantity_text", ""),
-                    "item_category": item.get("category", DEFAULT_CATEGORY),
-                    "household_id": household_id,
-                    "user_db_id": user_db_id,
-                }
-                send_message(chat_id, f"Маєш на увазі «{item['name']}»?", reply_markup=CONFIRM_KEYBOARD)
-                return "ok"
-            if fuzzy:
-                pending_inventory_candidates[chat_id] = {
-                    "items": [{"id": c["id"], "name": c["name"], "quantity_text": c.get("quantity_text", ""), "category": c.get("category", DEFAULT_CATEGORY)} for c in fuzzy],
-                    "household_id": household_id,
-                    "user_db_id": user_db_id,
-                }
-                lines = [f"{i + 1}. {c['name']}" for i, c in enumerate(fuzzy)]
-                send_message(
-                    chat_id,
-                    "Знайшов кілька варіантів:\n\n" + "\n".join(lines) + "\n\nНапиши номер потрібного продукту."
-                )
-                return "ok"
-            # 4. Gemini for natural language
-            indices = _ask_gemini_for_selection(text, items, "Список запасів")
+            indices = _ask_gemini_for_selection(text, items, "Список запасів", "прибрати із запасів")
             if indices is None:
-                send_message(chat_id, 'Не зміг точно зрозуміти вибір. Напиши "все", номери або назви продуктів.')
+                send_message(chat_id, SELECTION_ERROR_MSG)
                 inventory_mode[chat_id] = "removing"
             else:
                 _show_remove_preview(chat_id, [items[i] for i in indices], household_id, user_db_id)
