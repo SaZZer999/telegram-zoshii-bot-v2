@@ -17,6 +17,8 @@ from database import (
     mark_items_batch,
     delete_items_batch,
     delete_inventory_items_batch,
+    execute_merge_shopping,
+    execute_merge_inventory,
 )
 
 # =========================
@@ -53,10 +55,12 @@ GEMINI_COOKING_URL = "https://generativelanguage.googleapis.com/v1beta/models/ge
 # =========================
 user_history = {}
 waiting_for_ingredients = {}
-shopping_mode = {}        # chat_id -> "adding" | "marking" | "deleting"
-pending_batch = {}        # chat_id -> {items, ignored_items, household_id, user_db_id}
-pending_mark_batch = {}   # chat_id -> {items, household_id, user_db_id}
-pending_delete_batch = {} # chat_id -> {items, household_id, user_db_id}
+active_list_context = {}      # chat_id -> "shopping" | "inventory"
+shopping_mode = {}            # chat_id -> "adding" | "marking" | "deleting" | "editing_number" | "editing_text"
+pending_batch = {}            # chat_id -> {items, ignored_items, household_id, user_db_id}
+pending_mark_batch = {}       # chat_id -> {items, household_id, user_db_id}
+pending_delete_batch = {}     # chat_id -> {items, household_id, user_db_id}
+pending_merge = {}            # chat_id -> {groups, household_id, user_db_id, list_type}
 inventory_mode = {}           # chat_id -> "adding" | "removing"
 pending_inventory_batch = {}  # chat_id -> {items, ignored_items, household_id, user_db_id}
 pending_remove_batch = {}     # chat_id -> {items, household_id, user_db_id}
@@ -144,6 +148,27 @@ SELECTION_PROMPT = (
     "- Якщо нічого не підходить — відповідай {\"selected_numbers\": []}\n"
 )
 
+MERGE_DETECT_PROMPT = (
+    "Ти аналізуєш список товарів з унікальними id і визначаєш:\n"
+    "1. Чи хоче користувач об'єднати однакові або дублюючі позиції?\n"
+    "2. Якщо так — які позиції можна безпечно об'єднати?\n\n"
+    "Фрази об'єднання: «об'єднай», «злий дублікати», «прибери дублікати», «згрупуй повтори», "
+    "«зроби однакові однією позицією» та подібні за змістом.\n\n"
+    "Правила об'єднання:\n"
+    "- Об'єднуй лише якщо назви означають той самий продукт\n"
+    "- Категорія однакова, або одна з них — «Інше їстівне»\n"
+    "- Якщо обидві кількості мають однакову одиницю (л, мл, г, кг, шт.) — склади їх\n"
+    "- Якщо одна кількість порожня, а інша має значення → merged_quantity_text = непорожнє значення\n"
+    "- Якщо обидві порожні → merged_quantity_text = \"\"\n"
+    "- Не об'єднуй: різні важливі уточнення в назві («Вершки 18%» і «Вершки 30%»), різні одиниці\n"
+    "- Не вигадуй кількості\n"
+    "- У item_ids вказуй числа id із рядків у форматі «id=N»\n\n"
+    "Якщо користувач НЕ просить об'єднати → {\"merge_groups\": []}\n"
+    "Якщо просить, але безпечних дублікатів немає → {\"merge_groups\": []}\n\n"
+    "Відповідай ТІЛЬКИ валідним JSON без жодного тексту:\n"
+    "{\"merge_groups\": [{\"item_ids\": [101, 102], \"merged_name\": \"Вершки\", \"merged_quantity_text\": \"\", \"merged_category\": \"Молочне та яйця\"}]}"
+)
+
 # =========================
 # KEYBOARDS
 # =========================
@@ -215,6 +240,14 @@ ADD_INVENTORY_PREVIEW_KEYBOARD = {
     "keyboard": [
         ["✅ Додати все", "✏️ Надіслати інший список"],
         ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+MERGE_PREVIEW_KEYBOARD = {
+    "keyboard": [
+        ["✅ Об'єднати", "❌ Скасувати"],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": True,
@@ -316,14 +349,164 @@ def clear_shopping_state(chat_id):
     pending_batch.pop(chat_id, None)
     pending_mark_batch.pop(chat_id, None)
     pending_delete_batch.pop(chat_id, None)
+    pending_merge.pop(chat_id, None)
 
 def clear_inventory_state(chat_id):
     inventory_mode.pop(chat_id, None)
     pending_inventory_batch.pop(chat_id, None)
     pending_remove_batch.pop(chat_id, None)
+    pending_merge.pop(chat_id, None)
+
+# =========================
+# QUANTITY HELPERS (local)
+# =========================
+_MERGEABLE_UNITS_BOT = {"л", "мл", "г", "кг", "шт."}
+
+def _parse_qty(qty_text):
+    if not qty_text:
+        return None, None
+    normalized = qty_text.strip().replace(",", ".")
+    parts = normalized.split()
+    if len(parts) != 2:
+        return None, None
+    try:
+        return float(parts[0]), parts[1]
+    except ValueError:
+        return None, None
+
+def _compute_merged_quantity(merge_items):
+    """Compute safe merged quantity_text for a group.
+
+    both empty → ""; one empty → use non-empty; same mergeable unit → sum;
+    different units or unparseable → None (group blocked).
+    """
+    qtys = [item.get("quantity_text") or "" for item in merge_items]
+    non_empty = [q.strip() for q in qtys if q.strip()]
+
+    if not non_empty:
+        return ""
+    if len(non_empty) == 1:
+        return non_empty[0]
+
+    parsed = [_parse_qty(q) for q in non_empty]
+
+    if any(val is None for val, unit in parsed):
+        unique = set(non_empty)
+        return non_empty[0] if len(unique) == 1 else None
+
+    units = set(unit for val, unit in parsed)
+    if len(units) != 1:
+        return None
+
+    unit = next(iter(units))
+    if unit not in _MERGEABLE_UNITS_BOT:
+        unique = set(non_empty)
+        return non_empty[0] if len(unique) == 1 else None
+
+    total = round(sum(val for val, unit in parsed), 1)
+    if total == int(total):
+        return f"{int(total)} {unit}"
+    return str(total).replace(".", ",") + f" {unit}"
+
+# =========================
+# MERGE HELPERS
+# =========================
+
+def _validate_merge_groups(raw_groups, items_by_id):
+    """Validate Gemini merge suggestions against the loaded item list.
+
+    Returns validated groups with Python-computed quantities.
+    """
+    validated = []
+    for group in raw_groups:
+        ids = group.get("item_ids")
+        if not isinstance(ids, list) or len(ids) < 2:
+            continue
+        try:
+            ids = [int(i) for i in ids]
+        except (TypeError, ValueError):
+            continue
+
+        merge_items = [items_by_id.get(i) for i in ids]
+        if any(m is None for m in merge_items):
+            continue
+
+        categories = set(item.get("category") or DEFAULT_CATEGORY for item in merge_items)
+        non_default = categories - {DEFAULT_CATEGORY}
+        if len(non_default) > 1:
+            continue
+
+        merged_category = (group.get("merged_category") or "").strip()
+        if merged_category not in VALID_CATEGORIES:
+            merged_category = next(iter(non_default), DEFAULT_CATEGORY)
+
+        merged_name = (group.get("merged_name") or "").strip()
+        if not merged_name:
+            continue
+
+        merged_qty = _compute_merged_quantity(merge_items)
+        if merged_qty is None:
+            continue
+
+        validated.append({
+            "item_ids": ids,
+            "merged_name": merged_name,
+            "merged_quantity_text": merged_qty,
+            "merged_category": merged_category,
+            "items": merge_items,
+        })
+    return validated
+
+def _ask_gemini_for_merge(user_text, items):
+    """One Gemini call: detect merge intent AND return merge groups.
+
+    Returns raw list (may be empty — no intent or no duplicates).
+    """
+    if len(items) < 2:
+        return []
+    lines = []
+    for item in items:
+        label = f"id={item['id']}. {item['name']}"
+        if item.get("quantity_text"):
+            label += f" — {item['quantity_text']}"
+        label += f" [{item.get('category') or DEFAULT_CATEGORY}]"
+        lines.append(label)
+    prompt = "Список:\n" + "\n".join(lines) + f"\n\nКористувач написав: {user_text}"
+    raw = call_gemini([{"role": "user", "content": prompt}], MERGE_DETECT_PROMPT, temperature=0.1)
+    if not raw:
+        return []
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
+        if m:
+            cleaned = m.group(1).strip()
+    try:
+        data = json.loads(cleaned)
+        groups = data.get("merge_groups")
+        return groups if isinstance(groups, list) else []
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return []
+
+def _format_merge_preview(validated_groups):
+    lines = [f"🧹 Буде об'єднано груп: {len(validated_groups)}", ""]
+    for i, group in enumerate(validated_groups):
+        parts = []
+        for item in group["items"]:
+            label = item["name"]
+            if item.get("quantity_text"):
+                label += f" — {item['quantity_text']}"
+            parts.append(label)
+        result = group["merged_name"]
+        if group["merged_quantity_text"]:
+            result += f" — {group['merged_quantity_text']}"
+        lines.append(f"{i + 1}. {' + '.join(parts)} → {result}")
+    return "\n".join(lines)
+
+# =========================
+# SELECTION / PREVIEW HELPERS
+# =========================
 
 def _ask_gemini_for_selection(user_text, items, list_label, action_label):
-    """Send list + user text to Gemini; return sorted zero-based index list or None."""
     lines = []
     for i, item in enumerate(items):
         label = f"{i + 1}. {item['name']}"
@@ -390,11 +573,6 @@ def _show_remove_preview(chat_id, items, household_id, user_db_id):
     send_message(chat_id, preview, reply_markup=REMOVE_PREVIEW_KEYBOARD)
 
 def parse_shopping_list_with_gemini(text):
-    """Call Gemini once to parse a free-form shopping list.
-
-    Returns {"items": [...], "ignored_items": [...]} or None on failure.
-    Each item: {name, quantity_text, category, was_corrected}.
-    """
     history = [{"role": "user", "content": text}]
     raw = call_gemini(history, SHOPPING_PARSE_PROMPT, temperature=0.1)
     if not raw:
@@ -463,7 +641,6 @@ def webhook():
     user_id = message.get("from", {}).get("id")
     display_name = message.get("from", {}).get("first_name")
 
-    # /myid works for everyone, before access check
     if text == "/myid":
         send_message(chat_id, f"Твій Telegram ID: {user_id}")
         return "ok"
@@ -476,8 +653,23 @@ def webhook():
         return "ok"
 
     # =========================
-    # COMMANDS & BUTTONS
+    # BUTTON HANDLERS
     # =========================
+
+    if text == "✅ Об'єднати":
+        if chat_id in pending_merge:
+            merge_data = pending_merge.pop(chat_id)
+            list_type = merge_data["list_type"]
+            keyboard = SHOPPING_KEYBOARD if list_type == "shopping" else INVENTORY_KEYBOARD
+            try:
+                if list_type == "shopping":
+                    count = execute_merge_shopping(merge_data["household_id"], merge_data["groups"])
+                else:
+                    count = execute_merge_inventory(merge_data["household_id"], merge_data["groups"])
+                send_message(chat_id, f"✅ Об'єднано груп: {count}", reply_markup=keyboard)
+            except Exception:
+                send_message(chat_id, "Не вдалося виконати об'єднання. Спробуйте ще раз.", reply_markup=keyboard)
+        return "ok"
 
     if text == "✅ Додати все":
         if chat_id in pending_inventory_batch:
@@ -516,7 +708,11 @@ def webhook():
         return "ok"
 
     if text == "❌ Скасувати":
-        if chat_id in pending_inventory_batch:
+        if chat_id in pending_merge:
+            merge_data = pending_merge.pop(chat_id)
+            keyboard = SHOPPING_KEYBOARD if merge_data["list_type"] == "shopping" else INVENTORY_KEYBOARD
+            send_message(chat_id, "Об'єднання скасовано.", reply_markup=keyboard)
+        elif chat_id in pending_inventory_batch:
             clear_inventory_state(chat_id)
             send_message(chat_id, "Додавання продуктів скасовано.", reply_markup=INVENTORY_KEYBOARD)
         elif chat_id in pending_mark_batch:
@@ -542,14 +738,14 @@ def webhook():
 
     if text == "✅ Куплено + додати в запаси":
         if chat_id in pending_mark_batch:
-            data = pending_mark_batch.pop(chat_id)
+            mark_data = pending_mark_batch.pop(chat_id)
             try:
-                item_ids = [item["id"] for item in data["items"]]
-                count = mark_items_batch(item_ids, data["user_db_id"])
-                for item in data["items"]:
+                item_ids = [item["id"] for item in mark_data["items"]]
+                count = mark_items_batch(item_ids, mark_data["user_db_id"])
+                for item in mark_data["items"]:
                     add_or_merge_inventory_item(
-                        data["household_id"],
-                        data["user_db_id"],
+                        mark_data["household_id"],
+                        mark_data["user_db_id"],
                         item["name"],
                         item.get("quantity_text", ""),
                         item.get("category", DEFAULT_CATEGORY),
@@ -561,10 +757,10 @@ def webhook():
 
     if text == "✅ Куплено, без запасів":
         if chat_id in pending_mark_batch:
-            data = pending_mark_batch.pop(chat_id)
+            mark_data = pending_mark_batch.pop(chat_id)
             try:
-                item_ids = [item["id"] for item in data["items"]]
-                count = mark_items_batch(item_ids, data["user_db_id"])
+                item_ids = [item["id"] for item in mark_data["items"]]
+                count = mark_items_batch(item_ids, mark_data["user_db_id"])
                 send_message(chat_id, f"✅ Позначено купленими: {count}", reply_markup=SHOPPING_KEYBOARD)
             except Exception:
                 send_message(chat_id, "Не вдалося завершити покупку. Спробуйте ще раз трохи пізніше.")
@@ -572,9 +768,9 @@ def webhook():
 
     if text == "✅ Так, видалити":
         if chat_id in pending_delete_batch:
-            data = pending_delete_batch.pop(chat_id)
+            del_data = pending_delete_batch.pop(chat_id)
             try:
-                item_ids = [item["id"] for item in data["items"]]
+                item_ids = [item["id"] for item in del_data["items"]]
                 count = delete_items_batch(item_ids)
                 send_message(chat_id, f"🗑️ Видалено зі списку: {count}", reply_markup=SHOPPING_KEYBOARD)
             except Exception:
@@ -583,9 +779,9 @@ def webhook():
 
     if text == "✅ Так, прибрати":
         if chat_id in pending_remove_batch:
-            data = pending_remove_batch.pop(chat_id)
+            rem_data = pending_remove_batch.pop(chat_id)
             try:
-                item_ids = [item["id"] for item in data["items"]]
+                item_ids = [item["id"] for item in rem_data["items"]]
                 count = delete_inventory_items_batch(item_ids)
                 send_message(chat_id, f"✅ Прибрано із запасів: {count}", reply_markup=INVENTORY_KEYBOARD)
             except Exception:
@@ -594,9 +790,9 @@ def webhook():
 
     if text == "✏️ Змінити вибір":
         if chat_id in pending_mark_batch:
-            data = pending_mark_batch.pop(chat_id)
+            mark_data = pending_mark_batch.pop(chat_id)
             try:
-                items = get_active_shopping_items(data["household_id"])
+                items = get_active_shopping_items(mark_data["household_id"])
                 shopping_mode[chat_id] = "marking"
                 if not items:
                     send_message(chat_id, "Список покупок поки порожній.")
@@ -605,9 +801,9 @@ def webhook():
             except Exception:
                 send_message(chat_id, DB_ERROR_MSG)
         elif chat_id in pending_delete_batch:
-            data = pending_delete_batch.pop(chat_id)
+            del_data = pending_delete_batch.pop(chat_id)
             try:
-                items = get_active_shopping_items(data["household_id"])
+                items = get_active_shopping_items(del_data["household_id"])
                 shopping_mode[chat_id] = "deleting"
                 if not items:
                     send_message(chat_id, "Список покупок поки порожній.")
@@ -616,9 +812,9 @@ def webhook():
             except Exception:
                 send_message(chat_id, DB_ERROR_MSG)
         elif chat_id in pending_remove_batch:
-            data = pending_remove_batch.pop(chat_id)
+            rem_data = pending_remove_batch.pop(chat_id)
             try:
-                items = get_inventory_items(data["household_id"])
+                items = get_inventory_items(rem_data["household_id"])
                 inventory_mode[chat_id] = "removing"
                 if not items:
                     send_message(chat_id, "Запаси поки порожні.")
@@ -628,8 +824,13 @@ def webhook():
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
 
+    # =========================
+    # NAVIGATION BUTTONS
+    # =========================
+
     if text == "/start":
         waiting_for_ingredients.pop(chat_id, None)
+        active_list_context.pop(chat_id, None)
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         send_message(
@@ -642,6 +843,7 @@ def webhook():
 
     if text == "/menu":
         waiting_for_ingredients.pop(chat_id, None)
+        active_list_context.pop(chat_id, None)
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
@@ -661,18 +863,21 @@ def webhook():
 
     if text == "🛒 Покупки":
         waiting_for_ingredients.pop(chat_id, None)
+        active_list_context[chat_id] = "shopping"
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         send_message(chat_id, "🛒 Список покупок:", reply_markup=SHOPPING_KEYBOARD)
         return "ok"
 
     if text == "➕ Додати товар":
+        active_list_context[chat_id] = "shopping"
         clear_shopping_state(chat_id)
         shopping_mode[chat_id] = "adding"
         send_message(chat_id, "Надішли один товар або список товарів. Можна кожен товар з нового рядка.")
         return "ok"
 
     if text == "📋 Показати список":
+        active_list_context[chat_id] = "shopping"
         clear_shopping_state(chat_id)
         try:
             household_id, _ = get_household_and_user(user_id, display_name)
@@ -683,6 +888,7 @@ def webhook():
         return "ok"
 
     if text == "✅ Позначити купленим":
+        active_list_context[chat_id] = "shopping"
         clear_shopping_state(chat_id)
         try:
             household_id, _ = get_household_and_user(user_id, display_name)
@@ -697,6 +903,7 @@ def webhook():
         return "ok"
 
     if text == "🗑️ Видалити товар":
+        active_list_context[chat_id] = "shopping"
         clear_shopping_state(chat_id)
         try:
             household_id, _ = get_household_and_user(user_id, display_name)
@@ -712,6 +919,7 @@ def webhook():
 
     if text == "⬅️ Головне меню":
         waiting_for_ingredients.pop(chat_id, None)
+        active_list_context.pop(chat_id, None)
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
@@ -719,12 +927,14 @@ def webhook():
 
     if text == "🧊 Запаси":
         waiting_for_ingredients.pop(chat_id, None)
+        active_list_context[chat_id] = "inventory"
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         send_message(chat_id, "🧊 Запаси:", reply_markup=INVENTORY_KEYBOARD)
         return "ok"
 
     if text == "➕ Додати продукти":
+        active_list_context[chat_id] = "inventory"
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         inventory_mode[chat_id] = "adding"
@@ -732,6 +942,7 @@ def webhook():
         return "ok"
 
     if text == "📋 Показати запаси":
+        active_list_context[chat_id] = "inventory"
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         try:
@@ -743,6 +954,7 @@ def webhook():
         return "ok"
 
     if text == "➖ Використати / прибрати":
+        active_list_context[chat_id] = "inventory"
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         try:
@@ -758,6 +970,7 @@ def webhook():
         return "ok"
 
     if text == "🍽️ Що приготувати":
+        active_list_context.pop(chat_id, None)
         clear_shopping_state(chat_id)
         waiting_for_ingredients[chat_id] = True
         send_message(chat_id, "Напиши, які продукти зараз є вдома, і я запропоную кілька страв.")
@@ -934,6 +1147,41 @@ def webhook():
         return "ok"
 
     # =========================
+    # MERGE INTENT DETECTION
+    # Runs before cooking/AI chat when user is in shopping or inventory context
+    # and no specific mode is active. One Gemini call detects intent and returns
+    # merge groups. Empty result → not a merge request → fall through to AI chat.
+    # =========================
+    ctx = active_list_context.get(chat_id)
+    if ctx in ("shopping", "inventory"):
+        try:
+            household_id, user_db_id = get_household_and_user(user_id, display_name)
+            list_items = (
+                get_active_shopping_items(household_id)
+                if ctx == "shopping"
+                else get_inventory_items(household_id)
+            )
+            if len(list_items) >= 2:
+                raw_groups = _ask_gemini_for_merge(text, list_items)
+                if raw_groups:
+                    items_by_id = {item["id"]: item for item in list_items}
+                    validated = _validate_merge_groups(raw_groups, items_by_id)
+                    if validated:
+                        pending_merge[chat_id] = {
+                            "groups": validated,
+                            "household_id": household_id,
+                            "user_db_id": user_db_id,
+                            "list_type": ctx,
+                        }
+                        send_message(chat_id, _format_merge_preview(validated), reply_markup=MERGE_PREVIEW_KEYBOARD)
+                        return "ok"
+                    else:
+                        send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
+                        return "ok"
+        except Exception:
+            pass  # Fall through to AI chat on any error
+
+    # =========================
     # COOKING MODE
     # =========================
     if waiting_for_ingredients.pop(chat_id, False):
@@ -947,7 +1195,7 @@ def webhook():
         return "ok"
 
     # =========================
-    # AI (Gemini 3.1 Flash Lite)
+    # AI CHAT (Gemini 3.1 Flash Lite)
     # =========================
     if chat_id not in user_history:
         user_history[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -967,7 +1215,6 @@ def webhook():
         answer = "AI-помічник тимчасово недоступний. Спробуйте ще раз трохи пізніше."
 
     send_message(chat_id, answer)
-
     return "ok"
 
 
