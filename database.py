@@ -328,3 +328,18 @@ def add_shopping_items_batch(household_id, created_by_user_id, items):
                 )
         conn.commit()
     return len(items)
+
+def mark_items_batch(item_ids, completed_by_user_id):
+    """Mark multiple items as completed in one transaction. Returns count of updated rows."""
+    if not item_ids:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(item_ids))
+            cur.execute(
+                f"UPDATE shopping_items SET is_completed = TRUE, completed_by_user_id = %s, completed_at = NOW() WHERE id IN ({placeholders}) AND is_completed = FALSE",
+                [completed_by_user_id] + list(item_ids)
+            )
+            count = cur.rowcount
+        conn.commit()
+    return count
