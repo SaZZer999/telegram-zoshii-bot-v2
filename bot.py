@@ -19,6 +19,8 @@ from database import (
     delete_inventory_items_batch,
     execute_merge_shopping,
     execute_merge_inventory,
+    update_shopping_items_batch,
+    update_inventory_items_batch,
 )
 
 # =========================
@@ -64,6 +66,8 @@ pending_merge = {}            # chat_id -> {groups, household_id, user_db_id, li
 inventory_mode = {}           # chat_id -> "adding" | "removing"
 pending_inventory_batch = {}  # chat_id -> {items, ignored_items, household_id, user_db_id}
 pending_remove_batch = {}     # chat_id -> {items, household_id, user_db_id}
+saved_list_context = {}       # chat_id -> "shopping_saved" | "inventory_saved"
+pending_saved_edit = {}       # chat_id -> {items_snapshot, validated_updates, household_id, user_db_id, context_type}
 
 SYSTEM_PROMPT = "Ти корисний AI-помічник. Відповідай українською."
 
@@ -186,6 +190,28 @@ PENDING_PREVIEW_EDIT_PROMPT = (
     "{\"intent\": \"edit_preview\", \"updates\": [{\"item_number\": 1, \"name\": null, \"quantity_text\": \"2 шт.\", \"category\": null}]}"
 )
 
+SAVED_LIST_EDIT_PROMPT = (
+    "Ти помічник для редагування збереженого списку товарів.\n"
+    "Визнач намір (intent):\n"
+    "- «edit_saved_items» — якщо користувач хоче змінити кількість, назву або категорію наявних позицій\n"
+    "- «merge_duplicates» — якщо хоче об'єднати однакові або дублюючі позиції\n"
+    "- «none» — в усіх інших випадках: видалення, купівля, позначення купленим, додавання нових товарів, загальне питання\n\n"
+    "Для edit_saved_items — поверни updates лише для позицій, які змінюються:\n"
+    "- item_number — ціле число (номер у списку, від 1 до N)\n"
+    "- name — нова назва або null якщо не змінюється\n"
+    "- quantity_text — нова кількість (напр. «2 шт.», «500 г», «1,5 л») або null\n"
+    "- category — нова категорія або null\n\n"
+    "Для merge_duplicates — поверни merge_groups: масив масивів item_number:\n"
+    "- [[2, 4], [1, 3]] — кожна підгрупа містить номери позицій для об'єднання\n\n"
+    "Правила:\n"
+    "- Не додавай нових позицій\n"
+    "- Не видаляй існуючих позицій\n"
+    "- Не позначай нічого купленим\n"
+    "- Нормалізуй одиниці: «2 штуки» → «2 шт.», «500 грам» → «500 г», «1.5 л» → «1,5 л»\n\n"
+    "Відповідай ТІЛЬКИ валідним JSON без жодного тексту:\n"
+    "{\"intent\": \"edit_saved_items\", \"updates\": [{\"item_number\": 1, \"name\": null, \"quantity_text\": \"2 шт.\", \"category\": null}], \"merge_groups\": []}"
+)
+
 # =========================
 # KEYBOARDS
 # =========================
@@ -265,6 +291,15 @@ ADD_INVENTORY_PREVIEW_KEYBOARD = {
 MERGE_PREVIEW_KEYBOARD = {
     "keyboard": [
         ["✅ Об'єднати", "❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+SAVED_EDIT_PREVIEW_KEYBOARD = {
+    "keyboard": [
+        ["✅ Підтвердити зміни"],
+        ["❌ Скасувати"],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": True,
@@ -367,12 +402,16 @@ def clear_shopping_state(chat_id):
     pending_mark_batch.pop(chat_id, None)
     pending_delete_batch.pop(chat_id, None)
     pending_merge.pop(chat_id, None)
+    saved_list_context.pop(chat_id, None)
+    pending_saved_edit.pop(chat_id, None)
 
 def clear_inventory_state(chat_id):
     inventory_mode.pop(chat_id, None)
     pending_inventory_batch.pop(chat_id, None)
     pending_remove_batch.pop(chat_id, None)
     pending_merge.pop(chat_id, None)
+    saved_list_context.pop(chat_id, None)
+    pending_saved_edit.pop(chat_id, None)
 
 # =========================
 # QUANTITY HELPERS (local)
@@ -637,6 +676,187 @@ def _apply_preview_updates(items, valid_updates):
         if upd.get("category") is not None:
             result[idx]["category"] = upd["category"]
     return result
+
+
+# =========================
+# SAVED LIST EDIT HELPERS
+# =========================
+
+def _compute_saved_merged_quantity(group_items):
+    """Compute merged quantity for saved list merging.
+
+    All empty → count as 1 шт. each (e.g. Хліб + Хліб → 2 шт.).
+    empty + "N шт." → (N+1) шт. (empty treated as 1 шт.).
+    Same parseable non-шт. unit → sum (no empty items allowed for liquid/weight units).
+    Returns quantity string or None if incompatible.
+    """
+    qtys = [item.get("quantity_text") or "" for item in group_items]
+    non_empty = [q.strip() for q in qtys if q.strip()]
+    empty_count = len(qtys) - len(non_empty)
+
+    if not non_empty:
+        return f"{len(group_items)} шт."
+
+    parsed = []
+    for q in non_empty:
+        val, unit = _parse_qty(q)
+        if val is None:
+            return None
+        parsed.append((val, unit))
+
+    units = {u for _, u in parsed}
+    if len(units) != 1:
+        return None
+    unit = next(iter(units))
+    if unit not in _MERGEABLE_UNITS_BOT:
+        return None
+
+    if unit == "шт.":
+        total = round(sum(v for v, _ in parsed) + empty_count, 1)
+    else:
+        if empty_count > 0:
+            return None
+        total = round(sum(v for v, _ in parsed), 1)
+
+    if total == int(total):
+        return f"{int(total)} {unit}"
+    return str(total).replace(".", ",") + f" {unit}"
+
+
+def _compute_saved_merge_groups(merge_groups_raw, items):
+    """Convert Gemini [[2, 4], [1, 3]] merge_groups into validated groups for DB merge.
+
+    Validates: same normalized name, compatible categories, safe quantity merge.
+    Returns list of groups ready for execute_merge_shopping/inventory and _format_merge_preview.
+    """
+    if not isinstance(merge_groups_raw, list) or not merge_groups_raw:
+        return []
+    total = len(items)
+    items_by_num = {i + 1: items[i] for i in range(total)}
+    used_numbers = set()
+    validated = []
+    for group_raw in merge_groups_raw:
+        if not isinstance(group_raw, list) or len(group_raw) < 2:
+            continue
+        try:
+            nums = [int(n) for n in group_raw]
+        except (TypeError, ValueError):
+            continue
+        if any(n < 1 or n > total for n in nums):
+            continue
+        if any(n in used_numbers for n in nums):
+            continue
+        group_items = [items_by_num[n] for n in nums]
+        if len({it["name"].strip().lower() for it in group_items}) > 1:
+            continue
+        categories = {it.get("category") or DEFAULT_CATEGORY for it in group_items}
+        non_default = categories - {DEFAULT_CATEGORY}
+        if len(non_default) > 1:
+            continue
+        merged_category = next(iter(non_default), DEFAULT_CATEGORY)
+        merged_qty = _compute_saved_merged_quantity(group_items)
+        if merged_qty is None:
+            continue
+        used_numbers.update(nums)
+        validated.append({
+            "item_ids": [it["id"] for it in group_items],
+            "merged_name": group_items[0]["name"],
+            "merged_quantity_text": merged_qty,
+            "merged_category": merged_category,
+            "items": group_items,
+        })
+    return validated
+
+
+def _validate_saved_updates(updates, items):
+    """Validate Gemini saved list edit updates. Returns list of valid updates (with item_id) or None."""
+    if not isinstance(updates, list) or not updates:
+        return None
+    total = len(items)
+    used_numbers = set()
+    valid = []
+    for upd in updates:
+        if not isinstance(upd, dict):
+            return None
+        num = upd.get("item_number")
+        if not isinstance(num, int) or num < 1 or num > total:
+            return None
+        if num in used_numbers:
+            return None
+        used_numbers.add(num)
+        name = upd.get("name")
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            return None
+        qty = upd.get("quantity_text")
+        if qty is not None and (not isinstance(qty, str) or not qty.strip()):
+            return None
+        cat = upd.get("category")
+        if cat is not None and cat not in VALID_CATEGORIES:
+            return None
+        valid.append({
+            "item_number": num,
+            "item_id": items[num - 1]["id"],
+            "name": name,
+            "quantity_text": qty,
+            "category": cat,
+        })
+    return valid
+
+
+def _ask_gemini_saved_list_router(user_text, items, context_type):
+    """Gemini call: detect edit_saved_items or merge_duplicates for an active saved list."""
+    lines = []
+    for i, item in enumerate(items):
+        label = f"{i + 1}. {item['name']}"
+        if item.get("quantity_text"):
+            label += f" — {item['quantity_text']}"
+        label += f" [{item.get('category') or DEFAULT_CATEGORY}]"
+        lines.append(label)
+    prompt = (
+        f"Контекст: {context_type}\n"
+        "Поточний список:\n" + "\n".join(lines)
+        + f"\n\nКористувач написав: {user_text}"
+    )
+    raw = call_gemini([{"role": "user", "content": prompt}], SAVED_LIST_EDIT_PROMPT, temperature=0.1)
+    if not raw:
+        return {"intent": "none", "updates": [], "merge_groups": []}
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
+        if m:
+            cleaned = m.group(1).strip()
+    try:
+        data = json.loads(cleaned)
+        return {
+            "intent": data.get("intent", "none"),
+            "updates": data.get("updates") if isinstance(data.get("updates"), list) else [],
+            "merge_groups": data.get("merge_groups") if isinstance(data.get("merge_groups"), list) else [],
+        }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {"intent": "none", "updates": [], "merge_groups": []}
+
+
+def _format_saved_edit_preview(items_snapshot, validated_updates, context_type):
+    """Format before/after preview for a saved list edit."""
+    icon = "🛒" if context_type == "shopping_saved" else "🧊"
+    lines = [f"{icon} Буде змінено: {len(validated_updates)}", ""]
+    for upd in validated_updates:
+        idx = upd["item_number"] - 1
+        old = items_snapshot[idx]
+        old_label = old["name"]
+        if old.get("quantity_text"):
+            old_label += f" — {old['quantity_text']}"
+        new_name = upd.get("name") or old["name"]
+        new_qty = upd.get("quantity_text")
+        if new_qty is None:
+            new_qty = old.get("quantity_text") or ""
+        new_label = new_name
+        if new_qty:
+            new_label += f" — {new_qty}"
+        lines.append(f"{upd['item_number']}. {old_label}")
+        lines.append(f"   → {new_label}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def _format_merge_preview(validated_groups):
@@ -912,6 +1132,11 @@ def webhook():
         elif chat_id in pending_remove_batch:
             pending_remove_batch.pop(chat_id, None)
             send_message(chat_id, "Дію скасовано.", reply_markup=INVENTORY_KEYBOARD)
+        elif chat_id in pending_saved_edit:
+            edit_data = pending_saved_edit.pop(chat_id)
+            ctx = edit_data["context_type"]
+            keyboard = SHOPPING_KEYBOARD if ctx == "shopping_saved" else INVENTORY_KEYBOARD
+            send_message(chat_id, "Зміни скасовано.", reply_markup=keyboard)
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -974,6 +1199,37 @@ def webhook():
                 send_message(chat_id, f"✅ Прибрано із запасів: {count}", reply_markup=INVENTORY_KEYBOARD)
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
+        return "ok"
+
+    if text == "✅ Підтвердити зміни":
+        if chat_id in pending_saved_edit:
+            edit_data = pending_saved_edit.pop(chat_id)
+            ctx = edit_data["context_type"]
+            household_id = edit_data["household_id"]
+            valid_updates = edit_data["validated_updates"]
+            keyboard = SHOPPING_KEYBOARD if ctx == "shopping_saved" else INVENTORY_KEYBOARD
+            try:
+                current_items = (
+                    get_active_shopping_items(household_id)
+                    if ctx == "shopping_saved"
+                    else get_inventory_items(household_id)
+                )
+                current_ids = {it["id"] for it in current_items}
+                required_ids = {upd["item_id"] for upd in valid_updates}
+                if not required_ids.issubset(current_ids):
+                    send_message(
+                        chat_id,
+                        "Список змінився з іншого пристрою. Онови список і повтори дію.",
+                        reply_markup=keyboard,
+                    )
+                    return "ok"
+                if ctx == "shopping_saved":
+                    update_shopping_items_batch(household_id, valid_updates)
+                else:
+                    update_inventory_items_batch(household_id, valid_updates)
+                send_message(chat_id, "✅ Зміни застосовано.", reply_markup=keyboard)
+            except Exception:
+                send_message(chat_id, DB_ERROR_MSG if ctx == "shopping_saved" else INVENTORY_ERROR_MSG)
         return "ok"
 
     if text == "✏️ Змінити вибір":
@@ -1067,6 +1323,7 @@ def webhook():
     if text == "📋 Показати список":
         active_list_context[chat_id] = "shopping"
         clear_shopping_state(chat_id)
+        saved_list_context[chat_id] = "shopping_saved"
         try:
             household_id, _ = get_household_and_user(user_id, display_name)
             items = get_active_shopping_items(household_id)
@@ -1133,6 +1390,7 @@ def webhook():
         active_list_context[chat_id] = "inventory"
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
+        saved_list_context[chat_id] = "inventory_saved"
         try:
             household_id, _ = get_household_and_user(user_id, display_name)
             items = get_inventory_items(household_id)
@@ -1403,31 +1661,47 @@ def webhook():
             _preview_intercepted = True
 
     else:
-        ctx = active_list_context.get(chat_id)
-        if ctx in ("shopping", "inventory"):
+        ctx = saved_list_context.get(chat_id)
+        if ctx in ("shopping_saved", "inventory_saved"):
             try:
                 household_id, user_db_id = get_household_and_user(user_id, display_name)
                 list_items = (
                     get_active_shopping_items(household_id)
-                    if ctx == "shopping"
+                    if ctx == "shopping_saved"
                     else get_inventory_items(household_id)
                 )
-                if len(list_items) >= 2:
-                    raw = _ask_gemini_intent_router(text, list_items)
-                    if raw["intent"] == "merge_duplicates":
-                        _preview_intercepted = True
-                        list_type = "shopping_saved" if ctx == "shopping" else "inventory_saved"
-                        validated = _validate_merge_groups(raw["merge_groups"], list_items, is_pending=False)
-                        if validated:
-                            pending_merge[chat_id] = {
-                                "groups": validated,
+                if list_items:
+                    router_result = _ask_gemini_saved_list_router(text, list_items, ctx)
+                    intent = router_result["intent"]
+                    if intent == "edit_saved_items":
+                        valid_updates = _validate_saved_updates(router_result["updates"], list_items)
+                        if valid_updates:
+                            pending_saved_edit[chat_id] = {
+                                "items_snapshot": list_items,
+                                "validated_updates": valid_updates,
                                 "household_id": household_id,
                                 "user_db_id": user_db_id,
-                                "list_type": list_type,
+                                "context_type": ctx,
                             }
-                            send_message(chat_id, _format_merge_preview(validated), reply_markup=MERGE_PREVIEW_KEYBOARD)
+                            preview = _format_saved_edit_preview(list_items, valid_updates, ctx)
+                            send_message(chat_id, preview, reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD)
+                        else:
+                            send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
+                        _preview_intercepted = True
+                    elif intent == "merge_duplicates":
+                        validated_groups = _compute_saved_merge_groups(router_result["merge_groups"], list_items)
+                        if validated_groups:
+                            pending_merge[chat_id] = {
+                                "groups": validated_groups,
+                                "household_id": household_id,
+                                "user_db_id": user_db_id,
+                                "list_type": ctx,
+                            }
+                            send_message(chat_id, _format_merge_preview(validated_groups), reply_markup=MERGE_PREVIEW_KEYBOARD)
                         else:
                             send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
+                        _preview_intercepted = True
+                    # intent == "none": fall through to AI chat
             except Exception:
                 pass
 

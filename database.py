@@ -408,6 +408,83 @@ def execute_merge_shopping(household_id, validated_groups):
         conn.commit()
     return len(validated_groups)
 
+# =========================
+# BATCH UPDATE
+# =========================
+
+def update_shopping_items_batch(household_id, updates):
+    """Update name/quantity_text/category for multiple active shopping items in one transaction.
+
+    Each update: {item_id, name (or None), quantity_text (or None), category (or None)}.
+    Only non-None fields are changed. Returns count of rows updated.
+    """
+    if not updates:
+        return 0
+    updated = 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for upd in updates:
+                sets, params = [], []
+                if upd.get("name") is not None:
+                    sets.append("name = %s")
+                    params.append(upd["name"])
+                qty = upd.get("quantity_text")
+                if qty is not None:
+                    sets.append("quantity_text = %s")
+                    params.append(qty or None)
+                if upd.get("category") is not None:
+                    sets.append("category = %s")
+                    params.append(upd["category"])
+                if not sets:
+                    continue
+                params.extend([upd["item_id"], household_id])
+                cur.execute(
+                    f"UPDATE shopping_items SET {', '.join(sets)} WHERE id = %s AND household_id = %s AND is_completed = FALSE RETURNING id",
+                    params,
+                )
+                if cur.fetchone():
+                    updated += 1
+        conn.commit()
+    return updated
+
+
+def update_inventory_items_batch(household_id, updates):
+    """Update name/quantity_text/category for multiple inventory items in one transaction.
+
+    Each update: {item_id, name (or None), quantity_text (or None), category (or None)}.
+    Only non-None fields are changed. Returns count of rows updated.
+    """
+    if not updates:
+        return 0
+    updated = 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for upd in updates:
+                sets, params = [], []
+                if upd.get("name") is not None:
+                    sets.append("name = %s")
+                    params.append(upd["name"])
+                qty = upd.get("quantity_text")
+                if qty is not None:
+                    sets.append("quantity_text = %s")
+                    params.append(qty or None)
+                if upd.get("category") is not None:
+                    sets.append("category = %s")
+                    params.append(upd["category"])
+                if not sets:
+                    continue
+                sets.append("updated_at = NOW()")
+                params.extend([upd["item_id"], household_id])
+                cur.execute(
+                    f"UPDATE inventory_items SET {', '.join(sets)} WHERE id = %s AND household_id = %s RETURNING id",
+                    params,
+                )
+                if cur.fetchone():
+                    updated += 1
+        conn.commit()
+    return updated
+
+
 def execute_merge_inventory(household_id, validated_groups):
     """Merge validated groups in inventory_items in one transaction.
 
