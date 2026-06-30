@@ -53,6 +53,22 @@ def init_db():
                 ALTER TABLE shopping_items
                 ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'Інше їстівне'
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS inventory_items (
+                    id                    SERIAL PRIMARY KEY,
+                    household_id          INTEGER NOT NULL REFERENCES households(id),
+                    name                  TEXT NOT NULL,
+                    quantity_text         TEXT,
+                    category              TEXT NOT NULL DEFAULT 'Інше їстівне',
+                    created_by_user_id    INTEGER REFERENCES users(id),
+                    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_inventory_items_household
+                ON inventory_items (household_id, category, name)
+            """)
         conn.commit()
 
 def get_or_create_household():
@@ -172,6 +188,53 @@ def delete_item_by_id(item_id):
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM shopping_items WHERE id = %s AND is_completed = FALSE RETURNING name",
+                (item_id,)
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return row[0] if row else None
+
+def get_inventory_items(household_id):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, quantity_text, category
+                FROM inventory_items
+                WHERE household_id = %s
+                ORDER BY category, name ASC
+                """,
+                (household_id,)
+            )
+            rows = cur.fetchall()
+    return [{"id": r[0], "name": r[1], "quantity_text": r[2], "category": r[3]} for r in rows]
+
+def add_inventory_items_batch(household_id, created_by_user_id, items):
+    """Insert multiple inventory items in one transaction. Returns count of added rows."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for item in items:
+                cur.execute(
+                    """
+                    INSERT INTO inventory_items (household_id, name, quantity_text, category, created_by_user_id)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        household_id,
+                        item["name"],
+                        item["quantity_text"] or None,
+                        item.get("category") or "Інше їстівне",
+                        created_by_user_id,
+                    )
+                )
+        conn.commit()
+    return len(items)
+
+def delete_inventory_item_by_id(item_id):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM inventory_items WHERE id = %s RETURNING name",
                 (item_id,)
             )
             row = cur.fetchone()

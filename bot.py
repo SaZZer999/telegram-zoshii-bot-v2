@@ -15,6 +15,9 @@ from database import (
     mark_item_by_id,
     delete_item_by_id,
     add_shopping_items_batch,
+    get_inventory_items,
+    add_inventory_items_batch,
+    delete_inventory_item_by_id,
 )
 
 # =========================
@@ -55,6 +58,10 @@ shopping_mode = {}      # chat_id -> "adding" | "marking" | "deleting"
 pending_confirm = {}    # chat_id -> {action, item_id, item_name, user_db_id}
 pending_candidates = {} # chat_id -> {action, items, user_db_id}
 pending_batch = {}      # chat_id -> {items, household_id, user_db_id}
+inventory_mode = {}             # chat_id -> "adding" | "removing"
+pending_inventory_batch = {}    # chat_id -> {items, ignored_items, household_id, user_db_id}
+pending_inventory_confirm = {}  # chat_id -> {item_id, item_name}
+pending_inventory_candidates = {} # chat_id -> {items}
 
 SYSTEM_PROMPT = "Ти корисний AI-помічник. Відповідай українською."
 
@@ -70,6 +77,7 @@ COOKING_SYSTEM_PROMPT = (
 )
 
 DB_ERROR_MSG = "Не вдалося виконати дію зі списком покупок. Спробуйте ще раз трохи пізніше."
+INVENTORY_ERROR_MSG = "Не вдалося виконати дію із запасами. Спробуйте ще раз трохи пізніше."
 
 DEFAULT_CATEGORY = "Інше їстівне"
 
@@ -156,6 +164,24 @@ ADD_PREVIEW_KEYBOARD = {
     "keyboard": [
         ["✅ Додати все", "✏️ Надіслати інший список"],
         ["✏️ Виправити позицію", "❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+INVENTORY_KEYBOARD = {
+    "keyboard": [
+        ["➕ Додати продукти", "📋 Показати запаси"],
+        ["➖ Використати / прибрати", "⬅️ Головне меню"],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+ADD_INVENTORY_PREVIEW_KEYBOARD = {
+    "keyboard": [
+        ["✅ Додати все", "✏️ Надіслати інший список"],
+        ["❌ Скасувати"],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": True,
@@ -256,6 +282,18 @@ def format_shopping_list(items):
         return "Список покупок поки порожній."
     return format_grouped_list(items, "🛒 Список покупок:")
 
+def format_inventory_list(items):
+    if not items:
+        return "Запаси поки порожні."
+    return format_grouped_list(items, "🧊 Запаси:")
+
+def format_inventory_preview(items, ignored_items=None):
+    header = f"🧊 Знайшов продуктів: {len(items)}"
+    text = format_grouped_list(items, header)
+    if ignored_items:
+        text += "\n\nНе додано: " + ", ".join(ignored_items)
+    return text
+
 def get_household_and_user(user_id, display_name=None):
     household_id = get_or_create_household()
     user_db_id = get_or_create_user(user_id, household_id, display_name)
@@ -266,6 +304,12 @@ def clear_shopping_state(chat_id):
     pending_confirm.pop(chat_id, None)
     pending_candidates.pop(chat_id, None)
     pending_batch.pop(chat_id, None)
+
+def clear_inventory_state(chat_id):
+    inventory_mode.pop(chat_id, None)
+    pending_inventory_batch.pop(chat_id, None)
+    pending_inventory_confirm.pop(chat_id, None)
+    pending_inventory_candidates.pop(chat_id, None)
 
 def normalize_name(text):
     text = _APOSTROPHE_RE.sub("'", text)
@@ -392,7 +436,17 @@ def webhook():
 
     # Confirmation buttons — must come before any clear_shopping_state calls
     if text == "✅ Так":
-        if chat_id in pending_confirm:
+        if chat_id in pending_inventory_confirm:
+            confirm = pending_inventory_confirm.pop(chat_id)
+            try:
+                result = delete_inventory_item_by_id(confirm["item_id"])
+                if result is None:
+                    send_message(chat_id, "Цей продукт уже зник із запасів.", reply_markup=INVENTORY_KEYBOARD)
+                else:
+                    send_message(chat_id, f"✅ Прибрано із запасів: {result}", reply_markup=INVENTORY_KEYBOARD)
+            except Exception:
+                send_message(chat_id, INVENTORY_ERROR_MSG)
+        elif chat_id in pending_confirm:
             confirm = pending_confirm.pop(chat_id)
             try:
                 item = {"id": confirm["item_id"], "name": confirm["item_name"]}
@@ -402,7 +456,14 @@ def webhook():
         return "ok"
 
     if text == "❌ Ні":
-        if chat_id in pending_confirm:
+        if chat_id in pending_inventory_confirm:
+            pending_inventory_confirm.pop(chat_id)
+            send_message(
+                chat_id,
+                "Добре. Напиши номер зі списку або повну назву продукту.",
+                reply_markup=INVENTORY_KEYBOARD
+            )
+        elif chat_id in pending_confirm:
             pending_confirm.pop(chat_id)
             send_message(
                 chat_id,
@@ -412,7 +473,18 @@ def webhook():
         return "ok"
 
     if text == "✅ Додати все":
-        if chat_id in pending_batch:
+        if chat_id in pending_inventory_batch:
+            batch = pending_inventory_batch.pop(chat_id)
+            try:
+                count = add_inventory_items_batch(
+                    batch["household_id"],
+                    batch["user_db_id"],
+                    batch["items"]
+                )
+                send_message(chat_id, f"✅ Додано до запасів: {count}", reply_markup=INVENTORY_KEYBOARD)
+            except Exception:
+                send_message(chat_id, INVENTORY_ERROR_MSG)
+        elif chat_id in pending_batch:
             batch = pending_batch.pop(chat_id)
             try:
                 count = add_shopping_items_batch(
@@ -426,14 +498,23 @@ def webhook():
         return "ok"
 
     if text == "✏️ Надіслати інший список":
-        pending_batch.pop(chat_id, None)
-        shopping_mode[chat_id] = "adding"
-        send_message(chat_id, "Надішли один товар або список товарів. Можна кожен товар з нового рядка.")
+        if chat_id in pending_inventory_batch:
+            pending_inventory_batch.pop(chat_id, None)
+            inventory_mode[chat_id] = "adding"
+            send_message(chat_id, "Надішли один продукт або список продуктів. Можна кожен продукт з нового рядка.")
+        else:
+            pending_batch.pop(chat_id, None)
+            shopping_mode[chat_id] = "adding"
+            send_message(chat_id, "Надішли один товар або список товарів. Можна кожен товар з нового рядка.")
         return "ok"
 
     if text == "❌ Скасувати":
-        clear_shopping_state(chat_id)
-        send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
+        if chat_id in pending_inventory_batch:
+            clear_inventory_state(chat_id)
+            send_message(chat_id, "Додавання продуктів скасовано.", reply_markup=INVENTORY_KEYBOARD)
+        else:
+            clear_shopping_state(chat_id)
+            send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
         return "ok"
 
     if text == "✏️ Виправити позицію":
@@ -446,6 +527,7 @@ def webhook():
     if text == "/start":
         waiting_for_ingredients.pop(chat_id, None)
         clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
         send_message(
             chat_id,
             "Привіт! Я твій домашній помічник 🏠\n\n"
@@ -457,6 +539,7 @@ def webhook():
     if text == "/menu":
         waiting_for_ingredients.pop(chat_id, None)
         clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -475,6 +558,7 @@ def webhook():
     if text == "🛒 Покупки":
         waiting_for_ingredients.pop(chat_id, None)
         clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
         send_message(chat_id, "🛒 Список покупок:", reply_markup=SHOPPING_KEYBOARD)
         return "ok"
 
@@ -531,11 +615,51 @@ def webhook():
     if text == "⬅️ Головне меню":
         waiting_for_ingredients.pop(chat_id, None)
         clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
     if text == "🧊 Запаси":
-        send_message(chat_id, "Облік запасів буде доданий після підключення постійної бази даних.")
+        waiting_for_ingredients.pop(chat_id, None)
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        send_message(chat_id, "🧊 Запаси:", reply_markup=INVENTORY_KEYBOARD)
+        return "ok"
+
+    if text == "➕ Додати продукти":
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        inventory_mode[chat_id] = "adding"
+        send_message(chat_id, "Надішли один продукт або список продуктів. Можна кожен продукт з нового рядка.")
+        return "ok"
+
+    if text == "📋 Показати запаси":
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        try:
+            household_id, _ = get_household_and_user(user_id, display_name)
+            items = get_inventory_items(household_id)
+            send_message(chat_id, format_inventory_list(items))
+        except Exception:
+            send_message(chat_id, INVENTORY_ERROR_MSG)
+        return "ok"
+
+    if text == "➖ Використати / прибрати":
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        try:
+            household_id, _ = get_household_and_user(user_id, display_name)
+            items = get_inventory_items(household_id)
+            if not items:
+                send_message(chat_id, "Запаси поки порожні.")
+            else:
+                send_message(
+                    chat_id,
+                    format_inventory_list(items) + "\n\nНапиши номер або назву продукту, який потрібно повністю прибрати."
+                )
+                inventory_mode[chat_id] = "removing"
+        except Exception:
+            send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
 
     if text == "🍽️ Що приготувати":
@@ -560,7 +684,27 @@ def webhook():
     # SHOPPING MODE
     # =========================
 
-    # Candidates sub-list: user picks from a previously shown shortlist
+    # Inventory candidates: user picks from a shortlist
+    if chat_id in pending_inventory_candidates:
+        cands = pending_inventory_candidates.pop(chat_id)
+        candidate_items = cands["items"]
+        try:
+            num = int(text.strip())
+            if num < 1 or num > len(candidate_items):
+                send_message(chat_id, "Такого номера немає. Напиши номер зі списку або повну назву продукту.")
+                pending_inventory_candidates[chat_id] = cands
+            else:
+                result = delete_inventory_item_by_id(candidate_items[num - 1]["id"])
+                if result is None:
+                    send_message(chat_id, "Цей продукт уже зник із запасів.", reply_markup=INVENTORY_KEYBOARD)
+                else:
+                    send_message(chat_id, f"✅ Прибрано із запасів: {result}", reply_markup=INVENTORY_KEYBOARD)
+        except ValueError:
+            send_message(chat_id, "Напиши число — номер зі списку варіантів:")
+            pending_inventory_candidates[chat_id] = cands
+        return "ok"
+
+    # Shopping candidates sub-list: user picks from a previously shown shortlist
     if chat_id in pending_candidates:
         cands = pending_candidates.pop(chat_id)
         candidate_items = cands["items"]
@@ -694,6 +838,95 @@ def webhook():
 
         except Exception:
             send_message(chat_id, DB_ERROR_MSG)
+        return "ok"
+
+    # =========================
+    # INVENTORY MODE
+    # =========================
+    inv_mode = inventory_mode.pop(chat_id, None)
+
+    if inv_mode == "adding":
+        result = parse_shopping_list_with_gemini(text)
+        if result is None:
+            inventory_mode[chat_id] = "adding"
+            send_message(
+                chat_id,
+                "Не зміг точно розібрати список. Надішли продукти ще раз, бажано кожен з нового рядка."
+            )
+            return "ok"
+        items = result["items"]
+        if not items:
+            inventory_mode[chat_id] = "adding"
+            ignored = result["ignored_items"]
+            msg = "Не знайшов їстівних продуктів у списку. Надішли ще раз."
+            if ignored:
+                msg += "\n\nНе додано: " + ", ".join(ignored)
+            send_message(chat_id, msg)
+            return "ok"
+        try:
+            household_id, user_db_id = get_household_and_user(user_id, display_name)
+            pending_inventory_batch[chat_id] = {
+                "items": items,
+                "ignored_items": result["ignored_items"],
+                "household_id": household_id,
+                "user_db_id": user_db_id,
+            }
+            preview = format_inventory_preview(items, result["ignored_items"])
+            send_message(chat_id, preview, reply_markup=ADD_INVENTORY_PREVIEW_KEYBOARD)
+        except Exception:
+            send_message(chat_id, INVENTORY_ERROR_MSG)
+        return "ok"
+
+    if inv_mode == "removing":
+        try:
+            household_id, user_db_id = get_household_and_user(user_id, display_name)
+            items = get_inventory_items(household_id)
+
+            try:
+                num = int(text.strip())
+                if num < 1 or num > len(items):
+                    send_message(chat_id, "Такого номера немає. Напиши номер зі списку або повну назву продукту.")
+                    inventory_mode[chat_id] = "removing"
+                    return "ok"
+                result = delete_inventory_item_by_id(items[num - 1]["id"])
+                if result is None:
+                    send_message(chat_id, "Цей продукт уже зник із запасів.", reply_markup=INVENTORY_KEYBOARD)
+                else:
+                    send_message(chat_id, f"✅ Прибрано із запасів: {result}", reply_markup=INVENTORY_KEYBOARD)
+                return "ok"
+            except ValueError:
+                pass
+
+            exact, fuzzy = find_items_by_name(text, items)
+            candidates = exact if exact else fuzzy
+
+            if not candidates:
+                send_message(chat_id, "Не знайшов такого продукту. Напиши номер зі списку або повну назву.")
+                inventory_mode[chat_id] = "removing"
+            elif exact and len(candidates) == 1:
+                result = delete_inventory_item_by_id(candidates[0]["id"])
+                if result is None:
+                    send_message(chat_id, "Цей продукт уже зник із запасів.", reply_markup=INVENTORY_KEYBOARD)
+                else:
+                    send_message(chat_id, f"✅ Прибрано із запасів: {result}", reply_markup=INVENTORY_KEYBOARD)
+            elif fuzzy and len(candidates) == 1:
+                item = candidates[0]
+                pending_inventory_confirm[chat_id] = {
+                    "item_id": item["id"],
+                    "item_name": item["name"],
+                }
+                send_message(chat_id, f"Маєш на увазі «{item['name']}»?", reply_markup=CONFIRM_KEYBOARD)
+            else:
+                pending_inventory_candidates[chat_id] = {
+                    "items": [{"id": c["id"], "name": c["name"]} for c in candidates],
+                }
+                lines = [f"{i + 1}. {c['name']}" for i, c in enumerate(candidates)]
+                send_message(
+                    chat_id,
+                    "Знайшов кілька варіантів:\n\n" + "\n".join(lines) + "\n\nНапиши номер потрібного продукту."
+                )
+        except Exception:
+            send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
 
     # =========================
