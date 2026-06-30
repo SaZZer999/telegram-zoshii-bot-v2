@@ -169,6 +169,23 @@ INTENT_ROUTER_PROMPT = (
     "{\"intent\": \"merge_duplicates\", \"merge_groups\": [{\"item_refs\": [1, 2], \"merged_name\": \"Вершки\", \"merged_quantity_text\": \"\", \"merged_category\": \"Молочне та яйця\"}]}"
 )
 
+PENDING_PREVIEW_EDIT_PROMPT = (
+    "Ти помічник для редагування pending preview списку товарів.\n"
+    "Визнач намір (intent):\n"
+    "- «edit_preview» — якщо користувач хоче змінити кількість, назву або категорію існуючих позицій\n"
+    "- «merge_duplicates» — якщо хоче об'єднати однакові або дублюючі позиції\n"
+    "- «none» — в усіх інших випадках\n\n"
+    "Для edit_preview — поверни updates лише для позицій, які змінюються:\n"
+    "- item_number — ціле число (номер у preview, від 1 до N)\n"
+    "- name — нова назва або null якщо не змінюється\n"
+    "- quantity_text — нова кількість (напр. «2 шт.», «500 г», «1,5 л») або null\n"
+    "- category — нова категорія або null\n\n"
+    "Не створюй нових позицій і не видаляй існуючих.\n"
+    "Нормалізуй одиниці: «2 штуки» → «2 шт.», «500 грам» → «500 г», «1.5 л» → «1,5 л».\n\n"
+    "Відповідай ТІЛЬКИ валідним JSON без жодного тексту:\n"
+    "{\"intent\": \"edit_preview\", \"updates\": [{\"item_number\": 1, \"name\": null, \"quantity_text\": \"2 шт.\", \"category\": null}]}"
+)
+
 # =========================
 # KEYBOARDS
 # =========================
@@ -540,6 +557,86 @@ def _ask_gemini_intent_router(user_text, items):
         }
     except (json.JSONDecodeError, ValueError, TypeError):
         return {"intent": "none", "merge_groups": []}
+
+
+def _ask_gemini_preview_edit_router(user_text, items, context_type):
+    """Gemini call: detect edit_preview or merge_duplicates for an active pending preview."""
+    lines = []
+    for i, item in enumerate(items):
+        label = f"{i + 1}. {item['name']}"
+        if item.get("quantity_text"):
+            label += f" — {item['quantity_text']}"
+        label += f" [{item.get('category') or DEFAULT_CATEGORY}]"
+        lines.append(label)
+    prompt = (
+        f"Контекст: {context_type}\n"
+        "Товари у preview:\n" + "\n".join(lines)
+        + f"\n\nКористувач написав: {user_text}"
+    )
+    raw = call_gemini([{"role": "user", "content": prompt}], PENDING_PREVIEW_EDIT_PROMPT, temperature=0.1)
+    if not raw:
+        return {"intent": "none", "updates": []}
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
+        if m:
+            cleaned = m.group(1).strip()
+    try:
+        data = json.loads(cleaned)
+        return {
+            "intent": data.get("intent", "none"),
+            "updates": data.get("updates") if isinstance(data.get("updates"), list) else [],
+        }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {"intent": "none", "updates": []}
+
+
+def _validate_preview_updates(updates, items):
+    """Validate Gemini preview edit updates. Returns list of valid updates or None."""
+    if not isinstance(updates, list) or not updates:
+        return None
+    total = len(items)
+    used_numbers = set()
+    valid = []
+    for upd in updates:
+        if not isinstance(upd, dict):
+            return None
+        num = upd.get("item_number")
+        if not isinstance(num, int) or num < 1 or num > total:
+            return None
+        if num in used_numbers:
+            return None
+        used_numbers.add(num)
+        name = upd.get("name")
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            return None
+        qty = upd.get("quantity_text")
+        if qty is not None and (not isinstance(qty, str) or not qty.strip()):
+            return None
+        cat = upd.get("category")
+        if cat is not None and cat not in VALID_CATEGORIES:
+            return None
+        valid.append({
+            "item_number": num,
+            "name": name,
+            "quantity_text": qty,
+            "category": cat,
+        })
+    return valid
+
+
+def _apply_preview_updates(items, valid_updates):
+    """Apply validated updates to items list. Returns new list without mutating originals."""
+    result = [dict(item) for item in items]
+    for upd in valid_updates:
+        idx = upd["item_number"] - 1
+        if upd.get("name") is not None:
+            result[idx]["name"] = str(upd["name"]).strip()
+        if upd.get("quantity_text") is not None:
+            result[idx]["quantity_text"] = upd["quantity_text"].strip()
+        if upd.get("category") is not None:
+            result[idx]["category"] = upd["category"]
+    return result
 
 
 def _format_merge_preview(validated_groups):
@@ -1240,39 +1337,71 @@ def webhook():
         return "ok"
 
     # =========================
-    # MERGE INTENT DETECTION
-    # Case 1: pending shopping batch (RAM items, no DB access).
-    # Case 2: pending inventory batch (RAM items, no DB access).
-    # Case 3: saved list context (load from DB).
-    # intent=="merge_duplicates" → intercept; intent=="none" → fall through to AI chat.
+    # PENDING PREVIEW ROUTER
+    # Intercepts text when a pending add preview is active (shopping or inventory).
+    # Priority: edit_preview → apply + show preview; merge_duplicates → local merge;
+    # none → fall through to AI chat.
+    # No DB writes until ✅ Додати все.
+    # Saved list context (3rd branch): only merge_duplicates, unchanged.
     # =========================
-    _merge_intercepted = False
-    if chat_id in pending_batch and len(pending_batch[chat_id]["items"]) >= 2:
+    _preview_intercepted = False
+
+    if chat_id in pending_batch:
+        batch = pending_batch[chat_id]
         try:
-            raw = _ask_gemini_intent_router(text, pending_batch[chat_id]["items"])
-            if raw["intent"] == "merge_duplicates":
-                _merge_intercepted = True
-                validated = _validate_merge_groups(raw["merge_groups"], pending_batch[chat_id]["items"], is_pending=True)
-                if validated:
-                    pending_merge[chat_id] = {"groups": validated, "list_type": "shopping_pending_add"}
-                    send_message(chat_id, _format_merge_preview(validated), reply_markup=MERGE_PREVIEW_KEYBOARD)
+            router_result = _ask_gemini_preview_edit_router(text, batch["items"], "shopping_pending_add")
+            intent = router_result["intent"]
+            if intent == "edit_preview":
+                valid_updates = _validate_preview_updates(router_result["updates"], batch["items"])
+                if valid_updates:
+                    batch["items"] = _apply_preview_updates(batch["items"], valid_updates)
+                    preview = format_batch_preview(batch["items"], batch.get("ignored_items"))
+                    send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
+                else:
+                    send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
+                _preview_intercepted = True
+            elif intent == "merge_duplicates":
+                merged = _auto_merge_in_place(batch["items"])
+                if len(merged) < len(batch["items"]):
+                    batch["items"] = merged
+                    preview = format_batch_preview(merged, batch.get("ignored_items"))
+                    send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
                 else:
                     send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
+                _preview_intercepted = True
+            # intent == "none": fall through to AI chat
         except Exception:
-            pass
-    elif chat_id in pending_inventory_batch and len(pending_inventory_batch[chat_id]["items"]) >= 2:
+            send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
+            _preview_intercepted = True
+
+    elif chat_id in pending_inventory_batch:
+        batch = pending_inventory_batch[chat_id]
         try:
-            raw = _ask_gemini_intent_router(text, pending_inventory_batch[chat_id]["items"])
-            if raw["intent"] == "merge_duplicates":
-                _merge_intercepted = True
-                validated = _validate_merge_groups(raw["merge_groups"], pending_inventory_batch[chat_id]["items"], is_pending=True)
-                if validated:
-                    pending_merge[chat_id] = {"groups": validated, "list_type": "inventory_pending_add"}
-                    send_message(chat_id, _format_merge_preview(validated), reply_markup=MERGE_PREVIEW_KEYBOARD)
+            router_result = _ask_gemini_preview_edit_router(text, batch["items"], "inventory_pending_add")
+            intent = router_result["intent"]
+            if intent == "edit_preview":
+                valid_updates = _validate_preview_updates(router_result["updates"], batch["items"])
+                if valid_updates:
+                    batch["items"] = _apply_preview_updates(batch["items"], valid_updates)
+                    preview = format_inventory_preview(batch["items"], batch.get("ignored_items"))
+                    send_message(chat_id, preview, reply_markup=ADD_INVENTORY_PREVIEW_KEYBOARD)
+                else:
+                    send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
+                _preview_intercepted = True
+            elif intent == "merge_duplicates":
+                merged = _auto_merge_in_place(batch["items"])
+                if len(merged) < len(batch["items"]):
+                    batch["items"] = merged
+                    preview = format_inventory_preview(merged, batch.get("ignored_items"))
+                    send_message(chat_id, preview, reply_markup=ADD_INVENTORY_PREVIEW_KEYBOARD)
                 else:
                     send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
+                _preview_intercepted = True
+            # intent == "none": fall through to AI chat
         except Exception:
-            pass
+            send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
+            _preview_intercepted = True
+
     else:
         ctx = active_list_context.get(chat_id)
         if ctx in ("shopping", "inventory"):
@@ -1286,7 +1415,7 @@ def webhook():
                 if len(list_items) >= 2:
                     raw = _ask_gemini_intent_router(text, list_items)
                     if raw["intent"] == "merge_duplicates":
-                        _merge_intercepted = True
+                        _preview_intercepted = True
                         list_type = "shopping_saved" if ctx == "shopping" else "inventory_saved"
                         validated = _validate_merge_groups(raw["merge_groups"], list_items, is_pending=False)
                         if validated:
@@ -1301,7 +1430,8 @@ def webhook():
                             send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
             except Exception:
                 pass
-    if _merge_intercepted:
+
+    if _preview_intercepted:
         return "ok"
 
     # =========================
