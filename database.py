@@ -343,3 +343,33 @@ def mark_items_batch(item_ids, completed_by_user_id):
             count = cur.rowcount
         conn.commit()
     return count
+
+def delete_items_batch(item_ids):
+    """Delete multiple shopping items in one transaction. Returns count of deleted rows."""
+    if not item_ids:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(item_ids))
+            cur.execute(
+                f"DELETE FROM shopping_items WHERE id IN ({placeholders}) AND is_completed = FALSE",
+                list(item_ids)
+            )
+            count = cur.rowcount
+        conn.commit()
+    return count
+
+def delete_inventory_items_batch(item_ids):
+    """Delete multiple inventory items in one transaction. Returns count of deleted rows."""
+    if not item_ids:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(item_ids))
+            cur.execute(
+                f"DELETE FROM inventory_items WHERE id IN ({placeholders})",
+                list(item_ids)
+            )
+            count = cur.rowcount
+        conn.commit()
+    return count
