@@ -49,6 +49,10 @@ def init_db():
                 ON shopping_items (household_id)
                 WHERE is_completed = FALSE
             """)
+            cur.execute("""
+                ALTER TABLE shopping_items
+                ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'Інше їстівне'
+            """)
         conn.commit()
 
 def get_or_create_household():
@@ -101,7 +105,7 @@ def get_active_shopping_items(household_id):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, name, quantity_text
+                SELECT id, name, quantity_text, category
                 FROM shopping_items
                 WHERE household_id = %s AND is_completed = FALSE
                 ORDER BY created_at ASC
@@ -109,7 +113,7 @@ def get_active_shopping_items(household_id):
                 (household_id,)
             )
             rows = cur.fetchall()
-    return [{"id": r[0], "name": r[1], "quantity_text": r[2]} for r in rows]
+    return [{"id": r[0], "name": r[1], "quantity_text": r[2], "category": r[3]} for r in rows]
 
 def mark_item_completed(household_id, item_number, completed_by_user_id):
     items = get_active_shopping_items(household_id)
@@ -181,10 +185,16 @@ def add_shopping_items_batch(household_id, created_by_user_id, items):
             for item in items:
                 cur.execute(
                     """
-                    INSERT INTO shopping_items (household_id, name, quantity_text, created_by_user_id)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO shopping_items (household_id, name, quantity_text, category, created_by_user_id)
+                    VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (household_id, item["name"], item["quantity_text"] or None, created_by_user_id)
+                    (
+                        household_id,
+                        item["name"],
+                        item["quantity_text"] or None,
+                        item.get("category") or "Інше їстівне",
+                        created_by_user_id,
+                    )
                 )
         conn.commit()
     return len(items)
