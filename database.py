@@ -173,3 +173,18 @@ def delete_item_by_id(item_id):
             row = cur.fetchone()
         conn.commit()
     return row[0] if row else None
+
+def add_shopping_items_batch(household_id, created_by_user_id, items):
+    """Insert multiple items in one transaction. Returns count of added rows."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for item in items:
+                cur.execute(
+                    """
+                    INSERT INTO shopping_items (household_id, name, quantity_text, created_by_user_id)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (household_id, item["name"], item["quantity_text"] or None, created_by_user_id)
+                )
+        conn.commit()
+    return len(items)

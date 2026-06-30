@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import difflib
@@ -13,6 +14,7 @@ from database import (
     get_active_shopping_items,
     mark_item_by_id,
     delete_item_by_id,
+    add_shopping_items_batch,
 )
 
 # =========================
@@ -52,6 +54,7 @@ waiting_for_ingredients = {}
 shopping_mode = {}      # chat_id -> "adding" | "marking" | "deleting"
 pending_confirm = {}    # chat_id -> {action, item_id, item_name, user_db_id}
 pending_candidates = {} # chat_id -> {action, items, user_db_id}
+pending_batch = {}      # chat_id -> {items, household_id, user_db_id}
 
 SYSTEM_PROMPT = "Ти корисний AI-помічник. Відповідай українською."
 
@@ -67,6 +70,24 @@ COOKING_SYSTEM_PROMPT = (
 )
 
 DB_ERROR_MSG = "Не вдалося виконати дію зі списком покупок. Спробуйте ще раз трохи пізніше."
+
+SHOPPING_PARSE_PROMPT = (
+    "Розбий текст на список товарів для покупки. Правила:\n"
+    "- розділяй товари за новими рядками, комами, крапками з комою або природними розділеннями;\n"
+    "- «Мисливські ковбаски 4» — це ОДИН товар із кількістю «4», а не два окремих;\n"
+    "- виправляй лише очевидні орфографічні помилки;\n"
+    "- не вигадуй товари, яких немає в тексті;\n"
+    "- не вигадуй одиниці виміру, якщо вони не вказані явно;\n"
+    "- число або кількість зберігай у quantity_text як рядок (наприклад: «6», «2 л», «1.5»); "
+    "якщо кількість не вказана — порожній рядок;\n"
+    "- якщо виправив орфографічну помилку, вкажи її у correction_note у форматі "
+    "«Виправлено «оригінал» → «виправлено»»; інакше — порожній рядок.\n\n"
+    "Відповідай ТІЛЬКИ валідним JSON, без жодного додаткового тексту:\n"
+    '{"items": ['
+    '{"name": "Вершки", "quantity_text": "", "original_text": "Виршки", "correction_note": "Виправлено «Виршки» → «Вершки»"}, '
+    '{"name": "Молоко", "quantity_text": "1.5", "original_text": "Молоко 1.5", "correction_note": ""}'
+    "]}"
+)
 
 # =========================
 # KEYBOARDS
@@ -92,6 +113,15 @@ SHOPPING_KEYBOARD = {
 
 CONFIRM_KEYBOARD = {
     "keyboard": [["✅ Так", "❌ Ні"]],
+    "resize_keyboard": True,
+    "one_time_keyboard": True
+}
+
+ADD_PREVIEW_KEYBOARD = {
+    "keyboard": [
+        ["✅ Додати все", "✏️ Надіслати інший список"],
+        ["❌ Скасувати"]
+    ],
     "resize_keyboard": True,
     "one_time_keyboard": True
 }
@@ -185,6 +215,7 @@ def clear_shopping_state(chat_id):
     shopping_mode.pop(chat_id, None)
     pending_confirm.pop(chat_id, None)
     pending_candidates.pop(chat_id, None)
+    pending_batch.pop(chat_id, None)
 
 def normalize_name(text):
     text = _APOSTROPHE_RE.sub("'", text)
@@ -218,6 +249,55 @@ def _execute_action_by_id(chat_id, action, item, user_db_id):
             send_message(chat_id, "Цей товар уже зник зі списку. Онови список покупок.")
         else:
             send_message(chat_id, f"🗑️ Видалено: {result}")
+
+def parse_shopping_list_with_gemini(text):
+    """Call Gemini once to parse a free-form shopping list into structured items.
+
+    Returns a list of dicts with keys: name, quantity_text, original_text, correction_note.
+    Returns None if the response is missing or invalid.
+    """
+    history = [{"role": "user", "content": text}]
+    raw = call_gemini(history, SHOPPING_PARSE_PROMPT, temperature=0.1)
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    # Strip optional markdown code fences
+    if "```" in cleaned:
+        match = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
+        if match:
+            cleaned = match.group(1).strip()
+    try:
+        data = json.loads(cleaned)
+        raw_items = data.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            return None
+        result = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                return None
+            name = item.get("name", "").strip()
+            if not name:
+                return None
+            result.append({
+                "name": name,
+                "quantity_text": item.get("quantity_text", "").strip(),
+                "original_text": item.get("original_text", "").strip(),
+                "correction_note": item.get("correction_note", "").strip(),
+            })
+        return result
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+
+def format_batch_preview(items):
+    lines = [f"🛒 Знайшов товарів: {len(items)}\n"]
+    for i, item in enumerate(items, 1):
+        if item["quantity_text"]:
+            lines.append(f"{i}. {item['name']} — {item['quantity_text']}")
+        else:
+            lines.append(f"{i}. {item['name']}")
+        if item["correction_note"]:
+            lines.append(f"   {item['correction_note']}")
+    return "\n".join(lines)
 
 @app.route("/")
 def home():
@@ -277,6 +357,31 @@ def webhook():
             )
         return "ok"
 
+    if text == "✅ Додати все":
+        if chat_id in pending_batch:
+            batch = pending_batch.pop(chat_id)
+            try:
+                count = add_shopping_items_batch(
+                    batch["household_id"],
+                    batch["user_db_id"],
+                    batch["items"]
+                )
+                send_message(chat_id, f"✅ Додано товарів: {count}", reply_markup=SHOPPING_KEYBOARD)
+            except Exception:
+                send_message(chat_id, DB_ERROR_MSG)
+        return "ok"
+
+    if text == "✏️ Надіслати інший список":
+        pending_batch.pop(chat_id, None)
+        shopping_mode[chat_id] = "adding"
+        send_message(chat_id, "Надішли один товар або список товарів. Можна кожен товар з нового рядка.")
+        return "ok"
+
+    if text == "❌ Скасувати":
+        clear_shopping_state(chat_id)
+        send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
+        return "ok"
+
     if text == "/start":
         waiting_for_ingredients.pop(chat_id, None)
         clear_shopping_state(chat_id)
@@ -315,7 +420,7 @@ def webhook():
     if text == "➕ Додати товар":
         clear_shopping_state(chat_id)
         shopping_mode[chat_id] = "adding"
-        send_message(chat_id, "Напиши назву товару.\nПриклад: молоко — 2 л або яйця")
+        send_message(chat_id, "Надішли один товар або список товарів. Можна кожен товар з нового рядка.")
         return "ok"
 
     if text == "📋 Показати список":
@@ -415,14 +520,23 @@ def webhook():
     mode = shopping_mode.pop(chat_id, None)
 
     if mode == "adding":
-        name, quantity_text = parse_item_text(text)
+        parsed_items = parse_shopping_list_with_gemini(text)
+        if parsed_items is None:
+            shopping_mode[chat_id] = "adding"
+            send_message(
+                chat_id,
+                "Не зміг точно розібрати список. Надішли товари ще раз, бажано кожен з нового рядка."
+            )
+            return "ok"
         try:
             household_id, user_db_id = get_household_and_user(user_id, display_name)
-            add_shopping_item(household_id, name, quantity_text, user_db_id)
-            if quantity_text:
-                send_message(chat_id, f"✅ Додано: {name} — {quantity_text}")
-            else:
-                send_message(chat_id, f"✅ Додано: {name}")
+            pending_batch[chat_id] = {
+                "items": parsed_items,
+                "household_id": household_id,
+                "user_db_id": user_db_id,
+            }
+            preview = format_batch_preview(parsed_items)
+            send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
         except Exception:
             send_message(chat_id, DB_ERROR_MSG)
         return "ok"
