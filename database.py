@@ -230,6 +230,73 @@ def add_inventory_items_batch(household_id, created_by_user_id, items):
         conn.commit()
     return len(items)
 
+_MERGEABLE_UNITS = {"л", "мл", "г", "кг", "шт."}
+
+def _parse_quantity(qty_text):
+    """Parse 'number unit' string. Returns (float, str) or (None, None)."""
+    if not qty_text:
+        return None, None
+    normalized = qty_text.strip().replace(",", ".")
+    parts = normalized.split()
+    if len(parts) != 2:
+        return None, None
+    try:
+        return float(parts[0]), parts[1]
+    except ValueError:
+        return None, None
+
+def add_or_merge_inventory_item(household_id, created_by_user_id, name, quantity_text, category):
+    """Add item to inventory, merging quantity with an existing entry when safe.
+
+    Merges only when: same normalized name, same category, both quantities have the
+    same unit from _MERGEABLE_UNITS and numeric values that can be summed.
+    Returns 'merged' or 'added'.
+    """
+    category = category or "Інше їстівне"
+    norm_name = name.strip().lower()
+    new_val, new_unit = _parse_quantity(quantity_text)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if new_val is not None and new_unit in _MERGEABLE_UNITS:
+                cur.execute(
+                    """
+                    SELECT id, quantity_text
+                    FROM inventory_items
+                    WHERE household_id = %s
+                      AND LOWER(TRIM(name)) = %s
+                      AND category = %s
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """,
+                    (household_id, norm_name, category)
+                )
+                existing = cur.fetchone()
+                if existing:
+                    ex_id, ex_qty_text = existing
+                    ex_val, ex_unit = _parse_quantity(ex_qty_text)
+                    if ex_val is not None and ex_unit == new_unit:
+                        merged = round(ex_val + new_val, 1)
+                        if merged == int(merged):
+                            merged_qty = f"{int(merged)} {new_unit}"
+                        else:
+                            merged_qty = str(merged).replace(".", ",") + f" {new_unit}"
+                        cur.execute(
+                            "UPDATE inventory_items SET quantity_text = %s, updated_at = NOW() WHERE id = %s",
+                            (merged_qty, ex_id)
+                        )
+                        conn.commit()
+                        return "merged"
+            cur.execute(
+                """
+                INSERT INTO inventory_items (household_id, name, quantity_text, category, created_by_user_id)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (household_id, name, quantity_text or None, category, created_by_user_id)
+            )
+        conn.commit()
+    return "added"
+
 def delete_inventory_item_by_id(item_id):
     with get_connection() as conn:
         with conn.cursor() as cur:

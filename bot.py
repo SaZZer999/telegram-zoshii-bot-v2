@@ -18,6 +18,7 @@ from database import (
     get_inventory_items,
     add_inventory_items_batch,
     delete_inventory_item_by_id,
+    add_or_merge_inventory_item,
 )
 
 # =========================
@@ -62,6 +63,7 @@ inventory_mode = {}             # chat_id -> "adding" | "removing"
 pending_inventory_batch = {}    # chat_id -> {items, ignored_items, household_id, user_db_id}
 pending_inventory_confirm = {}  # chat_id -> {item_id, item_name}
 pending_inventory_candidates = {} # chat_id -> {items}
+pending_buy_to_inventory = {}   # chat_id -> {item_id, item_name, quantity_text, category, user_db_id, household_id}
 
 SYSTEM_PROMPT = "Ти корисний AI-помічник. Відповідай українською."
 
@@ -176,6 +178,15 @@ INVENTORY_KEYBOARD = {
     ],
     "resize_keyboard": True,
     "is_persistent": True,
+}
+
+BUY_TO_INVENTORY_KEYBOARD = {
+    "keyboard": [
+        ["✅ Так, додати", "❌ Ні, лише прибрати"],
+        ["⬅️ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
 }
 
 ADD_INVENTORY_PREVIEW_KEYBOARD = {
@@ -304,6 +315,7 @@ def clear_shopping_state(chat_id):
     pending_confirm.pop(chat_id, None)
     pending_candidates.pop(chat_id, None)
     pending_batch.pop(chat_id, None)
+    pending_buy_to_inventory.pop(chat_id, None)
 
 def clear_inventory_state(chat_id):
     inventory_mode.pop(chat_id, None)
@@ -330,19 +342,31 @@ def find_items_by_name(query, items):
     return [], fuzzy
 
 def _execute_action_by_id(chat_id, action, item, user_db_id):
-    """Perform mark or delete by item dict {id, name}. Handles race condition."""
-    if action == "marking":
-        result = mark_item_by_id(item["id"], user_db_id)
-        if result is None:
-            send_message(chat_id, "Цей товар уже зник зі списку. Онови список покупок.")
-        else:
-            send_message(chat_id, f"✅ Куплено: {result}")
-    else:  # deleting
-        result = delete_item_by_id(item["id"])
-        if result is None:
-            send_message(chat_id, "Цей товар уже зник зі списку. Онови список покупок.")
-        else:
-            send_message(chat_id, f"🗑️ Видалено: {result}")
+    """Perform delete by item dict {id, name}. Handles race condition. Not used for marking."""
+    result = delete_item_by_id(item["id"])
+    if result is None:
+        send_message(chat_id, "Цей товар уже зник зі списку. Онови список покупок.")
+    else:
+        send_message(chat_id, f"🗑️ Видалено: {result}")
+
+def _prompt_buy_to_inventory(chat_id, item, user_db_id, household_id):
+    """Store pending state and ask the user whether to also add the bought item to inventory."""
+    pending_buy_to_inventory[chat_id] = {
+        "item_id": item["id"],
+        "item_name": item["name"],
+        "quantity_text": item.get("quantity_text") or "",
+        "category": item.get("category") or DEFAULT_CATEGORY,
+        "user_db_id": user_db_id,
+        "household_id": household_id,
+    }
+    label = item["name"]
+    if item.get("quantity_text"):
+        label = f"{item['name']} — {item['quantity_text']}"
+    send_message(
+        chat_id,
+        f"{label}\n\nДодати цей товар до запасів?",
+        reply_markup=BUY_TO_INVENTORY_KEYBOARD
+    )
 
 def parse_shopping_list_with_gemini(text):
     """Call Gemini once to parse a free-form shopping list.
@@ -449,8 +473,17 @@ def webhook():
         elif chat_id in pending_confirm:
             confirm = pending_confirm.pop(chat_id)
             try:
-                item = {"id": confirm["item_id"], "name": confirm["item_name"]}
-                _execute_action_by_id(chat_id, confirm["action"], item, confirm["user_db_id"])
+                if confirm["action"] == "marking":
+                    item = {
+                        "id": confirm["item_id"],
+                        "name": confirm["item_name"],
+                        "quantity_text": confirm.get("item_quantity_text", ""),
+                        "category": confirm.get("item_category", DEFAULT_CATEGORY),
+                    }
+                    _prompt_buy_to_inventory(chat_id, item, confirm["user_db_id"], confirm["household_id"])
+                else:
+                    item = {"id": confirm["item_id"], "name": confirm["item_name"]}
+                    _execute_action_by_id(chat_id, confirm["action"], item, confirm["user_db_id"])
             except Exception:
                 send_message(chat_id, DB_ERROR_MSG)
         return "ok"
@@ -522,6 +555,45 @@ def webhook():
             n = len(pending_batch[chat_id]["items"])
             shopping_mode[chat_id] = "editing_number"
             send_message(chat_id, f"Напиши номер позиції для виправлення (1–{n}):")
+        return "ok"
+
+    if text == "✅ Так, додати":
+        if chat_id in pending_buy_to_inventory:
+            data = pending_buy_to_inventory.pop(chat_id)
+            try:
+                marked = mark_item_by_id(data["item_id"], data["user_db_id"])
+                if marked is None:
+                    send_message(chat_id, "Цей товар уже зник зі списку. Онови список покупок.", reply_markup=SHOPPING_KEYBOARD)
+                else:
+                    add_or_merge_inventory_item(
+                        data["household_id"],
+                        data["user_db_id"],
+                        data["item_name"],
+                        data["quantity_text"],
+                        data["category"],
+                    )
+                    send_message(chat_id, f"✅ Куплено й додано до запасів: {marked}", reply_markup=SHOPPING_KEYBOARD)
+            except Exception:
+                send_message(chat_id, "Не вдалося завершити покупку. Спробуйте ще раз трохи пізніше.")
+        return "ok"
+
+    if text == "❌ Ні, лише прибрати":
+        if chat_id in pending_buy_to_inventory:
+            data = pending_buy_to_inventory.pop(chat_id)
+            try:
+                result = mark_item_by_id(data["item_id"], data["user_db_id"])
+                if result is None:
+                    send_message(chat_id, "Цей товар уже зник зі списку. Онови список покупок.", reply_markup=SHOPPING_KEYBOARD)
+                else:
+                    send_message(chat_id, f"✅ Позначено купленим: {result}", reply_markup=SHOPPING_KEYBOARD)
+            except Exception:
+                send_message(chat_id, "Не вдалося завершити покупку. Спробуйте ще раз трохи пізніше.")
+        return "ok"
+
+    if text == "⬅️ Скасувати":
+        if chat_id in pending_buy_to_inventory:
+            pending_buy_to_inventory.pop(chat_id)
+            send_message(chat_id, "Дію скасовано.", reply_markup=SHOPPING_KEYBOARD)
         return "ok"
 
     if text == "/start":
@@ -716,7 +788,11 @@ def webhook():
                 send_message(chat_id, "Такого номера немає у списку. Напиши номер зі списку або повну назву товару.")
                 pending_candidates[chat_id] = cands
             else:
-                _execute_action_by_id(chat_id, action, candidate_items[num - 1], user_db_id)
+                selected = candidate_items[num - 1]
+                if action == "marking":
+                    _prompt_buy_to_inventory(chat_id, selected, user_db_id, cands["household_id"])
+                else:
+                    _execute_action_by_id(chat_id, action, selected, user_db_id)
         except ValueError:
             send_message(chat_id, "Напиши число — номер зі списку варіантів:")
             pending_candidates[chat_id] = cands
@@ -801,7 +877,11 @@ def webhook():
                     send_message(chat_id, "Такого номера немає у списку. Напиши номер зі списку або повну назву товару.")
                     shopping_mode[chat_id] = mode
                     return "ok"
-                _execute_action_by_id(chat_id, mode, items[num - 1], user_db_id)
+                selected = items[num - 1]
+                if mode == "marking":
+                    _prompt_buy_to_inventory(chat_id, selected, user_db_id, household_id)
+                else:
+                    _execute_action_by_id(chat_id, mode, selected, user_db_id)
                 return "ok"
             except ValueError:
                 pass  # not a number — try name search
@@ -814,21 +894,36 @@ def webhook():
                 send_message(chat_id, "Не знайшов такого товару. Напиши номер зі списку або повну назву товару.")
                 shopping_mode[chat_id] = mode
             elif exact and len(candidates) == 1:
-                _execute_action_by_id(chat_id, mode, candidates[0], user_db_id)
+                if mode == "marking":
+                    _prompt_buy_to_inventory(chat_id, candidates[0], user_db_id, household_id)
+                else:
+                    _execute_action_by_id(chat_id, mode, candidates[0], user_db_id)
             elif fuzzy and len(candidates) == 1:
                 item = candidates[0]
                 pending_confirm[chat_id] = {
                     "action": mode,
                     "item_id": item["id"],
                     "item_name": item["name"],
+                    "item_quantity_text": item.get("quantity_text", ""),
+                    "item_category": item.get("category", DEFAULT_CATEGORY),
                     "user_db_id": user_db_id,
+                    "household_id": household_id,
                 }
                 send_message(chat_id, f"Маєш на увазі «{item['name']}»?", reply_markup=CONFIRM_KEYBOARD)
             else:
                 pending_candidates[chat_id] = {
                     "action": mode,
-                    "items": [{"id": c["id"], "name": c["name"]} for c in candidates],
+                    "items": [
+                        {
+                            "id": c["id"],
+                            "name": c["name"],
+                            "quantity_text": c.get("quantity_text", ""),
+                            "category": c.get("category", DEFAULT_CATEGORY),
+                        }
+                        for c in candidates
+                    ],
                     "user_db_id": user_db_id,
+                    "household_id": household_id,
                 }
                 lines = [f"{i + 1}. {c['name']}" for i, c in enumerate(candidates)]
                 send_message(
