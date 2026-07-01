@@ -735,6 +735,53 @@ def apply_inventory_consumption(household_id, updates, delete_item_ids):
         conn.commit()
     return updated, deleted
 
+def apply_compound_inventory_operations(household_id, user_db_id, consume_updates, delete_item_ids, shopping_items):
+    """Apply partial consumption, full removal, and shopping-list additions in one transaction.
+
+    consume_updates: list of {item_id, quantity_value, quantity_unit, quantity_text} — sets
+    structured quantity fields directly (already computed by the caller).
+    delete_item_ids: inventory item ids to delete entirely (remove_inventory operations
+    plus consume operations that hit zero).
+    shopping_items: item dicts (name, category, canonical_name, quantity_value,
+    quantity_unit, quantity_inferred) merged/inserted into shopping_items using the same
+    safe merge rules as add_shopping_items_batch.
+    Returns (inventory_updated_count, inventory_deleted_count, shopping_added_count).
+    """
+    if not consume_updates and not delete_item_ids and not shopping_items:
+        return 0, 0, 0
+    updated = 0
+    deleted = 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for upd in consume_updates:
+                cur.execute(
+                    "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
+                    "quantity_inferred=FALSE, updated_at=NOW() WHERE id=%s AND household_id=%s RETURNING id",
+                    (upd["quantity_text"], upd["quantity_value"], upd["quantity_unit"], upd["item_id"], household_id)
+                )
+                if cur.fetchone():
+                    updated += 1
+            if delete_item_ids:
+                placeholders = ",".join(["%s"] * len(delete_item_ids))
+                cur.execute(
+                    f"DELETE FROM inventory_items WHERE id IN ({placeholders}) AND household_id=%s",
+                    list(delete_item_ids) + [household_id]
+                )
+                deleted = cur.rowcount
+            for item in shopping_items:
+                _merge_or_insert_shopping_in_tx(
+                    cur, household_id, user_db_id,
+                    item["name"],
+                    item.get("quantity_text") or "",
+                    item.get("category") or DEFAULT_CATEGORY,
+                    canonical_name=item.get("canonical_name"),
+                    quantity_value=item.get("quantity_value"),
+                    quantity_unit=item.get("quantity_unit"),
+                    quantity_inferred=item.get("quantity_inferred", False),
+                )
+        conn.commit()
+    return updated, deleted, len(shopping_items)
+
 # =========================
 # MANUAL MERGE
 # =========================

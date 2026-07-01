@@ -21,6 +21,7 @@ from database import (
     delete_items_batch,
     delete_inventory_items_batch,
     apply_inventory_consumption,
+    apply_compound_inventory_operations,
     execute_merge_shopping,
     execute_merge_inventory,
     update_shopping_items_batch,
@@ -77,6 +78,7 @@ saved_list_context = {}       # chat_id -> "shopping_saved" | "inventory_saved"
 pending_saved_edit = {}       # chat_id -> {items_snapshot, validated_updates, household_id, user_db_id, context_type}
 pending_quick_purchase = {}   # chat_id -> {items, ignored_items, household_id, user_db_id}
 pending_inventory_consumption = {}  # chat_id -> {resolved, household_id, user_db_id}
+pending_compound_inventory = {}  # chat_id -> {inventory_changes, add_to_shopping, household_id, user_db_id}
 
 SYSTEM_PROMPT = (
     "Ти корисний AI-помічник. Відповідай українською.\n"
@@ -244,6 +246,11 @@ SAVED_LIST_EDIT_PROMPT = (
     "його повністю (напр. «Я з'їв 4 сосиски», «Використав одну приправу», «Випили 500 мл молока», "
     "«Витратив 200 г сиру»). Ніколи не використовуй цей намір для shopping_saved. Якщо користувач хоче "
     "прибрати товар повністю («видали», «викинь», «прибери все, крім X») — це start_action з remove_inventory\n"
+    "- «compound_inventory_operations» — лише для контексту inventory_saved, коли одне повідомлення "
+    "поєднує КІЛЬКА РІЗНИХ дій одразу: часткове списання одних позицій, повне прибирання інших і/або "
+    "додавання товару до списку покупок (напр. «Вершки зіпсувались, і я з'їв 4 сосиски, плюс додай молоко "
+    "до покупок»). Використовуй цей намір лише коли повідомлення НЕ можна повністю описати одним із "
+    "намірів вище. Ніколи не використовуй для shopping_saved\n"
     "- «quick_add_to_inventory» — лише коли список порожній (позицій немає взагалі) і користувач "
     "повідомляє про продукти, які вже приніс/купив додому (напр. «Купив молоко і хліб», «Взяли сир»), "
     "навіть у минулому часі. Не використовуй цей намір, якщо є хоч одна позиція в списку, або текст — "
@@ -268,6 +275,16 @@ SAVED_LIST_EDIT_PROMPT = (
     "- item_number — ціле число (номер позиції)\n"
     "- quantity_value — додатне число, скільки саме використано\n"
     "- quantity_unit — одне з «шт.», «л», «мл», «г», «кг» — одиниця, у якій вказано використане\n\n"
+    "Для compound_inventory_operations — поверни operations: масив об'єктів, кожен з полем type:\n"
+    "- {\"type\": \"remove_inventory\", \"item_number\": N} — повністю прибрати позицію N із запасів\n"
+    "- {\"type\": \"consume_inventory_quantity\", \"item_number\": N, \"quantity_value\": число, "
+    "\"quantity_unit\": одиниця} — частково списати кількість із позиції N\n"
+    "- {\"type\": \"add_to_shopping\", \"name\": назва, \"quantity_value\": число або null, "
+    "\"quantity_unit\": одиниця або null, \"quantity_inferred\": true/false, \"category\": категорія, "
+    "\"is_consumable\": true} — додати новий товар до списку покупок\n"
+    "Також для compound_inventory_operations поверни unresolved_fragments — масив рядків з фрагментами "
+    "тексту, які ти НЕ зміг однозначно перетворити на одну з дозволених операцій. Не мовчи і не пропускай "
+    "незрозумілу частину — обов'язково додай її сюди замість того, щоб її ігнорувати\n\n"
     "Для quick_add_to_inventory — поверни items: масив нових товарів, кожен з полями:\n"
     "- name — назва товару\n"
     "- canonical_name — назва в нижньому регістрі\n"
@@ -284,6 +301,9 @@ SAVED_LIST_EDIT_PROMPT = (
     "- Для start_action не повертай updates і merge_groups\n"
     "- Для consume_inventory_quantity не вигадуй кількість — використовуй тільки те число, яке явно назвав "
     "користувач, і не повертай updates, merge_groups, action, selected_numbers, items\n"
+    "- Для compound_inventory_operations кожен item_number може зустрічатися лише в одній операції "
+    "(не можна одночасно прибрати й списати частково ту саму позицію); не вигадуй кількість; "
+    "не повертай updates, merge_groups, action, selected_numbers, items, consumptions\n"
     "- Для quick_add_to_inventory не повертай updates, merge_groups, action, selected_numbers\n"
     "- Нормалізуй одиниці: «2 штуки» → «2 шт.», «500 грам» → «500 г», «1.5 л» → «1,5 л»\n"
     "- Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON\n\n"
@@ -298,6 +318,16 @@ SAVED_LIST_EDIT_PROMPT = (
     "{\"intent\": \"consume_inventory_quantity\", \"action\": null, \"selected_numbers\": [], "
     "\"updates\": [], \"merge_groups\": [], \"items\": [], "
     "\"consumptions\": [{\"item_number\": 2, \"quantity_value\": 4, \"quantity_unit\": \"шт.\"}]}\n"
+    "Приклад compound_inventory_operations:\n"
+    "{\"intent\": \"compound_inventory_operations\", \"action\": null, \"selected_numbers\": [], "
+    "\"updates\": [], \"merge_groups\": [], \"items\": [], \"consumptions\": [], "
+    "\"operations\": ["
+    "{\"type\": \"remove_inventory\", \"item_number\": 3}, "
+    "{\"type\": \"consume_inventory_quantity\", \"item_number\": 2, \"quantity_value\": 0.5, \"quantity_unit\": \"шт.\"}, "
+    "{\"type\": \"add_to_shopping\", \"name\": \"Приправа до курки\", \"quantity_value\": 1, "
+    "\"quantity_unit\": \"шт.\", \"quantity_inferred\": false, \"category\": \"Соуси, спеції та бакалія\", "
+    "\"is_consumable\": true}"
+    "], \"unresolved_fragments\": []}\n"
     "Приклад quick_add_to_inventory:\n"
     "{\"intent\": \"quick_add_to_inventory\", \"action\": null, \"selected_numbers\": [], "
     "\"updates\": [], \"merge_groups\": [], \"items\": ["
@@ -401,6 +431,15 @@ SAVED_EDIT_PREVIEW_KEYBOARD = {
 QUICK_PURCHASE_KEYBOARD = {
     "keyboard": [
         ["✅ Додати до запасів", "✏️ Змінити список"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+COMPOUND_PREVIEW_KEYBOARD = {
+    "keyboard": [
+        ["✅ Підтвердити всі зміни"],
         ["❌ Скасувати"],
     ],
     "resize_keyboard": True,
@@ -518,6 +557,7 @@ def clear_inventory_state(chat_id):
     pending_saved_edit.pop(chat_id, None)
     pending_quick_purchase.pop(chat_id, None)
     pending_inventory_consumption.pop(chat_id, None)
+    pending_compound_inventory.pop(chat_id, None)
 
 # =========================
 # QUANTITY HELPERS (local)
@@ -1173,6 +1213,180 @@ def _format_consumption_preview(resolved):
     return "\n".join(lines).rstrip()
 
 
+_COMPOUND_OP_TYPES = {"remove_inventory", "consume_inventory_quantity", "add_to_shopping"}
+
+
+def _validate_compound_operations(operations, unresolved_fragments, items):
+    """Validate a compound_inventory_operations router result against current inventory items.
+
+    Returns one of:
+      ("unresolved", [fragment_str, ...]) — the router flagged part of the message as
+          unclear; nothing should be applied.
+      ("invalid", [reason_str, ...]) — one or more operations are malformed, conflicting,
+          or unsafe; nothing should be applied (no partial preview, no partial apply).
+      ("ok", {"inventory_changes": [...], "add_to_shopping": [...]}) — inventory_changes
+          preserves the order operations were given in (remove_inventory and
+          consume_inventory_quantity entries interleaved as given), each with
+          item_number, item_id, name, old_value, old_unit, old_display, new_value,
+          new_unit, new_display, will_remove, op_type ("remove"|"consume").
+          add_to_shopping is a list of normalized+merged item dicts ready for
+          add_shopping_items_batch-style insertion.
+    """
+    if unresolved_fragments:
+        if not isinstance(unresolved_fragments, list):
+            return "unresolved", ["(не вдалося розібрати частину повідомлення)"]
+        fragments = [str(f).strip() for f in unresolved_fragments if str(f).strip()]
+        return "unresolved", fragments or ["(не вдалося розібрати частину повідомлення)"]
+
+    if not isinstance(operations, list) or not operations:
+        return "invalid", ["Не знайшов жодної дії для виконання."]
+
+    total = len(items)
+    reasons = []
+    used_item_numbers = set()
+    inventory_changes = []
+    shopping_raw = []
+
+    for op in operations:
+        if not isinstance(op, dict) or op.get("type") not in _COMPOUND_OP_TYPES:
+            reasons.append("Незрозуміла дія.")
+            continue
+        op_type = op["type"]
+
+        if op_type in ("remove_inventory", "consume_inventory_quantity"):
+            num = op.get("item_number")
+            if not isinstance(num, int) or num < 1 or num > total:
+                reasons.append("Невідома позиція запасів.")
+                continue
+            item = items[num - 1]
+            if num in used_item_numbers:
+                reasons.append(f"«{item['name']}» — позиція задіяна в кількох операціях одночасно.")
+                continue
+
+            if op_type == "remove_inventory":
+                used_item_numbers.add(num)
+                inventory_changes.append({
+                    "item_number": num, "item_id": item["id"], "name": item["name"],
+                    "old_value": item.get("quantity_value"), "old_unit": item.get("quantity_unit"),
+                    "old_display": format_quantity_display(item.get("quantity_value"), item.get("quantity_unit")),
+                    "new_value": None, "new_unit": None, "new_display": None,
+                    "will_remove": True, "op_type": "remove",
+                })
+                continue
+
+            # consume_inventory_quantity
+            value = op.get("quantity_value")
+            unit = op.get("quantity_unit")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                reasons.append(f"«{item['name']}» — некоректна кількість для списання.")
+                continue
+            if unit not in STRUCTURED_UNITS:
+                reasons.append(f"«{item['name']}» — невідома одиниця вимірювання.")
+                continue
+            cur_value = item.get("quantity_value")
+            cur_unit = item.get("quantity_unit")
+            if cur_value is None or cur_unit is None:
+                reasons.append(f"«{item['name']}» — не вказана точна кількість, не можна безпечно списати частину.")
+                continue
+            kind, remaining, remaining_unit = _resolve_consumption(cur_value, cur_unit, value, unit)
+            if kind == "incompatible_units":
+                reasons.append(f"«{item['name']}» — несумісні одиниці для списання.")
+                continue
+            if kind == "insufficient":
+                available_display = format_quantity_display(cur_value, cur_unit)
+                requested_display = format_quantity_display(value, unit)
+                reasons.append(f"«{item['name']}» — у запасах лише {available_display}, а вказано {requested_display}.")
+                continue
+            used_item_numbers.add(num)
+            will_remove = remaining == 0
+            new_value = None if will_remove else float(remaining)
+            new_unit = None if will_remove else remaining_unit
+            inventory_changes.append({
+                "item_number": num, "item_id": item["id"], "name": item["name"],
+                "old_value": cur_value, "old_unit": cur_unit,
+                "old_display": format_quantity_display(cur_value, cur_unit),
+                "new_value": new_value, "new_unit": new_unit,
+                "new_display": None if will_remove else format_quantity_display(new_value, new_unit),
+                "will_remove": will_remove, "op_type": "consume",
+            })
+            continue
+
+        # add_to_shopping
+        name = op.get("name")
+        if not isinstance(name, str) or not name.strip():
+            reasons.append("Товар для покупок без назви.")
+            continue
+        name = name.strip()
+        if not op.get("is_consumable", True):
+            reasons.append(f"«{name}» — не їстівний товар, не можу додати до покупок.")
+            continue
+        cat = op.get("category")
+        if not isinstance(cat, str) or cat not in VALID_CATEGORIES:
+            cat = DEFAULT_CATEGORY
+        qty_value = op.get("quantity_value")
+        qty_unit = op.get("quantity_unit")
+        if (
+            not isinstance(qty_value, (int, float)) or isinstance(qty_value, bool)
+            or qty_value <= 0
+            or not isinstance(qty_unit, str) or qty_unit not in STRUCTURED_UNITS
+        ):
+            qty_value, qty_unit = None, None
+        normalized = normalize_item_quantity(
+            name, "", quantity_value=qty_value, quantity_unit=qty_unit, allow_default_unit=(qty_value is None)
+        )
+        shopping_item = {"name": name, "category": cat, "was_corrected": False}
+        shopping_item.update(normalized)
+        shopping_raw.append(shopping_item)
+
+    if reasons:
+        return "invalid", reasons
+    if not inventory_changes and not shopping_raw:
+        return "invalid", ["Не знайшов жодної безпечної дії."]
+
+    add_to_shopping = _auto_merge_in_place(shopping_raw) if shopping_raw else []
+    return "ok", {"inventory_changes": inventory_changes, "add_to_shopping": add_to_shopping}
+
+
+def _format_compound_preview(resolved):
+    changes = resolved["inventory_changes"]
+    shopping = resolved["add_to_shopping"]
+    lines = ["🧊 Буде змінено в запасах:", ""]
+    for i, c in enumerate(changes, start=1):
+        label = c["name"]
+        if c["old_display"]:
+            label += f" — {c['old_display']}"
+        lines.append(f"{i}. {label}")
+        if c["will_remove"]:
+            lines.append("   → буде прибрано із запасів")
+        else:
+            new_label = c["name"]
+            if c["new_display"]:
+                new_label += f" — {c['new_display']}"
+            lines.append(f"   → {new_label}")
+        lines.append("")
+    if shopping:
+        lines.append("🛒 Буде додано до покупок:")
+        lines.append("")
+        for item in shopping:
+            _, _, qty_display = _effective_quantity(item)
+            label = item["name"]
+            if qty_display:
+                label += f" — {qty_display}"
+            lines.append(f"• {label}")
+    return "\n".join(lines).rstrip()
+
+
+def _compound_snapshot_is_stale(inventory_changes, current_items):
+    """True if any inventory_changes item no longer exists, or its quantity_value/unit
+    changed since the compound preview was built (detects edits from another device)."""
+    current_by_id = {it["id"]: it for it in current_items}
+    for c in inventory_changes:
+        cur = current_by_id.get(c["item_id"])
+        if cur is None or cur.get("quantity_value") != c["old_value"] or cur.get("quantity_unit") != c["old_unit"]:
+            return True
+    return False
+
+
 def _validate_quick_add_items(raw_items):
     """Validate Gemini quick_add_to_inventory items for an empty shopping list.
 
@@ -1229,7 +1443,7 @@ def _format_quick_purchase_preview(items, ignored_items=None):
 
 _SAVED_LIST_ROUTER_FALLBACK = {
     "intent": "none", "action": None, "selected_numbers": [], "updates": [], "merge_groups": [], "items": [],
-    "consumptions": [],
+    "consumptions": [], "operations": [], "unresolved_fragments": [],
 }
 
 
@@ -1267,6 +1481,8 @@ def _ask_gemini_saved_list_router(user_text, items, context_type):
             "merge_groups": data.get("merge_groups") if isinstance(data.get("merge_groups"), list) else [],
             "items": data.get("items") if isinstance(data.get("items"), list) else [],
             "consumptions": data.get("consumptions") if isinstance(data.get("consumptions"), list) else [],
+            "operations": data.get("operations") if isinstance(data.get("operations"), list) else [],
+            "unresolved_fragments": data.get("unresolved_fragments") if isinstance(data.get("unresolved_fragments"), list) else [],
         }
     except (json.JSONDecodeError, ValueError, TypeError):
         return dict(_SAVED_LIST_ROUTER_FALLBACK)
@@ -1361,7 +1577,7 @@ def _should_restore_persisted_context(chat_id):
         chat_id in d for d in (
             pending_mark_batch, pending_delete_batch, pending_remove_batch,
             pending_saved_edit, pending_quick_purchase, pending_merge,
-            pending_inventory_consumption,
+            pending_inventory_consumption, pending_compound_inventory,
         )
     )
 
@@ -1619,6 +1835,9 @@ def webhook():
         elif chat_id in pending_inventory_consumption:
             pending_inventory_consumption.pop(chat_id, None)
             send_message(chat_id, "Дію скасовано.", reply_markup=INVENTORY_KEYBOARD)
+        elif chat_id in pending_compound_inventory:
+            pending_compound_inventory.pop(chat_id, None)
+            send_message(chat_id, "Дію скасовано.", reply_markup=INVENTORY_KEYBOARD)
         elif chat_id in pending_quick_purchase:
             pending_quick_purchase.pop(chat_id, None)
             send_message(chat_id, "Дію скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -1788,6 +2007,52 @@ def webhook():
                 delete_ids = [r["item_id"] for r in resolved if r["will_remove"]]
                 updated, deleted = apply_inventory_consumption(household_id, updates, delete_ids)
                 send_message(chat_id, f"✅ Оновлено запасів: {updated + deleted}", reply_markup=INVENTORY_KEYBOARD)
+            except Exception:
+                send_message(chat_id, INVENTORY_ERROR_MSG)
+        return "ok"
+
+    if text == "✅ Підтвердити всі зміни":
+        if chat_id in pending_compound_inventory:
+            compound_data = pending_compound_inventory.pop(chat_id)
+            household_id = compound_data["household_id"]
+            user_db_id = compound_data["user_db_id"]
+            inventory_changes = compound_data["inventory_changes"]
+            add_to_shopping = compound_data["add_to_shopping"]
+            try:
+                current_items = get_inventory_items(household_id)
+                if _compound_snapshot_is_stale(inventory_changes, current_items):
+                    send_message(
+                        chat_id,
+                        "Список змінився з іншого пристрою. Онови запаси й повтори дію.",
+                        reply_markup=INVENTORY_KEYBOARD,
+                    )
+                    return "ok"
+                consume_updates = [
+                    {
+                        "item_id": c["item_id"],
+                        "quantity_value": c["new_value"],
+                        "quantity_unit": c["new_unit"],
+                        "quantity_text": c["new_display"],
+                    }
+                    for c in inventory_changes if not c["will_remove"]
+                ]
+                delete_ids = [c["item_id"] for c in inventory_changes if c["will_remove"]]
+                inv_updated, inv_deleted, shopping_added = apply_compound_inventory_operations(
+                    household_id, user_db_id, consume_updates, delete_ids, add_to_shopping
+                )
+                if shopping_added:
+                    send_message(
+                        chat_id,
+                        f"✅ Зміни застосовано.\n\nОновлено запасів: {inv_updated + inv_deleted}\n"
+                        f"Додано до покупок: {shopping_added}",
+                        reply_markup=INVENTORY_KEYBOARD,
+                    )
+                else:
+                    send_message(
+                        chat_id,
+                        f"✅ Зміни запасів застосовано: {inv_updated + inv_deleted}",
+                        reply_markup=INVENTORY_KEYBOARD,
+                    )
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
@@ -2332,6 +2597,41 @@ def webhook():
                             )
                         else:
                             send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
+                        _preview_intercepted = True
+                    elif intent == "compound_inventory_operations" and ctx == "inventory_saved":
+                        kind, payload = _validate_compound_operations(
+                            router_result.get("operations"), router_result.get("unresolved_fragments"), list_items
+                        )
+                        if kind == "ok":
+                            pending_compound_inventory[chat_id] = {
+                                "inventory_changes": payload["inventory_changes"],
+                                "add_to_shopping": payload["add_to_shopping"],
+                                "household_id": household_id,
+                                "user_db_id": user_db_id,
+                            }
+                            send_message(
+                                chat_id, _format_compound_preview(payload), reply_markup=COMPOUND_PREVIEW_KEYBOARD
+                            )
+                        elif kind == "unresolved":
+                            lines = [
+                                "Я зрозумів частину повідомлення, але не хочу мовчки пропустити решту.",
+                                "",
+                                "Не зміг зрозуміти:",
+                            ]
+                            for frag in payload:
+                                lines.append(f"• «{frag}»")
+                            lines.append("")
+                            lines.append("Спробуй уточнити все повідомлення.")
+                            send_message(chat_id, "\n".join(lines))
+                        else:
+                            lines = [
+                                "Не зміг безпечно обробити всі зміни. Нічого не було змінено.",
+                                "",
+                                "Не зрозумів або не можу виконати:",
+                            ]
+                            for reason in payload:
+                                lines.append(f"• {reason}")
+                            send_message(chat_id, "\n".join(lines))
                         _preview_intercepted = True
                     # intent == "none": fall through to AI chat
                 elif ctx == "shopping_saved":
