@@ -1,6 +1,9 @@
 import json
 import os
 import re
+from datetime import datetime
+from decimal import Decimal
+from zoneinfo import ZoneInfo
 from flask import Flask, request
 from dotenv import load_dotenv
 from groq import Groq
@@ -17,6 +20,7 @@ from database import (
     mark_items_batch,
     delete_items_batch,
     delete_inventory_items_batch,
+    apply_inventory_consumption,
     execute_merge_shopping,
     execute_merge_inventory,
     update_shopping_items_batch,
@@ -72,8 +76,41 @@ pending_remove_batch = {}     # chat_id -> {items, household_id, user_db_id}
 saved_list_context = {}       # chat_id -> "shopping_saved" | "inventory_saved"
 pending_saved_edit = {}       # chat_id -> {items_snapshot, validated_updates, household_id, user_db_id, context_type}
 pending_quick_purchase = {}   # chat_id -> {items, ignored_items, household_id, user_db_id}
+pending_inventory_consumption = {}  # chat_id -> {resolved, household_id, user_db_id}
 
-SYSTEM_PROMPT = "Ти корисний AI-помічник. Відповідай українською."
+SYSTEM_PROMPT = (
+    "Ти корисний AI-помічник. Відповідай українською.\n"
+    "У тебе немає доступу до інтернету в реальному часі: ніколи не стверджуй, що маєш доступ до інтернету, "
+    "і не вигадуй поточну погоду, новини, курси валют, розклади рейсів чи інші дані, що потребують "
+    "актуального інтернет-джерела.\n"
+    "Якщо запитують поточну дату або час — використовуй надану нижче актуальну дату й час Europe/Warsaw "
+    "як єдине надійне джерело.\n"
+    "Якщо запитують погоду чи інші актуальні зовнішні дані — чесно відповідай: "
+    "«У цій версії бота я не маю доступу до актуального прогнозу чи інтернет-пошуку, тому не хочу вигадувати дані.»"
+)
+
+_UA_WEEKDAYS = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
+_UA_MONTHS_GENITIVE = [
+    "січня", "лютого", "березня", "квітня", "травня", "червня",
+    "липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
+]
+
+
+def get_warsaw_datetime_context(now=None):
+    """Authoritative Europe/Warsaw date/time string for the general AI chat prompt.
+
+    Pure: if now is given (a tz-aware datetime), it's used as-is instead of the
+    real clock — this is what makes it unit-testable without mocking time.
+    """
+    if now is None:
+        now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    weekday = _UA_WEEKDAYS[now.weekday()]
+    month = _UA_MONTHS_GENITIVE[now.month - 1]
+    return (
+        f"Актуальна локальна дата й час: {now.day} {month} {now.year}, {weekday}, "
+        f"{now.strftime('%H:%M')}, Europe/Warsaw.\n"
+        "Це єдине надійне джерело поточного часу для відповіді."
+    )
 
 COOKING_SYSTEM_PROMPT = (
     "Ти кулінарний помічник. Користувач надсилає перелік продуктів, які є вдома. "
@@ -202,6 +239,11 @@ SAVED_LIST_EDIT_PROMPT = (
     "- «start_action» — якщо хоче виконати дію над товарами зі списку: позначити купленими, "
     "видалити зі списку покупок або прибрати із запасів. Трактуй так само формулювання в минулому часі "
     "(«купив», «купили», «видалив», «прибрали») як запит на дію над поточним списком\n"
+    "- «consume_inventory_quantity» — лише для контексту inventory_saved, якщо користувач повідомляє, "
+    "що частково використав, з'їв, випив або витратив ЧАСТИНУ кількості товару, а не забрав/викинув/прибрав "
+    "його повністю (напр. «Я з'їв 4 сосиски», «Використав одну приправу», «Випили 500 мл молока», "
+    "«Витратив 200 г сиру»). Ніколи не використовуй цей намір для shopping_saved. Якщо користувач хоче "
+    "прибрати товар повністю («видали», «викинь», «прибери все, крім X») — це start_action з remove_inventory\n"
     "- «quick_add_to_inventory» — лише коли список порожній (позицій немає взагалі) і користувач "
     "повідомляє про продукти, які вже приніс/купив додому (напр. «Купив молоко і хліб», «Взяли сир»), "
     "навіть у минулому часі. Не використовуй цей намір, якщо є хоч одна позиція в списку, або текст — "
@@ -221,6 +263,11 @@ SAVED_LIST_EDIT_PROMPT = (
     "- selected_numbers — номери обраних позицій за тими самими правилами, що й вибір позицій: "
     "«всі», «усе», «все куплено» тощо → всі номери; «все крім X» або «залиш X, решту...» → всі, крім X; "
     "числа й діапазони («1 2 3», «1-4»); назви або фрази → знайди відповідні позиції за назвою або змістом\n\n"
+    "Для consume_inventory_quantity — поверни consumptions: масив об'єктів для позицій, з яких частково "
+    "списується кількість:\n"
+    "- item_number — ціле число (номер позиції)\n"
+    "- quantity_value — додатне число, скільки саме використано\n"
+    "- quantity_unit — одне з «шт.», «л», «мл», «г», «кг» — одиниця, у якій вказано використане\n\n"
     "Для quick_add_to_inventory — поверни items: масив нових товарів, кожен з полями:\n"
     "- name — назва товару\n"
     "- canonical_name — назва в нижньому регістрі\n"
@@ -235,6 +282,8 @@ SAVED_LIST_EDIT_PROMPT = (
     "Правила:\n"
     "- Не додавай нових позицій і не видаляй існуючих через edit_saved_items чи merge_duplicates\n"
     "- Для start_action не повертай updates і merge_groups\n"
+    "- Для consume_inventory_quantity не вигадуй кількість — використовуй тільки те число, яке явно назвав "
+    "користувач, і не повертай updates, merge_groups, action, selected_numbers, items\n"
     "- Для quick_add_to_inventory не повертай updates, merge_groups, action, selected_numbers\n"
     "- Нормалізуй одиниці: «2 штуки» → «2 шт.», «500 грам» → «500 г», «1.5 л» → «1,5 л»\n"
     "- Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON\n\n"
@@ -245,6 +294,10 @@ SAVED_LIST_EDIT_PROMPT = (
     "Приклад start_action:\n"
     "{\"intent\": \"start_action\", \"action\": \"mark_bought\", \"selected_numbers\": [1, 3], "
     "\"updates\": [], \"merge_groups\": [], \"items\": []}\n"
+    "Приклад consume_inventory_quantity:\n"
+    "{\"intent\": \"consume_inventory_quantity\", \"action\": null, \"selected_numbers\": [], "
+    "\"updates\": [], \"merge_groups\": [], \"items\": [], "
+    "\"consumptions\": [{\"item_number\": 2, \"quantity_value\": 4, \"quantity_unit\": \"шт.\"}]}\n"
     "Приклад quick_add_to_inventory:\n"
     "{\"intent\": \"quick_add_to_inventory\", \"action\": null, \"selected_numbers\": [], "
     "\"updates\": [], \"merge_groups\": [], \"items\": ["
@@ -464,6 +517,7 @@ def clear_inventory_state(chat_id):
     saved_list_context.pop(chat_id, None)
     pending_saved_edit.pop(chat_id, None)
     pending_quick_purchase.pop(chat_id, None)
+    pending_inventory_consumption.pop(chat_id, None)
 
 # =========================
 # QUANTITY HELPERS (local)
@@ -1012,6 +1066,113 @@ def _validate_start_action(action, selected_numbers, context_type, items):
     return _validate_selected_numbers(selected_numbers, items)
 
 
+_UNIT_GROUP = {"л": "volume", "мл": "volume", "кг": "mass", "г": "mass", "шт.": "count"}
+_UNIT_TO_CANONICAL_FACTOR = {
+    "л": Decimal("1"), "мл": Decimal("0.001"),
+    "кг": Decimal("1000"), "г": Decimal("1"),
+    "шт.": Decimal("1"),
+}
+_CANONICAL_UNIT_FOR_GROUP = {"volume": "л", "mass": "г", "count": "шт."}
+
+
+def _resolve_consumption(current_value, current_unit, consume_value, consume_unit):
+    """Compute the remaining quantity after consuming part of an inventory item.
+
+    Uses Decimal throughout (never float) for the subtraction/conversion. The
+    remainder is always expressed in the group's canonical display unit (л for
+    volume, г for mass, шт. for count), not necessarily current_unit — e.g.
+    1 кг - 200 г is shown as 800 г, not 0,8 кг.
+
+    Returns ("ok", remaining_decimal, remaining_unit), ("incompatible_units", None, None)
+    if the two units aren't from the same group, or ("insufficient", None, None) if
+    consume_value exceeds what's available.
+    """
+    current_group = _UNIT_GROUP.get(current_unit)
+    consume_group = _UNIT_GROUP.get(consume_unit)
+    if current_group is None or consume_group is None or current_group != consume_group:
+        return "incompatible_units", None, None
+    current_canonical = Decimal(str(current_value)) * _UNIT_TO_CANONICAL_FACTOR[current_unit]
+    consume_canonical = Decimal(str(consume_value)) * _UNIT_TO_CANONICAL_FACTOR[consume_unit]
+    if consume_canonical > current_canonical:
+        return "insufficient", None, None
+    remaining = current_canonical - consume_canonical
+    return "ok", remaining, _CANONICAL_UNIT_FOR_GROUP[current_group]
+
+
+def _validate_consumptions(consumptions, items):
+    """Validate Gemini consume_inventory_quantity output against current inventory items.
+
+    Returns one of:
+      ("ok", [resolved...]) — each resolved dict has item_number, item_id, name,
+          old_value, old_unit, old_display, new_value, new_unit, new_display,
+          will_remove (True when the remainder is exactly zero).
+      ("missing_quantity", item_name) — item has no structured quantity to subtract from.
+      ("insufficient", (item_name, available_display, requested_display)) — not enough left.
+      ("invalid", None) — malformed input, out-of-range/duplicate item_number, bad unit,
+          non-positive quantity, or incompatible units.
+    """
+    if not isinstance(consumptions, list) or not consumptions:
+        return "invalid", None
+    total = len(items)
+    used_numbers = set()
+    resolved = []
+    for entry in consumptions:
+        if not isinstance(entry, dict):
+            return "invalid", None
+        num = entry.get("item_number")
+        if not isinstance(num, int) or num < 1 or num > total:
+            return "invalid", None
+        if num in used_numbers:
+            return "invalid", None
+        used_numbers.add(num)
+        value = entry.get("quantity_value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            return "invalid", None
+        unit = entry.get("quantity_unit")
+        if unit not in STRUCTURED_UNITS:
+            return "invalid", None
+        item = items[num - 1]
+        cur_value = item.get("quantity_value")
+        cur_unit = item.get("quantity_unit")
+        if cur_value is None or cur_unit is None:
+            return "missing_quantity", item["name"]
+        kind, remaining, remaining_unit = _resolve_consumption(cur_value, cur_unit, value, unit)
+        if kind == "incompatible_units":
+            return "invalid", None
+        if kind == "insufficient":
+            available_display = format_quantity_display(cur_value, cur_unit)
+            requested_display = format_quantity_display(value, unit)
+            return "insufficient", (item["name"], available_display, requested_display)
+        will_remove = remaining == 0
+        new_value = None if will_remove else float(remaining)
+        new_unit = None if will_remove else remaining_unit
+        resolved.append({
+            "item_number": num,
+            "item_id": item["id"],
+            "name": item["name"],
+            "old_value": cur_value,
+            "old_unit": cur_unit,
+            "old_display": format_quantity_display(cur_value, cur_unit),
+            "new_value": new_value,
+            "new_unit": new_unit,
+            "new_display": None if will_remove else format_quantity_display(new_value, new_unit),
+            "will_remove": will_remove,
+        })
+    return "ok", resolved
+
+
+def _format_consumption_preview(resolved):
+    lines = [f"🧊 Буде використано: {len(resolved)}", ""]
+    for r in resolved:
+        lines.append(f"{r['item_number']}. {r['name']} — {r['old_display']}")
+        if r["will_remove"]:
+            lines.append("   → буде прибрано із запасів")
+        else:
+            lines.append(f"   → {r['name']} — {r['new_display']}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def _validate_quick_add_items(raw_items):
     """Validate Gemini quick_add_to_inventory items for an empty shopping list.
 
@@ -1068,6 +1229,7 @@ def _format_quick_purchase_preview(items, ignored_items=None):
 
 _SAVED_LIST_ROUTER_FALLBACK = {
     "intent": "none", "action": None, "selected_numbers": [], "updates": [], "merge_groups": [], "items": [],
+    "consumptions": [],
 }
 
 
@@ -1104,6 +1266,7 @@ def _ask_gemini_saved_list_router(user_text, items, context_type):
             "updates": data.get("updates") if isinstance(data.get("updates"), list) else [],
             "merge_groups": data.get("merge_groups") if isinstance(data.get("merge_groups"), list) else [],
             "items": data.get("items") if isinstance(data.get("items"), list) else [],
+            "consumptions": data.get("consumptions") if isinstance(data.get("consumptions"), list) else [],
         }
     except (json.JSONDecodeError, ValueError, TypeError):
         return dict(_SAVED_LIST_ROUTER_FALLBACK)
@@ -1198,6 +1361,7 @@ def _should_restore_persisted_context(chat_id):
         chat_id in d for d in (
             pending_mark_batch, pending_delete_batch, pending_remove_batch,
             pending_saved_edit, pending_quick_purchase, pending_merge,
+            pending_inventory_consumption,
         )
     )
 
@@ -1452,6 +1616,9 @@ def webhook():
             ctx = edit_data["context_type"]
             keyboard = SHOPPING_KEYBOARD if ctx == "shopping_saved" else INVENTORY_KEYBOARD
             send_message(chat_id, "Зміни скасовано.", reply_markup=keyboard)
+        elif chat_id in pending_inventory_consumption:
+            pending_inventory_consumption.pop(chat_id, None)
+            send_message(chat_id, "Дію скасовано.", reply_markup=INVENTORY_KEYBOARD)
         elif chat_id in pending_quick_purchase:
             pending_quick_purchase.pop(chat_id, None)
             send_message(chat_id, "Дію скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -1589,6 +1756,40 @@ def webhook():
                 send_message(chat_id, "✅ Зміни застосовано.", reply_markup=keyboard)
             except Exception:
                 send_message(chat_id, DB_ERROR_MSG if ctx == "shopping_saved" else INVENTORY_ERROR_MSG)
+        elif chat_id in pending_inventory_consumption:
+            consume_data = pending_inventory_consumption.pop(chat_id)
+            household_id = consume_data["household_id"]
+            resolved = consume_data["resolved"]
+            try:
+                current_items = get_inventory_items(household_id)
+                current_by_id = {it["id"]: it for it in current_items}
+                stale = False
+                for r in resolved:
+                    cur = current_by_id.get(r["item_id"])
+                    if cur is None or cur.get("quantity_value") != r["old_value"] or cur.get("quantity_unit") != r["old_unit"]:
+                        stale = True
+                        break
+                if stale:
+                    send_message(
+                        chat_id,
+                        "Список змінився з іншого пристрою. Онови список і повтори дію.",
+                        reply_markup=INVENTORY_KEYBOARD,
+                    )
+                    return "ok"
+                updates = [
+                    {
+                        "item_id": r["item_id"],
+                        "quantity_value": r["new_value"],
+                        "quantity_unit": r["new_unit"],
+                        "quantity_text": r["new_display"],
+                    }
+                    for r in resolved if not r["will_remove"]
+                ]
+                delete_ids = [r["item_id"] for r in resolved if r["will_remove"]]
+                updated, deleted = apply_inventory_consumption(household_id, updates, delete_ids)
+                send_message(chat_id, f"✅ Оновлено запасів: {updated + deleted}", reply_markup=INVENTORY_KEYBOARD)
+            except Exception:
+                send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
 
     if text == "✏️ Змінити вибір":
@@ -2107,6 +2308,31 @@ def webhook():
                         else:
                             send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
                         _preview_intercepted = True
+                    elif intent == "consume_inventory_quantity" and ctx == "inventory_saved":
+                        kind, payload = _validate_consumptions(router_result.get("consumptions"), list_items)
+                        if kind == "ok":
+                            pending_inventory_consumption[chat_id] = {
+                                "resolved": payload,
+                                "household_id": household_id,
+                                "user_db_id": user_db_id,
+                            }
+                            send_message(
+                                chat_id, _format_consumption_preview(payload), reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD
+                            )
+                        elif kind == "missing_quantity":
+                            send_message(
+                                chat_id,
+                                f"Не можу безпечно відняти частину, бо для «{payload}» не вказана точна кількість. "
+                                "Спочатку відредагуй кількість товару.",
+                            )
+                        elif kind == "insufficient":
+                            name, available, requested = payload
+                            send_message(
+                                chat_id, f"У запасах є лише {available}, а ти вказав {requested}. Уточни кількість."
+                            )
+                        else:
+                            send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
+                        _preview_intercepted = True
                     # intent == "none": fall through to AI chat
                 elif ctx == "shopping_saved":
                     router_result = _ask_gemini_saved_list_router(text, [], ctx)
@@ -2159,7 +2385,7 @@ def webhook():
         {"role": msg["role"], "content": msg["content"]}
         for msg in user_history[chat_id][1:]
     ]
-    answer = call_gemini(gemini_history, SYSTEM_PROMPT)
+    answer = call_gemini(gemini_history, SYSTEM_PROMPT + "\n\n" + get_warsaw_datetime_context())
 
     if answer is not None:
         user_history[chat_id].append({"role": "assistant", "content": answer})

@@ -702,6 +702,39 @@ def delete_inventory_items_batch(item_ids):
         conn.commit()
     return count
 
+def apply_inventory_consumption(household_id, updates, delete_item_ids):
+    """Apply partial consumption updates and full removals in a single transaction.
+
+    updates: list of {item_id, quantity_value, quantity_unit, quantity_text} — sets
+    structured quantity fields directly (already computed by the caller), unlike
+    update_inventory_items_batch which re-derives them from free text.
+    delete_item_ids: item ids consumed down to zero, deleted entirely.
+    Returns (updated_count, deleted_count).
+    """
+    if not updates and not delete_item_ids:
+        return 0, 0
+    updated = 0
+    deleted = 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for upd in updates:
+                cur.execute(
+                    "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
+                    "quantity_inferred=FALSE, updated_at=NOW() WHERE id=%s AND household_id=%s RETURNING id",
+                    (upd["quantity_text"], upd["quantity_value"], upd["quantity_unit"], upd["item_id"], household_id)
+                )
+                if cur.fetchone():
+                    updated += 1
+            if delete_item_ids:
+                placeholders = ",".join(["%s"] * len(delete_item_ids))
+                cur.execute(
+                    f"DELETE FROM inventory_items WHERE id IN ({placeholders}) AND household_id=%s",
+                    list(delete_item_ids) + [household_id]
+                )
+                deleted = cur.rowcount
+        conn.commit()
+    return updated, deleted
+
 # =========================
 # MANUAL MERGE
 # =========================
