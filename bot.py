@@ -191,11 +191,14 @@ PENDING_PREVIEW_EDIT_PROMPT = (
 )
 
 SAVED_LIST_EDIT_PROMPT = (
-    "Ти помічник для редагування збереженого списку товарів.\n"
+    "Ти помічник для роботи з відкритим збереженим списком товарів (список покупок або запасів).\n"
     "Визнач намір (intent):\n"
     "- «edit_saved_items» — якщо користувач хоче змінити кількість, назву або категорію наявних позицій\n"
     "- «merge_duplicates» — якщо хоче об'єднати однакові або дублюючі позиції\n"
-    "- «none» — в усіх інших випадках: видалення, купівля, позначення купленим, додавання нових товарів, загальне питання\n\n"
+    "- «start_action» — якщо хоче виконати дію над товарами зі списку: позначити купленими, "
+    "видалити зі списку покупок або прибрати із запасів. Трактуй так само формулювання в минулому часі "
+    "(«купив», «купили», «видалив», «прибрали») як запит на дію над поточним списком\n"
+    "- «none» — в усіх інших випадках: додавання нових товарів, загальне питання, не стосується списку\n\n"
     "Для edit_saved_items — поверни updates лише для позицій, які змінюються:\n"
     "- item_number — ціле число (номер у списку, від 1 до N)\n"
     "- name — нова назва або null якщо не змінюється\n"
@@ -203,13 +206,24 @@ SAVED_LIST_EDIT_PROMPT = (
     "- category — нова категорія або null\n\n"
     "Для merge_duplicates — поверни merge_groups: масив масивів item_number:\n"
     "- [[2, 4], [1, 3]] — кожна підгрупа містить номери позицій для об'єднання\n\n"
+    "Для start_action — поверни action і selected_numbers:\n"
+    "- action — одне з: «mark_bought» (позначити купленими — лише для списку покупок), "
+    "«delete_shopping» (видалити зі списку покупок — лише для списку покупок), "
+    "«remove_inventory» (прибрати із запасів — лише для запасів); обирай дію лише дозволену для поточного контексту\n"
+    "- selected_numbers — номери обраних позицій за тими самими правилами, що й вибір позицій: "
+    "«всі», «усе», «все куплено» тощо → всі номери; «все крім X» або «залиш X, решту...» → всі, крім X; "
+    "числа й діапазони («1 2 3», «1-4»); назви або фрази → знайди відповідні позиції за назвою або змістом\n\n"
     "Правила:\n"
-    "- Не додавай нових позицій\n"
-    "- Не видаляй існуючих позицій\n"
-    "- Не позначай нічого купленим\n"
-    "- Нормалізуй одиниці: «2 штуки» → «2 шт.», «500 грам» → «500 г», «1.5 л» → «1,5 л»\n\n"
-    "Відповідай ТІЛЬКИ валідним JSON без жодного тексту:\n"
-    "{\"intent\": \"edit_saved_items\", \"updates\": [{\"item_number\": 1, \"name\": null, \"quantity_text\": \"2 шт.\", \"category\": null}], \"merge_groups\": []}"
+    "- Не додавай нових позицій і не видаляй існуючих через edit_saved_items чи merge_duplicates\n"
+    "- Для start_action не повертай updates і merge_groups\n"
+    "- Нормалізуй одиниці: «2 штуки» → «2 шт.», «500 грам» → «500 г», «1.5 л» → «1,5 л»\n"
+    "- Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON\n\n"
+    "Приклад edit_saved_items:\n"
+    "{\"intent\": \"edit_saved_items\", \"action\": null, \"selected_numbers\": [], "
+    "\"updates\": [{\"item_number\": 1, \"name\": null, \"quantity_text\": \"2 шт.\", \"category\": null}], \"merge_groups\": []}\n"
+    "Приклад start_action:\n"
+    "{\"intent\": \"start_action\", \"action\": \"mark_bought\", \"selected_numbers\": [1, 3], "
+    "\"updates\": [], \"merge_groups\": []}"
 )
 
 # =========================
@@ -942,8 +956,30 @@ def _validate_saved_updates(updates, items):
     return valid
 
 
+_ACTIONS_BY_CONTEXT = {
+    "shopping_saved": {"mark_bought", "delete_shopping"},
+    "inventory_saved": {"remove_inventory"},
+}
+
+
+def _validate_start_action(action, selected_numbers, context_type, items):
+    """Validate a start_action router result for the current open list.
+
+    Rejects any action not allowed for context_type, then validates
+    selected_numbers the same way as button-triggered selection (dedup,
+    order preserved, out-of-range dropped, empty rejected).
+    Returns the ordered list of selected item dicts, or None if invalid.
+    """
+    if action not in _ACTIONS_BY_CONTEXT.get(context_type, set()):
+        return None
+    return _validate_selected_numbers(selected_numbers, items)
+
+
+_SAVED_LIST_ROUTER_FALLBACK = {"intent": "none", "action": None, "selected_numbers": [], "updates": [], "merge_groups": []}
+
+
 def _ask_gemini_saved_list_router(user_text, items, context_type):
-    """Gemini call: detect edit_saved_items or merge_duplicates for an active saved list."""
+    """Gemini call: detect edit_saved_items, merge_duplicates or start_action for an active saved list."""
     lines = []
     for i, item in enumerate(items):
         label = f"{i + 1}. {item['name']}"
@@ -959,7 +995,7 @@ def _ask_gemini_saved_list_router(user_text, items, context_type):
     )
     raw = call_gemini([{"role": "user", "content": prompt}], SAVED_LIST_EDIT_PROMPT, temperature=0.1)
     if not raw:
-        return {"intent": "none", "updates": [], "merge_groups": []}
+        return dict(_SAVED_LIST_ROUTER_FALLBACK)
     cleaned = raw.strip()
     if "```" in cleaned:
         m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
@@ -969,11 +1005,13 @@ def _ask_gemini_saved_list_router(user_text, items, context_type):
         data = json.loads(cleaned)
         return {
             "intent": data.get("intent", "none"),
+            "action": data.get("action"),
+            "selected_numbers": data.get("selected_numbers") if isinstance(data.get("selected_numbers"), list) else [],
             "updates": data.get("updates") if isinstance(data.get("updates"), list) else [],
             "merge_groups": data.get("merge_groups") if isinstance(data.get("merge_groups"), list) else [],
         }
     except (json.JSONDecodeError, ValueError, TypeError):
-        return {"intent": "none", "updates": [], "merge_groups": []}
+        return dict(_SAVED_LIST_ROUTER_FALLBACK)
 
 
 def _format_saved_edit_preview(items_snapshot, validated_updates, context_type):
@@ -1884,6 +1922,22 @@ def webhook():
                             send_message(chat_id, _format_merge_preview(validated_groups), reply_markup=MERGE_PREVIEW_KEYBOARD)
                         else:
                             send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
+                        _preview_intercepted = True
+                    elif intent == "start_action":
+                        selected = _validate_start_action(
+                            router_result.get("action"), router_result.get("selected_numbers"), ctx, list_items
+                        )
+                        if selected is not None:
+                            saved_list_context.pop(chat_id, None)
+                            action = router_result.get("action")
+                            if action == "mark_bought":
+                                _show_mark_preview(chat_id, selected, household_id, user_db_id)
+                            elif action == "delete_shopping":
+                                _show_delete_preview(chat_id, selected, household_id, user_db_id)
+                            elif action == "remove_inventory":
+                                _show_remove_preview(chat_id, selected, household_id, user_db_id)
+                        else:
+                            send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
                         _preview_intercepted = True
                     # intent == "none": fall through to AI chat
             except Exception:
