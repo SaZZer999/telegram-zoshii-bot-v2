@@ -1,8 +1,10 @@
 import os
+from datetime import datetime, timezone
 import psycopg
 
 HOUSEHOLD_NAME = "Спільний дім"
 DEFAULT_CATEGORY = "Інше їстівне"
+VALID_LIST_CONTEXTS = {"shopping_saved", "inventory_saved"}
 
 # =========================
 # STRUCTURED QUANTITY HELPERS (DB-local)
@@ -104,6 +106,39 @@ def merge_quantity_values(value_a, unit_a, value_b, unit_b):
     return round(value_a + value_b, 2), unit_a
 
 
+# =========================
+# PERSISTENT LIST CONTEXT HELPERS (pure, no DB connection)
+# =========================
+
+def list_context_is_valid(context):
+    """True if context is one of the two allowed persisted list contexts."""
+    return context in VALID_LIST_CONTEXTS
+
+
+def list_context_is_expired(expires_at, now=None):
+    """True if expires_at is missing or not strictly in the future.
+
+    `now` is injectable for tests; defaults to the real UTC time.
+    """
+    if expires_at is None:
+        return True
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return expires_at <= now
+
+
+def list_context_is_usable(context, stored_household_id, requested_household_id, expires_at, now=None):
+    """Combined pure decision used by get_list_context: valid context value,
+    matching household, and not expired. False if any check fails."""
+    if not list_context_is_valid(context):
+        return False
+    if stored_household_id != requested_household_id:
+        return False
+    if list_context_is_expired(expires_at, now=now):
+        return False
+    return True
+
+
 def get_connection():
     url = os.getenv("DATABASE_URL")
     return psycopg.connect(url, connect_timeout=10)
@@ -197,6 +232,18 @@ def init_db():
             cur.execute("""
                 ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS quantity_inferred BOOLEAN NOT NULL DEFAULT FALSE
             """)
+            # chat_id is already PK-indexed; expired rows are deleted by chat_id
+            # opportunistically in get_list_context, so no separate expires_at
+            # index is needed (no bulk-cleanup job exists to justify one).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_list_contexts (
+                    chat_id       BIGINT PRIMARY KEY,
+                    household_id  BIGINT NOT NULL,
+                    context       TEXT NOT NULL,
+                    expires_at    TIMESTAMPTZ NOT NULL,
+                    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         conn.commit()
     _backfill_structured_quantities()
 
@@ -217,6 +264,76 @@ def _backfill_structured_quantities():
                         (normalized["canonical_name"], normalized["quantity_value"], normalized["quantity_unit"], row_id),
                     )
         conn.commit()
+
+
+# =========================
+# PERSISTENT LIST CONTEXT (survives restart/deploy, TTL 24h)
+# =========================
+
+def save_list_context(chat_id, household_id, context):
+    """Persist the last opened saved list (shopping_saved/inventory_saved) for
+    a chat, replacing any previous value, with a 24h TTL from now.
+
+    No-ops silently for an invalid context or a DB error — this is a UX
+    convenience, never allowed to break the bot.
+    """
+    if not list_context_is_valid(context):
+        return
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_list_contexts (chat_id, household_id, context, expires_at, updated_at)
+                    VALUES (%s, %s, %s, NOW() + INTERVAL '24 hours', NOW())
+                    ON CONFLICT (chat_id) DO UPDATE
+                        SET household_id = EXCLUDED.household_id,
+                            context = EXCLUDED.context,
+                            expires_at = EXCLUDED.expires_at,
+                            updated_at = EXCLUDED.updated_at
+                    """,
+                    (chat_id, household_id, context)
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def get_list_context(chat_id, household_id):
+    """Return the persisted context for chat_id if valid, unexpired, and the
+    household matches. Returns None on any error, mismatch, or expiry —
+    never raises. Opportunistically deletes an expired row on read.
+    """
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT household_id, context, expires_at FROM bot_list_contexts WHERE chat_id = %s",
+                    (chat_id,)
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                stored_household_id, context, expires_at = row
+                usable = list_context_is_usable(context, stored_household_id, household_id, expires_at)
+                if not usable and list_context_is_expired(expires_at):
+                    cur.execute("DELETE FROM bot_list_contexts WHERE chat_id = %s", (chat_id,))
+                    conn.commit()
+        return context if usable else None
+    except Exception:
+        return None
+
+
+def clear_list_context(chat_id):
+    """Delete the persisted list context for a chat, if any. Never raises."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM bot_list_contexts WHERE chat_id = %s", (chat_id,))
+            conn.commit()
+    except Exception:
+        pass
+
 
 def get_or_create_household():
     with get_connection() as conn:

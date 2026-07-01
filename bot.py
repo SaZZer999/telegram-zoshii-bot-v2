@@ -21,6 +21,9 @@ from database import (
     execute_merge_inventory,
     update_shopping_items_batch,
     update_inventory_items_batch,
+    save_list_context,
+    get_list_context,
+    clear_list_context,
 )
 
 # =========================
@@ -1180,6 +1183,25 @@ def _snapshot_is_stale(item_ids, current_items):
     return not set(item_ids).issubset(current_ids)
 
 
+def _should_restore_persisted_context(chat_id):
+    """True if there's no RAM saved_list_context and no other active preview
+    or special mode that must take priority over restoring a persisted context.
+
+    shopping_mode/inventory_mode and pending_batch/pending_inventory_batch are
+    intentionally not checked here — they're already excluded by the time this
+    is reached (handled earlier in webhook() with their own early returns, or
+    by the outer if/elif around the saved_list_context branch).
+    """
+    if saved_list_context.get(chat_id) is not None:
+        return False
+    return not any(
+        chat_id in d for d in (
+            pending_mark_batch, pending_delete_batch, pending_remove_batch,
+            pending_saved_edit, pending_quick_purchase, pending_merge,
+        )
+    )
+
+
 def _ask_gemini_for_selection(user_text, items, list_label, action_label):
     lines = []
     for i, item in enumerate(items):
@@ -1614,6 +1636,7 @@ def webhook():
         active_list_context.pop(chat_id, None)
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
+        clear_list_context(chat_id)
         send_message(
             chat_id,
             "Привіт! Я твій домашній помічник 🏠\n\n"
@@ -1627,6 +1650,7 @@ def webhook():
         active_list_context.pop(chat_id, None)
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
+        clear_list_context(chat_id)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -1650,6 +1674,7 @@ def webhook():
         saved_list_context[chat_id] = "shopping_saved"
         try:
             household_id, _ = get_household_and_user(user_id, display_name)
+            save_list_context(chat_id, household_id, "shopping_saved")
             items = get_active_shopping_items(household_id)
             send_message(chat_id, format_shopping_list(items), reply_markup=SHOPPING_KEYBOARD)
         except Exception:
@@ -1669,6 +1694,7 @@ def webhook():
         saved_list_context[chat_id] = "shopping_saved"
         try:
             household_id, _ = get_household_and_user(user_id, display_name)
+            save_list_context(chat_id, household_id, "shopping_saved")
             items = get_active_shopping_items(household_id)
             send_message(chat_id, format_shopping_list(items))
         except Exception:
@@ -1710,6 +1736,7 @@ def webhook():
         active_list_context.pop(chat_id, None)
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
+        clear_list_context(chat_id)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -1721,6 +1748,7 @@ def webhook():
         saved_list_context[chat_id] = "inventory_saved"
         try:
             household_id, _ = get_household_and_user(user_id, display_name)
+            save_list_context(chat_id, household_id, "inventory_saved")
             items = get_inventory_items(household_id)
             send_message(chat_id, format_inventory_list(items), reply_markup=INVENTORY_KEYBOARD)
         except Exception:
@@ -1742,6 +1770,7 @@ def webhook():
         saved_list_context[chat_id] = "inventory_saved"
         try:
             household_id, _ = get_household_and_user(user_id, display_name)
+            save_list_context(chat_id, household_id, "inventory_saved")
             items = get_inventory_items(household_id)
             send_message(chat_id, format_inventory_list(items))
         except Exception:
@@ -2012,6 +2041,17 @@ def webhook():
 
     else:
         ctx = saved_list_context.get(chat_id)
+        if _should_restore_persisted_context(chat_id):
+            # Try restoring the last opened list from PostgreSQL — survives
+            # restart/deploy, TTL 24h.
+            try:
+                household_id, _ = get_household_and_user(user_id, display_name)
+                persisted = get_list_context(chat_id, household_id)
+                if persisted in ("shopping_saved", "inventory_saved"):
+                    ctx = persisted
+                    saved_list_context[chat_id] = ctx
+            except Exception:
+                pass
         if ctx in ("shopping_saved", "inventory_saved"):
             try:
                 household_id, user_db_id = get_household_and_user(user_id, display_name)
