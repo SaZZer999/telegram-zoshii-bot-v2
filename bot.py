@@ -879,6 +879,35 @@ def _format_merge_preview(validated_groups):
 # SELECTION / PREVIEW HELPERS
 # =========================
 
+def _validate_selected_numbers(numbers, items):
+    """Validate raw selected_numbers against the current items list.
+
+    Returns an ordered (as given), deduped list of item dicts, dropping
+    out-of-range numbers individually rather than invalidating the whole
+    selection. Returns None if numbers isn't a list or nothing remains.
+    """
+    if not isinstance(numbers, list):
+        return None
+    total = len(items)
+    seen = set()
+    selected = []
+    for n in numbers:
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= total and n not in seen:
+            seen.add(n)
+            selected.append(items[n - 1])
+    return selected if selected else None
+
+
+def _snapshot_is_stale(item_ids, current_items):
+    """True if any snapshot item id is no longer present in the current list."""
+    current_ids = {it["id"] for it in current_items}
+    return not set(item_ids).issubset(current_ids)
+
+
 def _ask_gemini_for_selection(user_text, items, list_label, action_label):
     lines = []
     for i, item in enumerate(items):
@@ -903,18 +932,7 @@ def _ask_gemini_for_selection(user_text, items, list_label, action_label):
             cleaned = m.group(1).strip()
     try:
         data = json.loads(cleaned)
-        numbers = data.get("selected_numbers")
-        if not isinstance(numbers, list):
-            return None
-        total = len(items)
-        seen = set()
-        indices = []
-        for n in numbers:
-            n = int(n)
-            if 1 <= n <= total and n not in seen:
-                indices.append(n - 1)
-                seen.add(n)
-        return sorted(indices) if indices else None
+        return _validate_selected_numbers(data.get("selected_numbers"), items)
     except (json.JSONDecodeError, ValueError, TypeError):
         return None
 
@@ -1153,7 +1171,11 @@ def webhook():
         if chat_id in pending_mark_batch:
             mark_data = pending_mark_batch.pop(chat_id)
             try:
+                current_items = get_active_shopping_items(mark_data["household_id"])
                 item_ids = [item["id"] for item in mark_data["items"]]
+                if _snapshot_is_stale(item_ids, current_items):
+                    send_message(chat_id, "Список змінився з іншого пристрою. Онови список і повтори дію.", reply_markup=SHOPPING_KEYBOARD)
+                    return "ok"
                 count = mark_items_batch(item_ids, mark_data["user_db_id"])
                 for item in mark_data["items"]:
                     add_or_merge_inventory_item(
@@ -1172,7 +1194,11 @@ def webhook():
         if chat_id in pending_mark_batch:
             mark_data = pending_mark_batch.pop(chat_id)
             try:
+                current_items = get_active_shopping_items(mark_data["household_id"])
                 item_ids = [item["id"] for item in mark_data["items"]]
+                if _snapshot_is_stale(item_ids, current_items):
+                    send_message(chat_id, "Список змінився з іншого пристрою. Онови список і повтори дію.", reply_markup=SHOPPING_KEYBOARD)
+                    return "ok"
                 count = mark_items_batch(item_ids, mark_data["user_db_id"])
                 send_message(chat_id, f"✅ Позначено купленими: {count}", reply_markup=SHOPPING_KEYBOARD)
             except Exception:
@@ -1183,7 +1209,11 @@ def webhook():
         if chat_id in pending_delete_batch:
             del_data = pending_delete_batch.pop(chat_id)
             try:
+                current_items = get_active_shopping_items(del_data["household_id"])
                 item_ids = [item["id"] for item in del_data["items"]]
+                if _snapshot_is_stale(item_ids, current_items):
+                    send_message(chat_id, "Список змінився з іншого пристрою. Онови список і повтори дію.", reply_markup=SHOPPING_KEYBOARD)
+                    return "ok"
                 count = delete_items_batch(item_ids)
                 send_message(chat_id, f"🗑️ Видалено зі списку: {count}", reply_markup=SHOPPING_KEYBOARD)
             except Exception:
@@ -1194,7 +1224,11 @@ def webhook():
         if chat_id in pending_remove_batch:
             rem_data = pending_remove_batch.pop(chat_id)
             try:
+                current_items = get_inventory_items(rem_data["household_id"])
                 item_ids = [item["id"] for item in rem_data["items"]]
+                if _snapshot_is_stale(item_ids, current_items):
+                    send_message(chat_id, "Список змінився з іншого пристрою. Онови список і повтори дію.", reply_markup=INVENTORY_KEYBOARD)
+                    return "ok"
                 count = delete_inventory_items_batch(item_ids)
                 send_message(chat_id, f"✅ Прибрано із запасів: {count}", reply_markup=INVENTORY_KEYBOARD)
             except Exception:
@@ -1512,12 +1546,12 @@ def webhook():
             if not items:
                 send_message(chat_id, "Список покупок поки порожній.")
                 return "ok"
-            indices = _ask_gemini_for_selection(text, items, "Список покупок", "позначити купленими")
-            if indices is None:
+            selected = _ask_gemini_for_selection(text, items, "Список покупок", "позначити купленими")
+            if selected is None:
                 send_message(chat_id, SELECTION_ERROR_MSG)
                 shopping_mode[chat_id] = "marking"
             else:
-                _show_mark_preview(chat_id, [items[i] for i in indices], household_id, user_db_id)
+                _show_mark_preview(chat_id, selected, household_id, user_db_id)
         except Exception:
             send_message(chat_id, DB_ERROR_MSG)
         return "ok"
@@ -1529,12 +1563,12 @@ def webhook():
             if not items:
                 send_message(chat_id, "Список покупок поки порожній.")
                 return "ok"
-            indices = _ask_gemini_for_selection(text, items, "Список покупок", "видалити зі списку")
-            if indices is None:
+            selected = _ask_gemini_for_selection(text, items, "Список покупок", "видалити зі списку")
+            if selected is None:
                 send_message(chat_id, SELECTION_ERROR_MSG)
                 shopping_mode[chat_id] = "deleting"
             else:
-                _show_delete_preview(chat_id, [items[i] for i in indices], household_id, user_db_id)
+                _show_delete_preview(chat_id, selected, household_id, user_db_id)
         except Exception:
             send_message(chat_id, DB_ERROR_MSG)
         return "ok"
@@ -1584,12 +1618,12 @@ def webhook():
             if not items:
                 send_message(chat_id, "Запаси поки порожні.")
                 return "ok"
-            indices = _ask_gemini_for_selection(text, items, "Список запасів", "прибрати із запасів")
-            if indices is None:
+            selected = _ask_gemini_for_selection(text, items, "Список запасів", "прибрати із запасів")
+            if selected is None:
                 send_message(chat_id, SELECTION_ERROR_MSG)
                 inventory_mode[chat_id] = "removing"
             else:
-                _show_remove_preview(chat_id, [items[i] for i in indices], household_id, user_db_id)
+                _show_remove_preview(chat_id, selected, household_id, user_db_id)
         except Exception:
             send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
