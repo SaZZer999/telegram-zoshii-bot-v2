@@ -68,6 +68,7 @@ pending_inventory_batch = {}  # chat_id -> {items, ignored_items, household_id, 
 pending_remove_batch = {}     # chat_id -> {items, household_id, user_db_id}
 saved_list_context = {}       # chat_id -> "shopping_saved" | "inventory_saved"
 pending_saved_edit = {}       # chat_id -> {items_snapshot, validated_updates, household_id, user_db_id, context_type}
+pending_quick_purchase = {}   # chat_id -> {items, ignored_items, household_id, user_db_id}
 
 SYSTEM_PROMPT = "Ти корисний AI-помічник. Відповідай українською."
 
@@ -198,7 +199,11 @@ SAVED_LIST_EDIT_PROMPT = (
     "- «start_action» — якщо хоче виконати дію над товарами зі списку: позначити купленими, "
     "видалити зі списку покупок або прибрати із запасів. Трактуй так само формулювання в минулому часі "
     "(«купив», «купили», «видалив», «прибрали») як запит на дію над поточним списком\n"
-    "- «none» — в усіх інших випадках: додавання нових товарів, загальне питання, не стосується списку\n\n"
+    "- «quick_add_to_inventory» — лише коли список порожній (позицій немає взагалі) і користувач "
+    "повідомляє про продукти, які вже приніс/купив додому (напр. «Купив молоко і хліб», «Взяли сир»), "
+    "навіть у минулому часі. Не використовуй цей намір, якщо є хоч одна позиція в списку, або текст — "
+    "питання, план на майбутнє чи загальна фраза\n"
+    "- «none» — в усіх інших випадках: додавання нових товарів у непорожній список, загальне питання, не стосується списку\n\n"
     "Для edit_saved_items — поверни updates лише для позицій, які змінюються:\n"
     "- item_number — ціле число (номер у списку, від 1 до N)\n"
     "- name — нова назва або null якщо не змінюється\n"
@@ -213,17 +218,35 @@ SAVED_LIST_EDIT_PROMPT = (
     "- selected_numbers — номери обраних позицій за тими самими правилами, що й вибір позицій: "
     "«всі», «усе», «все куплено» тощо → всі номери; «все крім X» або «залиш X, решту...» → всі, крім X; "
     "числа й діапазони («1 2 3», «1-4»); назви або фрази → знайди відповідні позиції за назвою або змістом\n\n"
+    "Для quick_add_to_inventory — поверни items: масив нових товарів, кожен з полями:\n"
+    "- name — назва товару\n"
+    "- canonical_name — назва в нижньому регістрі\n"
+    "- quantity_value — число або null, якщо кількість не вказана явно\n"
+    "- quantity_unit — одне з «шт.», «л», «мл», «г», «кг», або null\n"
+    "- quantity_inferred — true, якщо кількість не вказана явно (тоді quantity_value=1, quantity_unit=«шт.»)\n"
+    "- category — категорія товару\n"
+    "- is_consumable — true лише для їжі, напоїв, спецій та соусів; побутові товари → false\n"
+    "Для quick_add_to_inventory не вигадуй кількість: якщо явно не вказано число й одиницю — став "
+    "quantity_value=1, quantity_unit=«шт.», quantity_inferred=true. «Молоко 2 л» → quantity_value=2, "
+    "quantity_unit=«л», quantity_inferred=false.\n\n"
     "Правила:\n"
     "- Не додавай нових позицій і не видаляй існуючих через edit_saved_items чи merge_duplicates\n"
     "- Для start_action не повертай updates і merge_groups\n"
+    "- Для quick_add_to_inventory не повертай updates, merge_groups, action, selected_numbers\n"
     "- Нормалізуй одиниці: «2 штуки» → «2 шт.», «500 грам» → «500 г», «1.5 л» → «1,5 л»\n"
     "- Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON\n\n"
     "Приклад edit_saved_items:\n"
     "{\"intent\": \"edit_saved_items\", \"action\": null, \"selected_numbers\": [], "
-    "\"updates\": [{\"item_number\": 1, \"name\": null, \"quantity_text\": \"2 шт.\", \"category\": null}], \"merge_groups\": []}\n"
+    "\"updates\": [{\"item_number\": 1, \"name\": null, \"quantity_text\": \"2 шт.\", \"category\": null}], "
+    "\"merge_groups\": [], \"items\": []}\n"
     "Приклад start_action:\n"
     "{\"intent\": \"start_action\", \"action\": \"mark_bought\", \"selected_numbers\": [1, 3], "
-    "\"updates\": [], \"merge_groups\": []}"
+    "\"updates\": [], \"merge_groups\": [], \"items\": []}\n"
+    "Приклад quick_add_to_inventory:\n"
+    "{\"intent\": \"quick_add_to_inventory\", \"action\": null, \"selected_numbers\": [], "
+    "\"updates\": [], \"merge_groups\": [], \"items\": ["
+    "{\"name\": \"Молоко\", \"canonical_name\": \"молоко\", \"quantity_value\": 1, \"quantity_unit\": \"шт.\", "
+    "\"quantity_inferred\": true, \"category\": \"Молочне та яйця\", \"is_consumable\": true}]}"
 )
 
 # =========================
@@ -313,6 +336,15 @@ MERGE_PREVIEW_KEYBOARD = {
 SAVED_EDIT_PREVIEW_KEYBOARD = {
     "keyboard": [
         ["✅ Підтвердити зміни"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+QUICK_PURCHASE_KEYBOARD = {
+    "keyboard": [
+        ["✅ Додати до запасів", "✏️ Змінити список"],
         ["❌ Скасувати"],
     ],
     "resize_keyboard": True,
@@ -419,6 +451,7 @@ def clear_shopping_state(chat_id):
     pending_merge.pop(chat_id, None)
     saved_list_context.pop(chat_id, None)
     pending_saved_edit.pop(chat_id, None)
+    pending_quick_purchase.pop(chat_id, None)
 
 def clear_inventory_state(chat_id):
     inventory_mode.pop(chat_id, None)
@@ -427,6 +460,7 @@ def clear_inventory_state(chat_id):
     pending_merge.pop(chat_id, None)
     saved_list_context.pop(chat_id, None)
     pending_saved_edit.pop(chat_id, None)
+    pending_quick_purchase.pop(chat_id, None)
 
 # =========================
 # QUANTITY HELPERS (local)
@@ -975,11 +1009,68 @@ def _validate_start_action(action, selected_numbers, context_type, items):
     return _validate_selected_numbers(selected_numbers, items)
 
 
-_SAVED_LIST_ROUTER_FALLBACK = {"intent": "none", "action": None, "selected_numbers": [], "updates": [], "merge_groups": []}
+def _validate_quick_add_items(raw_items):
+    """Validate Gemini quick_add_to_inventory items for an empty shopping list.
+
+    Drops non-consumable entries (returned separately as ignored names),
+    never trusts Gemini's quantity_value/unit blindly — re-derives structured
+    fields locally via normalize_item_quantity, defaulting to "1 шт." inferred
+    only when no safe explicit quantity was given. Duplicate items are merged
+    the same way pending-add batches already are.
+    Returns (items, ignored_names) or None if nothing usable remains.
+    """
+    if not isinstance(raw_items, list) or not raw_items:
+        return None
+    valid = []
+    ignored = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = name.strip()
+        if not raw.get("is_consumable", True):
+            ignored.append(name)
+            continue
+        cat = raw.get("category")
+        if not isinstance(cat, str) or cat not in VALID_CATEGORIES:
+            cat = DEFAULT_CATEGORY
+        qty_value = raw.get("quantity_value")
+        qty_unit = raw.get("quantity_unit")
+        if (
+            not isinstance(qty_value, (int, float)) or isinstance(qty_value, bool)
+            or qty_value <= 0
+            or not isinstance(qty_unit, str) or qty_unit not in STRUCTURED_UNITS
+        ):
+            qty_value, qty_unit = None, None
+        normalized = normalize_item_quantity(
+            name, "", quantity_value=qty_value, quantity_unit=qty_unit, allow_default_unit=(qty_value is None)
+        )
+        item = {"name": name, "category": cat, "was_corrected": False}
+        item.update(normalized)
+        valid.append(item)
+    if not valid:
+        return None
+    return _auto_merge_in_place(valid), ignored
+
+
+def _format_quick_purchase_preview(items, ignored_items=None):
+    header = f"🧊 Буде додано до запасів: {len(items)}"
+    text = format_grouped_list(items, header)
+    if ignored_items:
+        text += "\n\nНе додано: " + ", ".join(ignored_items)
+    return text
+
+
+_SAVED_LIST_ROUTER_FALLBACK = {
+    "intent": "none", "action": None, "selected_numbers": [], "updates": [], "merge_groups": [], "items": [],
+}
 
 
 def _ask_gemini_saved_list_router(user_text, items, context_type):
-    """Gemini call: detect edit_saved_items, merge_duplicates or start_action for an active saved list."""
+    """Gemini call: detect edit_saved_items, merge_duplicates, start_action or
+    quick_add_to_inventory (for an empty shopping list) for an active saved list."""
     lines = []
     for i, item in enumerate(items):
         label = f"{i + 1}. {item['name']}"
@@ -1009,6 +1100,7 @@ def _ask_gemini_saved_list_router(user_text, items, context_type):
             "selected_numbers": data.get("selected_numbers") if isinstance(data.get("selected_numbers"), list) else [],
             "updates": data.get("updates") if isinstance(data.get("updates"), list) else [],
             "merge_groups": data.get("merge_groups") if isinstance(data.get("merge_groups"), list) else [],
+            "items": data.get("items") if isinstance(data.get("items"), list) else [],
         }
     except (json.JSONDecodeError, ValueError, TypeError):
         return dict(_SAVED_LIST_ROUTER_FALLBACK)
@@ -1338,6 +1430,9 @@ def webhook():
             ctx = edit_data["context_type"]
             keyboard = SHOPPING_KEYBOARD if ctx == "shopping_saved" else INVENTORY_KEYBOARD
             send_message(chat_id, "Зміни скасовано.", reply_markup=keyboard)
+        elif chat_id in pending_quick_purchase:
+            pending_quick_purchase.pop(chat_id, None)
+            send_message(chat_id, "Дію скасовано.", reply_markup=SHOPPING_KEYBOARD)
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -1420,6 +1515,27 @@ def webhook():
                 send_message(chat_id, f"✅ Прибрано із запасів: {count}", reply_markup=INVENTORY_KEYBOARD)
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
+        return "ok"
+
+    if text == "✅ Додати до запасів":
+        if chat_id in pending_quick_purchase:
+            purchase = pending_quick_purchase.pop(chat_id)
+            try:
+                count = add_inventory_items_batch(
+                    purchase["household_id"],
+                    purchase["user_db_id"],
+                    purchase["items"],
+                )
+                send_message(chat_id, f"✅ Додано до запасів: {count}", reply_markup=SHOPPING_KEYBOARD)
+            except Exception:
+                send_message(chat_id, INVENTORY_ERROR_MSG)
+        return "ok"
+
+    if text == "✏️ Змінити список":
+        if chat_id in pending_quick_purchase:
+            pending_quick_purchase.pop(chat_id, None)
+            saved_list_context[chat_id] = "shopping_saved"
+            send_message(chat_id, "Напиши, які товари ти купив:")
         return "ok"
 
     if text == "✅ Підтвердити зміни":
@@ -1531,7 +1647,13 @@ def webhook():
         active_list_context[chat_id] = "shopping"
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
-        send_message(chat_id, "🛒 Список покупок:", reply_markup=SHOPPING_KEYBOARD)
+        saved_list_context[chat_id] = "shopping_saved"
+        try:
+            household_id, _ = get_household_and_user(user_id, display_name)
+            items = get_active_shopping_items(household_id)
+            send_message(chat_id, format_shopping_list(items), reply_markup=SHOPPING_KEYBOARD)
+        except Exception:
+            send_message(chat_id, DB_ERROR_MSG, reply_markup=SHOPPING_KEYBOARD)
         return "ok"
 
     if text == "➕ Додати товар":
@@ -1596,7 +1718,13 @@ def webhook():
         active_list_context[chat_id] = "inventory"
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
-        send_message(chat_id, "🧊 Запаси:", reply_markup=INVENTORY_KEYBOARD)
+        saved_list_context[chat_id] = "inventory_saved"
+        try:
+            household_id, _ = get_household_and_user(user_id, display_name)
+            items = get_inventory_items(household_id)
+            send_message(chat_id, format_inventory_list(items), reply_markup=INVENTORY_KEYBOARD)
+        except Exception:
+            send_message(chat_id, INVENTORY_ERROR_MSG, reply_markup=INVENTORY_KEYBOARD)
         return "ok"
 
     if text == "➕ Додати продукти":
@@ -1938,6 +2066,25 @@ def webhook():
                                 _show_remove_preview(chat_id, selected, household_id, user_db_id)
                         else:
                             send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
+                        _preview_intercepted = True
+                    # intent == "none": fall through to AI chat
+                elif ctx == "shopping_saved":
+                    router_result = _ask_gemini_saved_list_router(text, [], ctx)
+                    if router_result["intent"] == "quick_add_to_inventory":
+                        parsed = _validate_quick_add_items(router_result.get("items"))
+                        if parsed is not None:
+                            quick_items, ignored_names = parsed
+                            saved_list_context.pop(chat_id, None)
+                            pending_quick_purchase[chat_id] = {
+                                "items": quick_items,
+                                "ignored_items": ignored_names,
+                                "household_id": household_id,
+                                "user_db_id": user_db_id,
+                            }
+                            preview = _format_quick_purchase_preview(quick_items, ignored_names)
+                            send_message(chat_id, preview, reply_markup=QUICK_PURCHASE_KEYBOARD)
+                        else:
+                            send_message(chat_id, "Не зміг безпечно зрозуміти покупку. Спробуй написати інакше.")
                         _preview_intercepted = True
                     # intent == "none": fall through to AI chat
             except Exception:
