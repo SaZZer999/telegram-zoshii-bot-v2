@@ -366,8 +366,9 @@ def format_grouped_list(items, header):
             label = item["name"]
             if item.get("was_corrected"):
                 label += " (виправлено)"
-            if item.get("quantity_text"):
-                lines.append(f"{counter}. {label} — {item['quantity_text']}")
+            _, _, qty_display = _effective_quantity(item)
+            if qty_display:
+                lines.append(f"{counter}. {label} — {qty_display}")
             else:
                 lines.append(f"{counter}. {label}")
             counter += 1
@@ -430,6 +431,126 @@ def _parse_qty(qty_text):
     except ValueError:
         return None, None
 
+# =========================
+# STRUCTURED QUANTITY HELPERS
+# =========================
+
+_NAME_SYNONYMS = {
+    "сливки": "вершки",
+}
+
+_UNIT_ALIASES = {
+    "шт": "шт.", "шт.": "шт.", "штук": "шт.", "штуки": "шт.", "штука": "шт.",
+    "л": "л", "літр": "л", "літри": "л", "літра": "л",
+    "мл": "мл", "мілілітр": "мл", "мілілітри": "мл", "мілілітрів": "мл",
+    "г": "г", "грам": "г", "грами": "г", "грама": "г", "грамів": "г",
+    "кг": "кг", "кілограм": "кг", "кілограми": "кг", "кілограмів": "кг",
+}
+
+STRUCTURED_UNITS = {"шт.", "л", "мл", "г", "кг"}
+
+
+def canonicalize_name(name):
+    """Lowercase/trim a name and map known synonyms to one canonical form."""
+    base = (name or "").strip().lower()
+    return _NAME_SYNONYMS.get(base, base)
+
+
+def _parse_structured_quantity(quantity_text):
+    """Parse an unambiguous 'value unit' or bare-number quantity_text.
+
+    Returns (value: float|None, unit: str|None). Never raises.
+    """
+    if not quantity_text or not quantity_text.strip():
+        return None, None
+    normalized = quantity_text.strip().replace(",", ".")
+    parts = normalized.split()
+    if len(parts) == 1:
+        try:
+            return float(parts[0]), None
+        except ValueError:
+            return None, None
+    if len(parts) == 2:
+        try:
+            value = float(parts[0])
+        except ValueError:
+            return None, None
+        unit = _UNIT_ALIASES.get(parts[1].lower().rstrip("."))
+        if unit is None:
+            return None, None
+        return value, unit
+    return None, None
+
+
+def format_quantity_display(value, unit):
+    """Format a numeric value+unit for display: comma decimal, no trailing .0."""
+    if value is None:
+        return ""
+    if value == int(value):
+        value_str = str(int(value))
+    else:
+        value_str = ("%g" % value).replace(".", ",")
+    return f"{value_str} {unit}" if unit else value_str
+
+
+def normalize_item_quantity(name, quantity_text, quantity_value=None, quantity_unit=None, allow_default_unit=False):
+    """Compute canonical_name/quantity_value/quantity_unit/quantity_inferred/quantity_text for an item.
+
+    If quantity_value+quantity_unit are already known, they're used as-is.
+    Otherwise quantity_text is parsed locally when unambiguous. allow_default_unit=True
+    applies the "1 шт." default only when quantity_text is genuinely blank (new
+    items straight out of AI parsing) — never for edits or legacy-data backfill.
+    """
+    canonical_name = canonicalize_name(name)
+    inferred = False
+    if quantity_value is not None and quantity_unit is not None:
+        value, unit = quantity_value, quantity_unit
+    else:
+        value, unit = _parse_structured_quantity(quantity_text)
+        if value is None and not (quantity_text or "").strip() and allow_default_unit:
+            value, unit, inferred = 1.0, "шт.", True
+    display = format_quantity_display(value, unit) if value is not None else (quantity_text or "").strip()
+    return {
+        "canonical_name": canonical_name,
+        "quantity_value": value,
+        "quantity_unit": unit,
+        "quantity_inferred": inferred,
+        "quantity_text": display,
+    }
+
+
+def merge_quantity_values(value_a, unit_a, value_b, unit_b):
+    """Return merged (value, unit) if two structured quantities can be safely
+    summed, else None. Units must match and be one of the known structured units."""
+    if value_a is None or value_b is None:
+        return None
+    if unit_a != unit_b:
+        return None
+    if unit_a not in STRUCTURED_UNITS:
+        return None
+    return round(value_a + value_b, 2), unit_a
+
+
+def _effective_quantity(item):
+    """Return (value, unit, display_text) for an item, preferring structured fields."""
+    value = item.get("quantity_value")
+    unit = item.get("quantity_unit")
+    if value is not None:
+        return value, unit, format_quantity_display(value, unit)
+    return None, None, (item.get("quantity_text") or "")
+
+
+def names_can_merge(item_a, item_b):
+    """Same product (canonical_name) and compatible category (equal, or either default)."""
+    canon_a = item_a.get("canonical_name") or canonicalize_name(item_a["name"])
+    canon_b = item_b.get("canonical_name") or canonicalize_name(item_b["name"])
+    if canon_a != canon_b:
+        return False
+    cat_a = item_a.get("category") or DEFAULT_CATEGORY
+    cat_b = item_b.get("category") or DEFAULT_CATEGORY
+    return cat_a == cat_b or cat_a == DEFAULT_CATEGORY or cat_b == DEFAULT_CATEGORY
+
+
 def _compute_merged_quantity(merge_items):
     """Compute safe merged quantity_text for a group.
 
@@ -471,26 +592,33 @@ def _compute_merged_quantity(merge_items):
 def _auto_merge_in_place(items):
     """Merge duplicate items within a pending list (pure Python, no Gemini).
 
-    Groups by (lowercase name, category). Compatible quantities are summed.
-    Incompatible quantities block the merge — those items stay separate.
+    Same canonical_name (+ compatible category) with matching structured
+    units are summed. Incompatible items are left separate — no guessed math.
     """
-    from collections import OrderedDict
-    seen = OrderedDict()
-    for item in items:
-        key = (item["name"].strip().lower(), item.get("category") or DEFAULT_CATEGORY)
-        seen.setdefault(key, []).append(item)
     result = []
-    for group in seen.values():
-        if len(group) == 1:
-            result.append(group[0])
-            continue
-        merged_qty = _compute_merged_quantity(group)
-        if merged_qty is None:
-            result.extend(group)
-            continue
-        merged = dict(group[0])
-        merged["quantity_text"] = merged_qty
-        result.append(merged)
+    for item in items:
+        target = None
+        merged_qty = None
+        for existing in result:
+            if not names_can_merge(existing, item):
+                continue
+            val_a, unit_a, _ = _effective_quantity(existing)
+            val_b, unit_b, _ = _effective_quantity(item)
+            candidate = merge_quantity_values(val_a, unit_a, val_b, unit_b)
+            if candidate is not None:
+                target = existing
+                merged_qty = candidate
+                break
+        if target is not None:
+            value, unit = merged_qty
+            target["quantity_value"] = value
+            target["quantity_unit"] = unit
+            target["quantity_text"] = format_quantity_display(value, unit)
+            target["quantity_inferred"] = bool(target.get("quantity_inferred")) and bool(item.get("quantity_inferred"))
+            if (target.get("category") or DEFAULT_CATEGORY) == DEFAULT_CATEGORY and item.get("category"):
+                target["category"] = item["category"]
+        else:
+            result.append(dict(item))
     return result
 
 
@@ -603,8 +731,9 @@ def _ask_gemini_preview_edit_router(user_text, items, context_type):
     lines = []
     for i, item in enumerate(items):
         label = f"{i + 1}. {item['name']}"
-        if item.get("quantity_text"):
-            label += f" — {item['quantity_text']}"
+        item_qty = _effective_quantity(item)[2]
+        if item_qty:
+            label += f" — {item_qty}"
         label += f" [{item.get('category') or DEFAULT_CATEGORY}]"
         lines.append(label)
     prompt = (
@@ -669,12 +798,17 @@ def _apply_preview_updates(items, valid_updates):
     result = [dict(item) for item in items]
     for upd in valid_updates:
         idx = upd["item_number"] - 1
-        if upd.get("name") is not None:
+        name_changed = upd.get("name") is not None
+        qty_changed = upd.get("quantity_text") is not None
+        if name_changed:
             result[idx]["name"] = str(upd["name"]).strip()
-        if upd.get("quantity_text") is not None:
+        if qty_changed:
             result[idx]["quantity_text"] = upd["quantity_text"].strip()
         if upd.get("category") is not None:
             result[idx]["category"] = upd["category"]
+        if name_changed or qty_changed:
+            normalized = normalize_item_quantity(result[idx]["name"], result[idx].get("quantity_text") or "")
+            result[idx].update(normalized)
     return result
 
 
@@ -690,7 +824,7 @@ def _compute_saved_merged_quantity(group_items):
     Same parseable non-шт. unit → sum (no empty items allowed for liquid/weight units).
     Returns quantity string or None if incompatible.
     """
-    qtys = [item.get("quantity_text") or "" for item in group_items]
+    qtys = [_effective_quantity(item)[2] for item in group_items]
     non_empty = [q.strip() for q in qtys if q.strip()]
     empty_count = len(qtys) - len(non_empty)
 
@@ -747,7 +881,8 @@ def _compute_saved_merge_groups(merge_groups_raw, items):
         if any(n in used_numbers for n in nums):
             continue
         group_items = [items_by_num[n] for n in nums]
-        if len({it["name"].strip().lower() for it in group_items}) > 1:
+        canonical_names = {it.get("canonical_name") or canonicalize_name(it["name"]) for it in group_items}
+        if len(canonical_names) > 1:
             continue
         categories = {it.get("category") or DEFAULT_CATEGORY for it in group_items}
         non_default = categories - {DEFAULT_CATEGORY}
@@ -757,12 +892,16 @@ def _compute_saved_merge_groups(merge_groups_raw, items):
         merged_qty = _compute_saved_merged_quantity(group_items)
         if merged_qty is None:
             continue
+        merged_value, merged_unit = _parse_structured_quantity(merged_qty)
         used_numbers.update(nums)
         validated.append({
             "item_ids": [it["id"] for it in group_items],
             "merged_name": group_items[0]["name"],
             "merged_quantity_text": merged_qty,
             "merged_category": merged_category,
+            "canonical_name": next(iter(canonical_names)),
+            "merged_quantity_value": merged_value,
+            "merged_quantity_unit": merged_unit,
             "items": group_items,
         })
     return validated
@@ -808,8 +947,9 @@ def _ask_gemini_saved_list_router(user_text, items, context_type):
     lines = []
     for i, item in enumerate(items):
         label = f"{i + 1}. {item['name']}"
-        if item.get("quantity_text"):
-            label += f" — {item['quantity_text']}"
+        item_qty = _effective_quantity(item)[2]
+        if item_qty:
+            label += f" — {item_qty}"
         label += f" [{item.get('category') or DEFAULT_CATEGORY}]"
         lines.append(label)
     prompt = (
@@ -844,12 +984,13 @@ def _format_saved_edit_preview(items_snapshot, validated_updates, context_type):
         idx = upd["item_number"] - 1
         old = items_snapshot[idx]
         old_label = old["name"]
-        if old.get("quantity_text"):
-            old_label += f" — {old['quantity_text']}"
+        old_qty = _effective_quantity(old)[2]
+        if old_qty:
+            old_label += f" — {old_qty}"
         new_name = upd.get("name") or old["name"]
         new_qty = upd.get("quantity_text")
         if new_qty is None:
-            new_qty = old.get("quantity_text") or ""
+            new_qty = old_qty
         new_label = new_name
         if new_qty:
             new_label += f" — {new_qty}"
@@ -865,8 +1006,9 @@ def _format_merge_preview(validated_groups):
         parts = []
         for item in group["items"]:
             label = item["name"]
-            if item.get("quantity_text"):
-                label += f" — {item['quantity_text']}"
+            item_qty = _effective_quantity(item)[2]
+            if item_qty:
+                label += f" — {item_qty}"
             parts.append(label)
         result = group["merged_name"]
         if group["merged_quantity_text"]:
@@ -912,8 +1054,9 @@ def _ask_gemini_for_selection(user_text, items, list_label, action_label):
     lines = []
     for i, item in enumerate(items):
         label = f"{i + 1}. {item['name']}"
-        if item.get("quantity_text"):
-            label += f" — {item['quantity_text']}"
+        item_qty = _effective_quantity(item)[2]
+        if item_qty:
+            label += f" — {item_qty}"
         if item.get("category"):
             label += f" [{item['category']}]"
         lines.append(label)
@@ -992,12 +1135,14 @@ def parse_shopping_list_with_gemini(text):
             cat = item.get("category", "").strip()
             if cat not in VALID_CATEGORIES:
                 cat = DEFAULT_CATEGORY
-            consumable.append({
+            normalized = normalize_item_quantity(name, item.get("quantity_text", "").strip(), allow_default_unit=True)
+            entry = {
                 "name": name,
-                "quantity_text": item.get("quantity_text", "").strip(),
                 "category": cat,
                 "was_corrected": bool(item.get("was_corrected", False)),
-            })
+            }
+            entry.update(normalized)
+            consumable.append(entry)
         if not consumable and not ignored:
             return None
         return {"items": consumable, "ignored_items": ignored}
@@ -1184,6 +1329,10 @@ def webhook():
                         item["name"],
                         item.get("quantity_text", ""),
                         item.get("category", DEFAULT_CATEGORY),
+                        canonical_name=item.get("canonical_name"),
+                        quantity_value=item.get("quantity_value"),
+                        quantity_unit=item.get("quantity_unit"),
+                        quantity_inferred=item.get("quantity_inferred", False),
                     )
                 send_message(chat_id, f"✅ Куплено й додано до запасів: {count}", reply_markup=SHOPPING_KEYBOARD)
             except Exception:
@@ -1533,8 +1682,9 @@ def webhook():
             return "ok"
         name, quantity_text = parse_item_text(text)
         batch["items"][idx]["name"] = name
-        batch["items"][idx]["quantity_text"] = quantity_text or ""
         batch["items"][idx]["was_corrected"] = False
+        normalized = normalize_item_quantity(name, quantity_text or "", allow_default_unit=True)
+        batch["items"][idx].update(normalized)
         preview = format_batch_preview(batch["items"], batch.get("ignored_items"))
         send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
         return "ok"
