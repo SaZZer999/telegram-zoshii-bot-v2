@@ -804,7 +804,7 @@ class StaleSnapshotError(Exception):
     pass
 
 
-def _verify_targets_in_tx(cur, table, household_id, targets):
+def _verify_targets_in_tx(cur, table, household_id, targets, extra_fields=None):
     """Re-read `targets` for `table` ("shopping_items" or "inventory_items")
     inside the caller's open transaction and lock the rows (FOR UPDATE) so no
     concurrent write can slip in before this transaction commits. Raises
@@ -813,23 +813,37 @@ def _verify_targets_in_tx(cur, table, household_id, targets):
 
     targets: list of dicts with item_id, quantity_value, quantity_unit — the
     values captured when the preview/snapshot was built.
+
+    extra_fields (optional): tuple of additional column names (e.g.
+    ("canonical_name", "category")) to also verify for exact match against
+    the same-named keys in each target dict — used by the manual merge guard,
+    which must also detect a concurrent rename/re-categorization that leaves
+    quantity_value/quantity_unit untouched. None (default) preserves the
+    original quantity-only check and SQL shape unchanged for every other caller.
     """
     if not targets:
         return
     ids = [t["item_id"] for t in targets]
     placeholders = ",".join(["%s"] * len(ids))
+    extra_cols = list(extra_fields or ())
+    columns = ["id", "quantity_value", "quantity_unit"] + extra_cols
     cur.execute(
-        f"SELECT id, quantity_value, quantity_unit FROM {table} "
+        f"SELECT {', '.join(columns)} FROM {table} "
         f"WHERE id IN ({placeholders}) AND household_id=%s FOR UPDATE",
         list(ids) + [household_id],
     )
-    current = {
-        row[0]: (float(row[1]) if row[1] is not None else None, row[2])
-        for row in cur.fetchall()
-    }
+    current = {}
+    for row in cur.fetchall():
+        value = float(row[1]) if row[1] is not None else None
+        current[row[0]] = ((value, row[2]), tuple(row[3:]))
     for t in targets:
         seen = current.get(t["item_id"])
-        if seen is None or seen != (t.get("quantity_value"), t.get("quantity_unit")):
+        if seen is None:
+            raise StaleSnapshotError()
+        seen_qty, seen_extra = seen
+        if seen_qty != (t.get("quantity_value"), t.get("quantity_unit")):
+            raise StaleSnapshotError()
+        if extra_cols and seen_extra != tuple(t.get(f) for f in extra_cols):
             raise StaleSnapshotError()
 
 
@@ -1141,17 +1155,27 @@ def apply_inventory_reconciliation(household_id, user_db_id, updates, insert_ite
 # MANUAL MERGE
 # =========================
 
-def execute_merge_shopping(household_id, validated_groups):
+def execute_merge_shopping(household_id, validated_groups, targets=None):
     """Merge validated groups in shopping_items in one transaction.
 
     Each group: {item_ids, merged_name, merged_quantity_text, merged_category}.
     First id gets updated; remaining ids get deleted.
+
+    targets (optional): snapshot of {item_id, quantity_value, quantity_unit,
+    canonical_name, category} for every source item across validated_groups,
+    captured when the merge preview was built. Verified for staleness inside
+    this same transaction before anything is written — raises
+    StaleSnapshotError (transaction rolled back, nothing applied, not even
+    partially) if any target's quantity, unit, canonical_name, or category
+    changed, or if any target row vanished, since the preview was shown.
     Returns count of groups merged.
     """
     if not validated_groups:
         return 0
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "shopping_items", household_id, targets,
+                                   extra_fields=("canonical_name", "category"))
             for group in validated_groups:
                 main_id = group["item_ids"][0]
                 rest_ids = group["item_ids"][1:]
@@ -1295,17 +1319,27 @@ def update_inventory_items_batch(household_id, updates):
     return updated
 
 
-def execute_merge_inventory(household_id, validated_groups):
+def execute_merge_inventory(household_id, validated_groups, targets=None):
     """Merge validated groups in inventory_items in one transaction.
 
     Each group: {item_ids, merged_name, merged_quantity_text, merged_category}.
     First id gets updated; remaining ids get deleted.
+
+    targets (optional): snapshot of {item_id, quantity_value, quantity_unit,
+    canonical_name, category} for every source item across validated_groups,
+    captured when the merge preview was built. Verified for staleness inside
+    this same transaction before anything is written — raises
+    StaleSnapshotError (transaction rolled back, nothing applied, not even
+    partially) if any target's quantity, unit, canonical_name, or category
+    changed, or if any target row vanished, since the preview was shown.
     Returns count of groups merged.
     """
     if not validated_groups:
         return 0
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, targets,
+                                   extra_fields=("canonical_name", "category"))
             for group in validated_groups:
                 main_id = group["item_ids"][0]
                 rest_ids = group["item_ids"][1:]

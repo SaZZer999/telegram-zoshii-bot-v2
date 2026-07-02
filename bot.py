@@ -2440,6 +2440,29 @@ def _snapshot_targets(items):
     return targets
 
 
+def _merge_snapshot_targets(validated_groups):
+    """Build {item_id, quantity_value, quantity_unit, canonical_name, category}
+    snapshot targets for every SOURCE item across a set of validated saved-list
+    merge groups (each group's "items" list, as built by _compute_saved_merge_groups)
+    — fed into database._verify_targets_in_tx's extra_fields check, the exact same
+    guard every other confirm-flow already uses, just extended to also cover the
+    two extra fields a merge's UPDATE actually changes. Blocks the manual merge
+    (StaleSnapshotError) if any target item's quantity, unit, canonical_name, or
+    category changed — or the item vanished — since the merge preview was built.
+    """
+    targets = []
+    for group in validated_groups:
+        for it in group["items"]:
+            targets.append({
+                "item_id": it["id"],
+                "quantity_value": it.get("quantity_value"),
+                "quantity_unit": it.get("quantity_unit"),
+                "canonical_name": it.get("canonical_name") or canonicalize_name(it["name"]),
+                "category": it.get("category") or DEFAULT_CATEGORY,
+            })
+    return targets
+
+
 def _should_restore_persisted_context(chat_id):
     """True if there's no RAM saved_list_context and no other active preview
     or special mode that must take priority over restoring a persisted context.
@@ -2629,14 +2652,18 @@ def webhook():
                     send_message(chat_id, "Список вже не в пам'яті.", reply_markup=INVENTORY_KEYBOARD)
             elif list_type == "shopping_saved":
                 try:
-                    count = execute_merge_shopping(merge_data["household_id"], merge_data["groups"])
+                    count = execute_merge_shopping(merge_data["household_id"], merge_data["groups"], merge_data.get("targets"))
                     send_message(chat_id, f"✅ Об'єднано груп: {count}", reply_markup=SHOPPING_KEYBOARD)
+                except StaleSnapshotError:
+                    send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=SHOPPING_KEYBOARD)
                 except Exception:
                     send_message(chat_id, "Не вдалося виконати об'єднання. Спробуйте ще раз.", reply_markup=SHOPPING_KEYBOARD)
             elif list_type == "inventory_saved":
                 try:
-                    count = execute_merge_inventory(merge_data["household_id"], merge_data["groups"])
+                    count = execute_merge_inventory(merge_data["household_id"], merge_data["groups"], merge_data.get("targets"))
                     send_message(chat_id, f"✅ Об'єднано груп: {count}", reply_markup=INVENTORY_KEYBOARD)
+                except StaleSnapshotError:
+                    send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=INVENTORY_KEYBOARD)
                 except Exception:
                     send_message(chat_id, "Не вдалося виконати об'єднання. Спробуйте ще раз.", reply_markup=INVENTORY_KEYBOARD)
         return "ok"
@@ -3594,6 +3621,7 @@ def webhook():
                         if validated_groups:
                             pending_merge[chat_id] = {
                                 "groups": validated_groups,
+                                "targets": _merge_snapshot_targets(validated_groups),
                                 "household_id": household_id,
                                 "user_db_id": user_db_id,
                                 "list_type": ctx,
