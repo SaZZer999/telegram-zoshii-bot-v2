@@ -93,6 +93,28 @@ pending_inventory_reconciliation = {}  # chat_id -> {updates, additions, deletes
 pending_inventory_reconciliation_clarify = {}  # chat_id -> {ambiguous_group, rest, household_id, user_db_id}
 pending_alias_action = {}     # chat_id -> {kind: "create"|"update"|"delete", household_id, user_db_id, alias_text, target_display_name, alias_normalized (delete only)}
 
+# Every OTHER flow's pending preview/confirm state — deliberately excludes
+# pending_alias_action itself (a new global alias command is allowed to
+# overwrite an already-pending alias action, same as the dedicated aliases
+# submenu already does) and pending_batch/pending_inventory_batch/
+# pending_inventory_reconciliation_clarify (already checked earlier in the
+# same if/elif chain the gate lives in, so reaching the gate already implies
+# they're inactive for this chat — listed anyway for robustness against
+# future reordering).
+_ALIAS_GATE_BLOCKING_PENDING_STATES = (
+    pending_batch, pending_inventory_batch, pending_mark_batch, pending_delete_batch,
+    pending_remove_batch, pending_merge, pending_saved_edit, pending_quick_purchase,
+    pending_inventory_consumption, pending_compound_inventory,
+    pending_inventory_reconciliation, pending_inventory_reconciliation_clarify,
+)
+
+
+def _has_blocking_pending_state(chat_id):
+    """True if some other flow's pending preview/confirm is currently active
+    for this chat — the global alias command gate must never interrupt it."""
+    return any(chat_id in d for d in _ALIAS_GATE_BLOCKING_PENDING_STATES)
+
+
 _SEEN_UPDATE_IDS_MAXLEN = 1000
 _seen_update_ids = deque(maxlen=_SEEN_UPDATE_IDS_MAXLEN)   # oldest-first, bounded
 _seen_update_ids_set = set()                               # O(1) membership
@@ -129,7 +151,11 @@ SYSTEM_PROMPT = (
     "«У цій версії бота я не маю доступу до актуального прогнозу чи інтернет-пошуку, тому не хочу вигадувати дані.»\n"
     "Ніколи не пиши «Я зафіксував», «Я зберіг» або «Я оновив запаси», якщо в цьому чаті реально не відбулася "
     "підтверджена операція над базою даних. Не вигадуй зміни в PostgreSQL, обсяги упаковок, перерахунки "
-    "одиниць виміру чи суми між несумісними одиницями — якщо не впевнений, чесно скажи, що не можеш це визначити."
+    "одиниць виміру чи суми між несумісними одиницями — якщо не впевнений, чесно скажи, що не можеш це визначити.\n"
+    "Це стосується й домашніх назв товарів (aliases): ти НІКОЛИ не маєш права стверджувати, що «запам'ятав», "
+    "«зберіг» чи «оновив» домашню назву товару, або що вона тепер діятиме надалі. Створення, зміну й видалення "
+    "домашніх назв виконує лише код бота після явного підтвердження користувача кнопкою — якщо такого "
+    "підтвердження в цьому чаті не було, чесно скажи, що не можеш це зробити в звичайній розмові."
 )
 
 _UA_WEEKDAYS = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
@@ -715,6 +741,135 @@ def _format_alias_delete_preview(alias_text, target_display_name):
     return (f"🧠 Видалити домашню назву?\n\n"
             f"«{alias_text}» → «{target_display_name}»\n\n"
             f"✅ Так, видалити\n❌ Скасувати")
+
+
+ALIAS_GATE_UNRECOGNIZED_MSG = (
+    "Не зміг зрозуміти домашню назву. Напиши, наприклад:\n\n"
+    "Запам'ятай, що сливки = Вершки"
+)
+
+
+def _alias_origin_keyboard(origin):
+    """ALIASES_KEYBOARD when the action originated from the dedicated
+    submenu; None (no keyboard override) for a global alias command, so it
+    never changes whatever list/menu the user currently has open."""
+    return ALIASES_KEYBOARD if origin == "menu" else None
+
+
+def _reply_after_alias_action(chat_id, household_id, origin, message):
+    """After a confirmed alias create/update/delete: full refreshed list +
+    ALIASES_KEYBOARD when the action originated from the dedicated submenu;
+    a short standalone confirmation with no keyboard override otherwise."""
+    if origin == "menu":
+        send_message(chat_id, message)
+        send_message(chat_id, format_alias_list(list_household_aliases(household_id)), reply_markup=ALIASES_KEYBOARD)
+    else:
+        send_message(chat_id, message)
+
+
+def _alias_command_gate(text):
+    """Narrow, local gate for global alias commands — usable outside the
+    dedicated aliases submenu (main menu, help, open shopping/inventory
+    lists). Recognizes only unambiguous alias-management phrasing; it never
+    parses alias_text/target itself and never calls Gemini — that remains
+    entirely the job of the existing Gemini alias router. Kept deliberately
+    narrow so ordinary messages are never mistaken for alias commands.
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if lowered.startswith(("запам'ятай", "запам’ятай")) and "=" in stripped:
+        return True
+    if lowered.startswith("зміни:") and "=" in stripped:
+        return True
+    if lowered.startswith("забудь"):
+        remainder = stripped[len("забудь"):].strip(" ,:.-")
+        return bool(remainder)
+    if lowered in ("покажи мої назви", "покажи назви товарів"):
+        return True
+    return False
+
+
+def _handle_alias_command(chat_id, user_id, display_name, text, origin):
+    """Shared alias-router handling for the dedicated aliases submenu
+    (origin="menu") and the global alias command gate (origin="global").
+
+    Returns True if the message was fully handled here (caller must not fall
+    through to general AI-chat). Returns False only when intent is "none" and
+    origin == "menu" — the one case allowed to fall through, matching every
+    other router in this file. A global-gate command is never allowed to
+    fall through to AI-chat, even on "none"/"invalid" — the gate already
+    confirmed the text looks like an alias command.
+    """
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        router_result = _ask_gemini_alias_router(text)
+        kind, payload = _validate_alias_router_result(router_result)
+        menu_keyboard = _alias_origin_keyboard(origin)
+        if kind == "unresolved":
+            lines = ["Не зрозумів частину повідомлення:", ""]
+            lines += [f"• «{f}»" for f in payload]
+            lines.append("")
+            lines.append("Спробуй сформулювати інакше, наприклад: «сливки — це вершки».")
+            send_message(chat_id, "\n".join(lines), reply_markup=menu_keyboard)
+        elif kind == "list":
+            send_message(chat_id, format_alias_list(list_household_aliases(household_id)), reply_markup=menu_keyboard)
+        elif kind == "invalid":
+            if origin == "menu":
+                send_message(chat_id, "Не зміг безпечно зрозуміти правило. Спробуй написати, наприклад: «сливки — це вершки».")
+            else:
+                send_message(chat_id, ALIAS_GATE_UNRECOGNIZED_MSG)
+        elif kind == "create_or_update":
+            alias_text = router_result["alias_text"].strip()
+            target_display_name = router_result["target_display_name"].strip()
+            existing = get_household_alias(household_id, payload)
+            if existing:
+                pending_alias_action[chat_id] = {
+                    "kind": "update", "household_id": household_id, "user_db_id": user_db_id,
+                    "alias_text": alias_text, "target_display_name": target_display_name, "origin": origin,
+                }
+                send_message(
+                    chat_id,
+                    _format_alias_update_preview(alias_text, existing["target_display_name"], target_display_name),
+                    reply_markup=ALIAS_UPDATE_CONFIRM_KEYBOARD,
+                )
+            else:
+                pending_alias_action[chat_id] = {
+                    "kind": "create", "household_id": household_id, "user_db_id": user_db_id,
+                    "alias_text": alias_text, "target_display_name": target_display_name, "origin": origin,
+                }
+                send_message(
+                    chat_id,
+                    _format_alias_create_preview(alias_text, target_display_name),
+                    reply_markup=ALIAS_CREATE_CONFIRM_KEYBOARD,
+                )
+        elif kind == "delete":
+            existing = get_household_alias(household_id, payload)
+            if existing is None:
+                send_message(chat_id, "Не знайшов такого правила серед домашніх назв.", reply_markup=menu_keyboard)
+            else:
+                pending_alias_action[chat_id] = {
+                    "kind": "delete", "household_id": household_id, "user_db_id": user_db_id,
+                    "alias_normalized": payload, "alias_text": existing["alias_text"],
+                    "target_display_name": existing["target_display_name"], "origin": origin,
+                }
+                send_message(
+                    chat_id,
+                    _format_alias_delete_preview(existing["alias_text"], existing["target_display_name"]),
+                    reply_markup=ALIAS_DELETE_CONFIRM_KEYBOARD,
+                )
+        elif kind == "none":
+            if origin == "menu":
+                return False
+            send_message(chat_id, ALIAS_GATE_UNRECOGNIZED_MSG)
+        return True
+    except Exception:
+        send_message(chat_id, "Не вдалося виконати дію з домашніми назвами. Спробуй ще раз трохи пізніше.")
+        return True
+
 
 def format_inventory_preview(items, ignored_items=None):
     header = f"🧊 Знайшов продуктів: {len(items)}"
@@ -2438,8 +2593,8 @@ def webhook():
             pending_quick_purchase.pop(chat_id, None)
             send_message(chat_id, "Дію скасовано.", reply_markup=SHOPPING_KEYBOARD)
         elif chat_id in pending_alias_action:
-            pending_alias_action.pop(chat_id, None)
-            send_message(chat_id, "Дію скасовано.", reply_markup=ALIASES_KEYBOARD)
+            alias_data = pending_alias_action.pop(chat_id, None)
+            send_message(chat_id, "Дію скасовано.", reply_markup=_alias_origin_keyboard((alias_data or {}).get("origin", "menu")))
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -2506,43 +2661,43 @@ def webhook():
                 send_message(chat_id, DB_ERROR_MSG)
         elif chat_id in pending_alias_action:
             data = pending_alias_action.pop(chat_id)
+            origin = data.get("origin", "menu")
             if data.get("kind") == "delete":
                 try:
                     delete_household_alias(data["household_id"], data["alias_normalized"])
-                    send_message(chat_id, "✅ Видалив.")
-                    send_message(chat_id, format_alias_list(list_household_aliases(data["household_id"])), reply_markup=ALIASES_KEYBOARD)
+                    _reply_after_alias_action(chat_id, data["household_id"], origin, "✅ Видалив.")
                 except Exception:
-                    send_message(chat_id, "Не вдалося видалити назву. Спробуй ще раз трохи пізніше.", reply_markup=ALIASES_KEYBOARD)
+                    send_message(chat_id, "Не вдалося видалити назву. Спробуй ще раз трохи пізніше.", reply_markup=_alias_origin_keyboard(origin))
             else:
-                send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=ALIASES_KEYBOARD)
+                send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
         return "ok"
 
     if text == "✅ Так, запам'ятати":
         if chat_id in pending_alias_action:
             data = pending_alias_action.pop(chat_id)
+            origin = data.get("origin", "menu")
             if data.get("kind") == "create":
                 try:
                     create_or_update_household_alias(data["household_id"], data["alias_text"], data["target_display_name"], data["user_db_id"])
-                    send_message(chat_id, "✅ Запам'ятав.")
-                    send_message(chat_id, format_alias_list(list_household_aliases(data["household_id"])), reply_markup=ALIASES_KEYBOARD)
+                    _reply_after_alias_action(chat_id, data["household_id"], origin, "✅ Запам'ятав.")
                 except Exception:
-                    send_message(chat_id, "Не вдалося зберегти назву. Спробуй ще раз трохи пізніше.", reply_markup=ALIASES_KEYBOARD)
+                    send_message(chat_id, "Не вдалося зберегти назву. Спробуй ще раз трохи пізніше.", reply_markup=_alias_origin_keyboard(origin))
             else:
-                send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=ALIASES_KEYBOARD)
+                send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
         return "ok"
 
     if text == "✅ Так, змінити":
         if chat_id in pending_alias_action:
             data = pending_alias_action.pop(chat_id)
+            origin = data.get("origin", "menu")
             if data.get("kind") == "update":
                 try:
                     create_or_update_household_alias(data["household_id"], data["alias_text"], data["target_display_name"], data["user_db_id"])
-                    send_message(chat_id, "✅ Змінив.")
-                    send_message(chat_id, format_alias_list(list_household_aliases(data["household_id"])), reply_markup=ALIASES_KEYBOARD)
+                    _reply_after_alias_action(chat_id, data["household_id"], origin, "✅ Змінив.")
                 except Exception:
-                    send_message(chat_id, "Не вдалося змінити назву. Спробуй ще раз трохи пізніше.", reply_markup=ALIASES_KEYBOARD)
+                    send_message(chat_id, "Не вдалося змінити назву. Спробуй ще раз трохи пізніше.", reply_markup=_alias_origin_keyboard(origin))
             else:
-                send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=ALIASES_KEYBOARD)
+                send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
         return "ok"
 
     if text == "✅ Так, прибрати":
@@ -3223,65 +3378,17 @@ def webhook():
             _preview_intercepted = True
 
     elif active_list_context.get(chat_id) == "aliases":
-        try:
-            household_id, user_db_id = get_household_and_user(user_id, display_name)
-            router_result = _ask_gemini_alias_router(text)
-            kind, payload = _validate_alias_router_result(router_result)
-            if kind == "unresolved":
-                lines = ["Не зрозумів частину повідомлення:", ""]
-                lines += [f"• «{f}»" for f in payload]
-                lines.append("")
-                lines.append("Спробуй сформулювати інакше, наприклад: «сливки — це вершки».")
-                send_message(chat_id, "\n".join(lines))
-            elif kind == "list":
-                send_message(chat_id, format_alias_list(list_household_aliases(household_id)))
-            elif kind == "invalid":
-                send_message(chat_id, "Не зміг безпечно зрозуміти правило. Спробуй написати, наприклад: «сливки — це вершки».")
-            elif kind == "create_or_update":
-                alias_text = router_result["alias_text"].strip()
-                target_display_name = router_result["target_display_name"].strip()
-                existing = get_household_alias(household_id, payload)
-                if existing:
-                    pending_alias_action[chat_id] = {
-                        "kind": "update", "household_id": household_id, "user_db_id": user_db_id,
-                        "alias_text": alias_text, "target_display_name": target_display_name,
-                    }
-                    send_message(
-                        chat_id,
-                        _format_alias_update_preview(alias_text, existing["target_display_name"], target_display_name),
-                        reply_markup=ALIAS_UPDATE_CONFIRM_KEYBOARD,
-                    )
-                else:
-                    pending_alias_action[chat_id] = {
-                        "kind": "create", "household_id": household_id, "user_db_id": user_db_id,
-                        "alias_text": alias_text, "target_display_name": target_display_name,
-                    }
-                    send_message(
-                        chat_id,
-                        _format_alias_create_preview(alias_text, target_display_name),
-                        reply_markup=ALIAS_CREATE_CONFIRM_KEYBOARD,
-                    )
-            elif kind == "delete":
-                existing = get_household_alias(household_id, payload)
-                if existing is None:
-                    send_message(chat_id, "Не знайшов такого правила серед домашніх назв.")
-                else:
-                    pending_alias_action[chat_id] = {
-                        "kind": "delete", "household_id": household_id, "user_db_id": user_db_id,
-                        "alias_normalized": payload, "alias_text": existing["alias_text"],
-                        "target_display_name": existing["target_display_name"],
-                    }
-                    send_message(
-                        chat_id,
-                        _format_alias_delete_preview(existing["alias_text"], existing["target_display_name"]),
-                        reply_markup=ALIAS_DELETE_CONFIRM_KEYBOARD,
-                    )
-            # kind == "none": fall through to AI chat
-            if kind != "none":
-                _preview_intercepted = True
-        except Exception:
-            send_message(chat_id, "Не вдалося виконати дію з домашніми назвами. Спробуй ще раз трохи пізніше.")
+        if _handle_alias_command(chat_id, user_id, display_name, text, origin="menu"):
             _preview_intercepted = True
+        # else: intent was "none" — fall through to AI chat, same as every other router here.
+
+    elif not _has_blocking_pending_state(chat_id) and _alias_command_gate(text):
+        # Global alias command gate — narrow, local, no Gemini call here. Fires
+        # from anywhere (main menu, help, open shopping/inventory lists) but
+        # never overrides an active preview/confirm/mode and never touches
+        # saved_list_context.
+        _handle_alias_command(chat_id, user_id, display_name, text, origin="global")
+        _preview_intercepted = True
 
     else:
         ctx = saved_list_context.get(chat_id)
