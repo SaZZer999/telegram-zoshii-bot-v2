@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timezone
 import psycopg
 
@@ -104,6 +105,50 @@ def merge_quantity_values(value_a, unit_a, value_b, unit_b):
     if unit_a not in STRUCTURED_UNITS:
         return None
     return round(value_a + value_b, 2), unit_a
+
+
+# =========================
+# HOUSEHOLD ALIAS RESOLUTION (pure, no DB connection)
+# =========================
+
+ALIAS_TEXT_MAX_LEN = 60
+
+
+def normalize_alias_text(text):
+    """Pure normalization for alias TEXT: both the stored alias_normalized key
+    and the lookup key used to match incoming product names against it.
+    Collapses whitespace, lowercases, strips stray punctuation while keeping
+    meaningful digits/% (e.g. "30%"), enforces ALIAS_TEXT_MAX_LEN, rejects
+    empty input. Returns the normalized string, or None if unusable. Never raises.
+    """
+    if not isinstance(text, str):
+        return None
+    collapsed = re.sub(r"\s+", " ", text.strip())
+    if not collapsed:
+        return None
+    cleaned = re.sub(r"[^\w%\-\s]", "", collapsed.lower(), flags=re.UNICODE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned or len(cleaned) > ALIAS_TEXT_MAX_LEN:
+        return None
+    return cleaned
+
+
+def resolve_item_name(name, alias_map):
+    """THE single shared resolver for product-name resolution, used by both
+    database.py's own chokepoints and bot.py (via import). Resolution order:
+    household alias (highest priority) -> built-in generic synonym via
+    canonicalize_name() -> plain lowercasing. No alias-to-alias chaining: a
+    match returns the alias row's stored target directly, one hop only.
+
+    alias_map: {alias_normalized: {"target_display_name":.., "target_canonical_name":..}},
+    e.g. from get_household_alias_map(). Pass {} or None when there is no
+    household context. Returns (display_name, canonical_name). Never raises.
+    """
+    key = normalize_alias_text(name)
+    if alias_map and key is not None and key in alias_map:
+        entry = alias_map[key]
+        return entry["target_display_name"], entry["target_canonical_name"]
+    return name, canonicalize_name(name)
 
 
 # =========================
@@ -244,6 +289,23 @@ def init_db():
                     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS household_aliases (
+                    id                     SERIAL PRIMARY KEY,
+                    household_id           INTEGER NOT NULL REFERENCES households(id),
+                    alias_text             TEXT NOT NULL,
+                    alias_normalized       TEXT NOT NULL,
+                    target_display_name    TEXT NOT NULL,
+                    target_canonical_name  TEXT NOT NULL,
+                    created_by_user_id     INTEGER REFERENCES users(id),
+                    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_household_aliases_unique
+                ON household_aliases (household_id, alias_normalized)
+            """)
         conn.commit()
     _backfill_structured_quantities()
 
@@ -367,6 +429,116 @@ def get_or_create_user(telegram_user_id, household_id, display_name=None):
             row = cur.fetchone()
         conn.commit()
     return row[0]
+
+# =========================
+# HOUSEHOLD ALIASES
+# =========================
+
+def list_household_aliases(household_id):
+    """All aliases for one household, sorted by alias_normalized. Never
+    visible across households (WHERE household_id=%s)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, alias_text, alias_normalized, target_display_name, target_canonical_name
+                FROM household_aliases
+                WHERE household_id = %s
+                ORDER BY alias_normalized ASC
+                """,
+                (household_id,)
+            )
+            rows = cur.fetchall()
+    return [
+        {"id": r[0], "alias_text": r[1], "alias_normalized": r[2],
+         "target_display_name": r[3], "target_canonical_name": r[4]}
+        for r in rows
+    ]
+
+def get_household_alias(household_id, alias_normalized):
+    """Single read-only lookup by normalized key, scoped to household_id.
+    Returns a dict or None. Used to build the create/update preview text
+    ("було X / стане Y") — never called at confirm time for writing."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, alias_text, alias_normalized, target_display_name, target_canonical_name
+                FROM household_aliases
+                WHERE household_id = %s AND alias_normalized = %s
+                """,
+                (household_id, alias_normalized)
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return {"id": row[0], "alias_text": row[1], "alias_normalized": row[2],
+            "target_display_name": row[3], "target_canonical_name": row[4]}
+
+def get_household_alias_map(household_id):
+    """All aliases for one household as a lookup dict — fetch ONCE per
+    request/batch and reuse across every item, never one query per item:
+    {alias_normalized: {"target_display_name":.., "target_canonical_name":..}}."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT alias_normalized, target_display_name, target_canonical_name "
+                "FROM household_aliases WHERE household_id = %s",
+                (household_id,)
+            )
+            rows = cur.fetchall()
+    return {r[0]: {"target_display_name": r[1], "target_canonical_name": r[2]} for r in rows}
+
+def create_or_update_household_alias(household_id, alias_text, target_display_name, created_by_user_id):
+    """Create or update (upsert on household_id+alias_normalized). Re-derives
+    alias_normalized/target_canonical_name itself and never trusts a caller's
+    pre-check alone (defense in depth) — returns None without ever opening a
+    DB connection if the input is invalid (empty/too-long/no-op alias≈target).
+    On update, created_by_user_id of the ORIGINAL row is preserved (not
+    overwritten). Never touches shopping_items/inventory_items.
+    """
+    alias_normalized = normalize_alias_text(alias_text)
+    target_clean = (target_display_name or "").strip()
+    if alias_normalized is None or not target_clean:
+        return None
+    if alias_normalized == normalize_alias_text(target_display_name):
+        return None
+    target_canonical_name = canonicalize_name(target_display_name)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO household_aliases
+                    (household_id, alias_text, alias_normalized, target_display_name,
+                     target_canonical_name, created_by_user_id, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (household_id, alias_normalized) DO UPDATE
+                    SET target_display_name = EXCLUDED.target_display_name,
+                        target_canonical_name = EXCLUDED.target_canonical_name,
+                        updated_at = NOW()
+                RETURNING id, alias_text, alias_normalized, target_display_name, target_canonical_name
+                """,
+                (household_id, alias_text.strip(), alias_normalized, target_clean,
+                 target_canonical_name, created_by_user_id)
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return {"id": row[0], "alias_text": row[1], "alias_normalized": row[2],
+            "target_display_name": row[3], "target_canonical_name": row[4]}
+
+def delete_household_alias(household_id, alias_normalized):
+    """Delete one household alias by normalized key. Only ever deletes the
+    alias row — never shopping_items/inventory_items. Returns True if a row
+    was deleted, False if none matched (already gone / never existed)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM household_aliases WHERE household_id = %s AND alias_normalized = %s RETURNING id",
+                (household_id, alias_normalized)
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return row is not None
 
 def add_shopping_item(household_id, name, quantity_text, created_by_user_id):
     with get_connection() as conn:
@@ -980,13 +1152,15 @@ def update_shopping_items_batch(household_id, updates):
                 for upd in updates
             ]
             _verify_targets_in_tx(cur, "shopping_items", household_id, targets)
+            alias_map = get_household_alias_map(household_id)
             for upd in updates:
                 sets, params = [], []
                 if upd.get("name") is not None:
+                    resolved_name, canonical_name = resolve_item_name(upd["name"], alias_map)
                     sets.append("name = %s")
-                    params.append(upd["name"])
+                    params.append(resolved_name)
                     sets.append("canonical_name = %s")
-                    params.append(canonicalize_name(upd["name"]))
+                    params.append(canonical_name)
                 qty = upd.get("quantity_text")
                 if qty is not None:
                     value, unit = parse_structured_quantity(qty)
@@ -1034,13 +1208,15 @@ def update_inventory_items_batch(household_id, updates):
                 for upd in updates
             ]
             _verify_targets_in_tx(cur, "inventory_items", household_id, targets)
+            alias_map = get_household_alias_map(household_id)
             for upd in updates:
                 sets, params = [], []
                 if upd.get("name") is not None:
+                    resolved_name, canonical_name = resolve_item_name(upd["name"], alias_map)
                     sets.append("name = %s")
-                    params.append(upd["name"])
+                    params.append(resolved_name)
                     sets.append("canonical_name = %s")
-                    params.append(canonicalize_name(upd["name"]))
+                    params.append(canonical_name)
                 qty = upd.get("quantity_text")
                 if qty is not None:
                     value, unit = parse_structured_quantity(qty)

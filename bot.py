@@ -32,6 +32,11 @@ from database import (
     get_list_context,
     clear_list_context,
     StaleSnapshotError,
+    get_household_alias_map,
+    get_household_alias,
+    list_household_aliases,
+    create_or_update_household_alias,
+    delete_household_alias,
 )
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
@@ -86,6 +91,7 @@ pending_inventory_consumption = {}  # chat_id -> {resolved, household_id, user_d
 pending_compound_inventory = {}  # chat_id -> {inventory_changes, add_to_shopping, household_id, user_db_id}
 pending_inventory_reconciliation = {}  # chat_id -> {updates, additions, deletes, household_id, user_db_id}
 pending_inventory_reconciliation_clarify = {}  # chat_id -> {ambiguous_group, rest, household_id, user_db_id}
+pending_alias_action = {}     # chat_id -> {kind: "create"|"update"|"delete", household_id, user_db_id, alias_text, target_display_name, alias_normalized (delete only)}
 
 _SEEN_UPDATE_IDS_MAXLEN = 1000
 _seen_update_ids = deque(maxlen=_SEEN_UPDATE_IDS_MAXLEN)   # oldest-first, bounded
@@ -163,6 +169,16 @@ COOKING_SYSTEM_PROMPT = (
 DB_ERROR_MSG = "Не вдалося виконати дію зі списком покупок. Спробуйте ще раз трохи пізніше."
 INVENTORY_ERROR_MSG = "Не вдалося виконати дію із запасами. Спробуйте ще раз трохи пізніше."
 SELECTION_ERROR_MSG = "Не зміг точно зрозуміти, які товари ти маєш на увазі. Спробуй написати інакше."
+
+ALIAS_INTRO_TEXT = (
+    "🧠 Домашні назви товарів\n\n"
+    "Тут можна запам'ятати ваші звичні назви продуктів.\n\n"
+    "Приклади:\n"
+    "• Запам'ятай, що сливки = Вершки\n"
+    "• Зміни: сливки = Вершки 30%\n"
+    "• Покажи мої назви\n"
+    "• Забудь, що сливки"
+)
 
 DEFAULT_CATEGORY = "Інше їстівне"
 
@@ -411,13 +427,42 @@ SAVED_LIST_EDIT_PROMPT = (
     "], \"unresolved_fragments\": []}"
 )
 
+ALIAS_ROUTER_PROMPT = (
+    "Ти помічник для керування домашніми назвами товарів (aliases) — персональними правилами "
+    "«моя назва → цільова назва товару» для одного домашнього господарства.\n"
+    "Визнач намір (intent):\n"
+    "- «create_or_update» — користувач хоче запам'ятати або змінити правило "
+    "(напр. «Запам'ятай, що сливки = Вершки», «Зміни: сливки = Вершки 30%», «сливки — це вершки»)\n"
+    "- «delete» — користувач хоче видалити правило (напр. «Забудь, що сливки», «Видали назву сливки»)\n"
+    "- «list» — користувач хоче побачити список збережених назв (напр. «Покажи мої назви», «Який список назв?»)\n"
+    "- «none» — повідомлення не стосується керування назвами товарів\n\n"
+    "Для create_or_update і delete поверни:\n"
+    "- alias_text — назва, яку вводить користувач (наприклад «сливки»)\n"
+    "- target_display_name — цільова назва товару, на яку замінюється alias_text "
+    "(лише для create_or_update; для delete залиш null)\n\n"
+    "Це ПРОСТО правило заміни назви. Ніколи не вигадуй і не змінюй кількість чи одиницю виміру товару — "
+    "alias_text і target_display_name це лише текстові назви, без чисел кількості.\n"
+    "Якщо ти не можеш однозначно визначити alias_text або target_display_name — не вгадуй. Додай незрозумілий "
+    "фрагмент тексту в unresolved_fragments (масив рядків) і залиш alias_text/target_display_name null.\n"
+    "Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON:\n"
+    "{\"intent\": \"create_or_update\", \"alias_text\": \"сливки\", \"target_display_name\": \"Вершки\", "
+    "\"unresolved_fragments\": []}\n"
+    "Приклад delete:\n"
+    "{\"intent\": \"delete\", \"alias_text\": \"сливки\", \"target_display_name\": null, \"unresolved_fragments\": []}\n"
+    "Приклад list:\n"
+    "{\"intent\": \"list\", \"alias_text\": null, \"target_display_name\": null, \"unresolved_fragments\": []}\n"
+    "Приклад none:\n"
+    "{\"intent\": \"none\", \"alias_text\": null, \"target_display_name\": null, \"unresolved_fragments\": []}"
+)
+
 # =========================
 # KEYBOARDS
 # =========================
 MAIN_KEYBOARD = {
     "keyboard": [
         ["🛒 Покупки", "🧊 Запаси"],
-        ["🍽️ Що приготувати", "ℹ️ Допомога"]
+        ["🍽️ Що приготувати", "ℹ️ Допомога"],
+        ["🧠 Назви товарів"]
     ],
     "resize_keyboard": True,
     "is_persistent": True
@@ -531,6 +576,42 @@ RECONCILIATION_PREVIEW_KEYBOARD = {
     "one_time_keyboard": True,
 }
 
+ALIASES_KEYBOARD = {
+    "keyboard": [
+        ["📋 Показати назви"],
+        ["⬅️ Головне меню"],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+ALIAS_CREATE_CONFIRM_KEYBOARD = {
+    "keyboard": [
+        ["✅ Так, запам'ятати"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+ALIAS_UPDATE_CONFIRM_KEYBOARD = {
+    "keyboard": [
+        ["✅ Так, змінити"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+ALIAS_DELETE_CONFIRM_KEYBOARD = {
+    "keyboard": [
+        ["✅ Так, видалити"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
 # =========================
 # FLASK APP
 # =========================
@@ -613,6 +694,28 @@ def format_inventory_list(items):
         return "Запаси поки порожні."
     return format_grouped_list(items, "🧊 Запаси:")
 
+def format_alias_list(aliases):
+    if not aliases:
+        return "Домашніх назв поки немає."
+    lines = ["🧠 Домашні назви товарів:", ""]
+    lines += [f"{i}. {a['alias_text']} → {a['target_display_name']}" for i, a in enumerate(aliases, start=1)]
+    return "\n".join(lines)
+
+def _format_alias_create_preview(alias_text, target_display_name):
+    return (f"🧠 Запам'ятати домашню назву?\n\n"
+            f"«{alias_text}» → «{target_display_name}»\n\n"
+            f"✅ Так, запам'ятати\n❌ Скасувати")
+
+def _format_alias_update_preview(alias_text, old_target, new_target):
+    return (f"🧠 Змінити домашню назву?\n\n"
+            f"«{alias_text}»\nбуло → «{old_target}»\nстане → «{new_target}»\n\n"
+            f"✅ Так, змінити\n❌ Скасувати")
+
+def _format_alias_delete_preview(alias_text, target_display_name):
+    return (f"🧠 Видалити домашню назву?\n\n"
+            f"«{alias_text}» → «{target_display_name}»\n\n"
+            f"✅ Так, видалити\n❌ Скасувати")
+
 def format_inventory_preview(items, ignored_items=None):
     header = f"🧊 Знайшов продуктів: {len(items)}"
     text = format_grouped_list(items, header)
@@ -634,6 +737,7 @@ def clear_shopping_state(chat_id):
     saved_list_context.pop(chat_id, None)
     pending_saved_edit.pop(chat_id, None)
     pending_quick_purchase.pop(chat_id, None)
+    pending_alias_action.pop(chat_id, None)
 
 def clear_inventory_state(chat_id):
     inventory_mode.pop(chat_id, None)
@@ -647,6 +751,10 @@ def clear_inventory_state(chat_id):
     pending_compound_inventory.pop(chat_id, None)
     pending_inventory_reconciliation.pop(chat_id, None)
     pending_inventory_reconciliation_clarify.pop(chat_id, None)
+    pending_alias_action.pop(chat_id, None)
+
+def clear_alias_state(chat_id):
+    pending_alias_action.pop(chat_id, None)
 
 # =========================
 # QUANTITY HELPERS (local)
@@ -690,6 +798,40 @@ def canonicalize_name(name):
     return _NAME_SYNONYMS.get(base, base)
 
 
+# Self-contained mirror of database.py's alias-resolution logic. Duplicated on
+# purpose, same reasoning as the structured-quantity helpers above: these are
+# pure functions with no DB access, and bot.py's own copy is what every
+# pending-preview/RAM code path (and the wider test suite, which mocks the
+# `database` module in ways this file must not depend on) actually exercises.
+ALIAS_TEXT_MAX_LEN = 60
+
+
+def normalize_alias_text(text):
+    """Pure normalization for alias TEXT — see database.py's identical copy
+    for the authoritative docstring. Must stay in sync in behavior."""
+    if not isinstance(text, str):
+        return None
+    collapsed = re.sub(r"\s+", " ", text.strip())
+    if not collapsed:
+        return None
+    cleaned = re.sub(r"[^\w%\-\s]", "", collapsed.lower(), flags=re.UNICODE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned or len(cleaned) > ALIAS_TEXT_MAX_LEN:
+        return None
+    return cleaned
+
+
+def resolve_item_name(name, alias_map):
+    """THE shared resolver (bot.py-local mirror of database.py's copy): household
+    alias (highest priority) -> built-in generic synonym via canonicalize_name()
+    -> plain lowercasing. Returns (display_name, canonical_name). Never raises."""
+    key = normalize_alias_text(name)
+    if alias_map and key is not None and key in alias_map:
+        entry = alias_map[key]
+        return entry["target_display_name"], entry["target_canonical_name"]
+    return name, canonicalize_name(name)
+
+
 def _parse_structured_quantity(quantity_text):
     """Parse an unambiguous 'value unit' or bare-number quantity_text.
 
@@ -727,15 +869,18 @@ def format_quantity_display(value, unit):
     return f"{value_str} {unit}" if unit else value_str
 
 
-def normalize_item_quantity(name, quantity_text, quantity_value=None, quantity_unit=None, allow_default_unit=False):
-    """Compute canonical_name/quantity_value/quantity_unit/quantity_inferred/quantity_text for an item.
+def normalize_item_quantity(name, quantity_text, quantity_value=None, quantity_unit=None, allow_default_unit=False, alias_map=None):
+    """Compute name/canonical_name/quantity_value/quantity_unit/quantity_inferred/quantity_text for an item.
 
     If quantity_value+quantity_unit are already known, they're used as-is.
     Otherwise quantity_text is parsed locally when unambiguous. allow_default_unit=True
     applies the "1 шт." default only when quantity_text is genuinely blank (new
     items straight out of AI parsing) — never for edits or legacy-data backfill.
+    alias_map (household alias lookup, fetched once per request) takes priority
+    over the built-in generic synonym when resolving the display/canonical name;
+    it never affects quantity parsing, which is computed independently below.
     """
-    canonical_name = canonicalize_name(name)
+    resolved_name, canonical_name = resolve_item_name(name, alias_map or {})
     inferred = False
     if quantity_value is not None and quantity_unit is not None:
         value, unit = quantity_value, quantity_unit
@@ -745,6 +890,7 @@ def normalize_item_quantity(name, quantity_text, quantity_value=None, quantity_u
             value, unit, inferred = 1.0, "шт.", True
     display = format_quantity_display(value, unit) if value is not None else (quantity_text or "").strip()
     return {
+        "name": resolved_name,
         "canonical_name": canonical_name,
         "quantity_value": value,
         "quantity_unit": unit,
@@ -1027,7 +1173,7 @@ def _validate_preview_updates(updates, items):
     return valid
 
 
-def _apply_preview_updates(items, valid_updates):
+def _apply_preview_updates(items, valid_updates, alias_map=None):
     """Apply validated updates to items list. Returns new list without mutating originals."""
     result = [dict(item) for item in items]
     for upd in valid_updates:
@@ -1041,7 +1187,7 @@ def _apply_preview_updates(items, valid_updates):
         if upd.get("category") is not None:
             result[idx]["category"] = upd["category"]
         if name_changed or qty_changed:
-            normalized = normalize_item_quantity(result[idx]["name"], result[idx].get("quantity_text") or "")
+            normalized = normalize_item_quantity(result[idx]["name"], result[idx].get("quantity_text") or "", alias_map=alias_map)
             result[idx].update(normalized)
     return result
 
@@ -1139,6 +1285,48 @@ def _compute_saved_merge_groups(merge_groups_raw, items):
             "items": group_items,
         })
     return validated
+
+
+def _validate_alias_action(alias_text, target_display_name):
+    """Pure validation for create_or_update: rejects empty/too-long alias_text
+    and the alias≈target no-op case. Returns alias_normalized on success, or
+    None. Does not compute target_canonical_name — database.py's
+    create_or_update_household_alias re-derives that independently and never
+    trusts this pre-check alone."""
+    if not isinstance(target_display_name, str) or not target_display_name.strip():
+        return None
+    alias_normalized = normalize_alias_text(alias_text)
+    if alias_normalized is None:
+        return None
+    if alias_normalized == normalize_alias_text(target_display_name):
+        return None
+    return alias_normalized
+
+
+def _validate_alias_router_result(router_result):
+    """Pure decision logic for the alias router's JSON. Returns one of:
+      ("unresolved", [fragment,...])   -- blocks any change regardless of intent
+      ("list", None)
+      ("create_or_update", alias_normalized)
+      ("delete", alias_normalized)
+      ("invalid", None)                -- create_or_update/delete with unusable text
+      ("none", None)
+    """
+    fragments = router_result.get("unresolved_fragments")
+    if isinstance(fragments, list):
+        cleaned = [str(f).strip() for f in fragments if str(f).strip()]
+        if cleaned:
+            return "unresolved", cleaned
+    intent = router_result.get("intent")
+    if intent == "list":
+        return "list", None
+    if intent == "create_or_update":
+        alias_normalized = _validate_alias_action(router_result.get("alias_text"), router_result.get("target_display_name"))
+        return ("create_or_update", alias_normalized) if alias_normalized else ("invalid", None)
+    if intent == "delete":
+        alias_normalized = normalize_alias_text(router_result.get("alias_text"))
+        return ("delete", alias_normalized) if alias_normalized else ("invalid", None)
+    return "none", None
 
 
 def _validate_saved_updates(updates, items):
@@ -1309,7 +1497,7 @@ def _format_consumption_preview(resolved):
 _COMPOUND_OP_TYPES = {"remove_inventory", "consume_inventory_quantity", "add_to_shopping"}
 
 
-def _validate_compound_operations(operations, unresolved_fragments, items):
+def _validate_compound_operations(operations, unresolved_fragments, items, alias_map=None):
     """Validate a compound_inventory_operations router result against current inventory items.
 
     Returns one of:
@@ -1425,7 +1613,8 @@ def _validate_compound_operations(operations, unresolved_fragments, items):
         ):
             qty_value, qty_unit = None, None
         normalized = normalize_item_quantity(
-            name, "", quantity_value=qty_value, quantity_unit=qty_unit, allow_default_unit=(qty_value is None)
+            name, "", quantity_value=qty_value, quantity_unit=qty_unit, allow_default_unit=(qty_value is None),
+            alias_map=alias_map,
         )
         shopping_item = {"name": name, "category": cat, "was_corrected": False}
         shopping_item.update(normalized)
@@ -1521,7 +1710,7 @@ def _sum_same_group_reconcile_items(group_items):
     return merged
 
 
-def _validate_reconcile_snapshot(raw_items, unresolved_fragments, list_items):
+def _validate_reconcile_snapshot(raw_items, unresolved_fragments, list_items, alias_map=None):
     """Validate/diff a reconcile_inventory_snapshot router result against the
     current full inventory (list_items). Pure — no DB access, no side effects.
 
@@ -1563,9 +1752,10 @@ def _validate_reconcile_snapshot(raw_items, unresolved_fragments, list_items):
         cat = raw.get("category")
         if not isinstance(cat, str) or cat not in VALID_CATEGORIES:
             cat = DEFAULT_CATEGORY
+        resolved_name, canonical_name = resolve_item_name(name.strip(), alias_map or {})
         cleaned.append({
-            "name": name.strip(),
-            "canonical_name": raw.get("canonical_name") or canonicalize_name(name),
+            "name": resolved_name,
+            "canonical_name": canonical_name,
             "category": cat,
             "quantity_value": qty_value,
             "quantity_unit": qty_unit,
@@ -1733,7 +1923,7 @@ def _format_reconciliation_unit_clarify_question(ambiguous_group):
     return "\n".join(lines)
 
 
-def _validate_quick_add_items(raw_items):
+def _validate_quick_add_items(raw_items, alias_map=None):
     """Validate Gemini quick_add_to_inventory items for an empty shopping list.
 
     Drops non-consumable entries (returned separately as ignored names),
@@ -1769,7 +1959,8 @@ def _validate_quick_add_items(raw_items):
         ):
             qty_value, qty_unit = None, None
         normalized = normalize_item_quantity(
-            name, "", quantity_value=qty_value, quantity_unit=qty_unit, allow_default_unit=(qty_value is None)
+            name, "", quantity_value=qty_value, quantity_unit=qty_unit, allow_default_unit=(qty_value is None),
+            alias_map=alias_map,
         )
         item = {"name": name, "category": cat, "was_corrected": False}
         item.update(normalized)
@@ -1832,6 +2023,32 @@ def _ask_gemini_saved_list_router(user_text, items, context_type):
         }
     except (json.JSONDecodeError, ValueError, TypeError):
         return dict(_SAVED_LIST_ROUTER_FALLBACK)
+
+
+_ALIAS_ROUTER_FALLBACK = {"intent": "none", "alias_text": None, "target_display_name": None, "unresolved_fragments": []}
+
+
+def _ask_gemini_alias_router(user_text):
+    """ONE Gemini call per message in aliases mode. Gemini never touches SQL —
+    it only classifies intent and extracts alias_text/target_display_name."""
+    raw = call_gemini([{"role": "user", "content": f"Користувач написав: {user_text}"}], ALIAS_ROUTER_PROMPT, temperature=0.1)
+    if not raw:
+        return dict(_ALIAS_ROUTER_FALLBACK)
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
+        if m:
+            cleaned = m.group(1).strip()
+    try:
+        data = json.loads(cleaned)
+        return {
+            "intent": data.get("intent", "none"),
+            "alias_text": data.get("alias_text"),
+            "target_display_name": data.get("target_display_name"),
+            "unresolved_fragments": data.get("unresolved_fragments") if isinstance(data.get("unresolved_fragments"), list) else [],
+        }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return dict(_ALIAS_ROUTER_FALLBACK)
 
 
 def _format_saved_edit_preview(items_snapshot, validated_updates, context_type):
@@ -1947,6 +2164,7 @@ def _should_restore_persisted_context(chat_id):
             pending_saved_edit, pending_quick_purchase, pending_merge,
             pending_inventory_consumption, pending_compound_inventory,
             pending_inventory_reconciliation, pending_inventory_reconciliation_clarify,
+            pending_alias_action,
         )
     )
 
@@ -2007,7 +2225,7 @@ def _show_remove_preview(chat_id, items, household_id, user_db_id):
     preview = format_grouped_list(items, f"🧊 Буде прибрано із запасів: {len(items)}")
     send_message(chat_id, preview, reply_markup=REMOVE_PREVIEW_KEYBOARD)
 
-def parse_shopping_list_with_gemini(text):
+def parse_shopping_list_with_gemini(text, alias_map=None):
     history = [{"role": "user", "content": text}]
     raw = call_gemini(history, SHOPPING_PARSE_PROMPT, temperature=0.1)
     if not raw:
@@ -2036,7 +2254,7 @@ def parse_shopping_list_with_gemini(text):
             cat = item.get("category", "").strip()
             if cat not in VALID_CATEGORIES:
                 cat = DEFAULT_CATEGORY
-            normalized = normalize_item_quantity(name, item.get("quantity_text", "").strip(), allow_default_unit=True)
+            normalized = normalize_item_quantity(name, item.get("quantity_text", "").strip(), allow_default_unit=True, alias_map=alias_map)
             entry = {
                 "name": name,
                 "category": cat,
@@ -2219,6 +2437,9 @@ def webhook():
         elif chat_id in pending_quick_purchase:
             pending_quick_purchase.pop(chat_id, None)
             send_message(chat_id, "Дію скасовано.", reply_markup=SHOPPING_KEYBOARD)
+        elif chat_id in pending_alias_action:
+            pending_alias_action.pop(chat_id, None)
+            send_message(chat_id, "Дію скасовано.", reply_markup=ALIASES_KEYBOARD)
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -2283,6 +2504,45 @@ def webhook():
                 send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=SHOPPING_KEYBOARD)
             except Exception:
                 send_message(chat_id, DB_ERROR_MSG)
+        elif chat_id in pending_alias_action:
+            data = pending_alias_action.pop(chat_id)
+            if data.get("kind") == "delete":
+                try:
+                    delete_household_alias(data["household_id"], data["alias_normalized"])
+                    send_message(chat_id, "✅ Видалив.")
+                    send_message(chat_id, format_alias_list(list_household_aliases(data["household_id"])), reply_markup=ALIASES_KEYBOARD)
+                except Exception:
+                    send_message(chat_id, "Не вдалося видалити назву. Спробуй ще раз трохи пізніше.", reply_markup=ALIASES_KEYBOARD)
+            else:
+                send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=ALIASES_KEYBOARD)
+        return "ok"
+
+    if text == "✅ Так, запам'ятати":
+        if chat_id in pending_alias_action:
+            data = pending_alias_action.pop(chat_id)
+            if data.get("kind") == "create":
+                try:
+                    create_or_update_household_alias(data["household_id"], data["alias_text"], data["target_display_name"], data["user_db_id"])
+                    send_message(chat_id, "✅ Запам'ятав.")
+                    send_message(chat_id, format_alias_list(list_household_aliases(data["household_id"])), reply_markup=ALIASES_KEYBOARD)
+                except Exception:
+                    send_message(chat_id, "Не вдалося зберегти назву. Спробуй ще раз трохи пізніше.", reply_markup=ALIASES_KEYBOARD)
+            else:
+                send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=ALIASES_KEYBOARD)
+        return "ok"
+
+    if text == "✅ Так, змінити":
+        if chat_id in pending_alias_action:
+            data = pending_alias_action.pop(chat_id)
+            if data.get("kind") == "update":
+                try:
+                    create_or_update_household_alias(data["household_id"], data["alias_text"], data["target_display_name"], data["user_db_id"])
+                    send_message(chat_id, "✅ Змінив.")
+                    send_message(chat_id, format_alias_list(list_household_aliases(data["household_id"])), reply_markup=ALIASES_KEYBOARD)
+                except Exception:
+                    send_message(chat_id, "Не вдалося змінити назву. Спробуй ще раз трохи пізніше.", reply_markup=ALIASES_KEYBOARD)
+            else:
+                send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=ALIASES_KEYBOARD)
         return "ok"
 
     if text == "✅ Так, прибрати":
@@ -2583,6 +2843,26 @@ def webhook():
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
+    if text == "🧠 Назви товарів":
+        waiting_for_ingredients.pop(chat_id, None)
+        active_list_context[chat_id] = "aliases"
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        clear_alias_state(chat_id)
+        send_message(chat_id, ALIAS_INTRO_TEXT, reply_markup=ALIASES_KEYBOARD)
+        return "ok"
+
+    if text == "📋 Показати назви":
+        active_list_context[chat_id] = "aliases"
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        try:
+            household_id, _ = get_household_and_user(user_id, display_name)
+            send_message(chat_id, format_alias_list(list_household_aliases(household_id)), reply_markup=ALIASES_KEYBOARD)
+        except Exception:
+            send_message(chat_id, "Не вдалося показати домашні назви. Спробуй ще раз трохи пізніше.", reply_markup=ALIASES_KEYBOARD)
+        return "ok"
+
     if text == "🧊 Запаси":
         waiting_for_ingredients.pop(chat_id, None)
         active_list_context[chat_id] = "inventory"
@@ -2661,7 +2941,14 @@ def webhook():
     mode = shopping_mode.pop(chat_id, None)
 
     if mode == "adding":
-        result = parse_shopping_list_with_gemini(text)
+        try:
+            household_id, user_db_id = get_household_and_user(user_id, display_name)
+            alias_map = get_household_alias_map(household_id)
+        except Exception:
+            shopping_mode[chat_id] = "adding"
+            send_message(chat_id, DB_ERROR_MSG)
+            return "ok"
+        result = parse_shopping_list_with_gemini(text, alias_map=alias_map)
         if result is None:
             shopping_mode[chat_id] = "adding"
             send_message(
@@ -2680,7 +2967,6 @@ def webhook():
             return "ok"
         items = _auto_merge_in_place(items)
         try:
-            household_id, user_db_id = get_household_and_user(user_id, display_name)
             pending_batch[chat_id] = {
                 "items": items,
                 "ignored_items": result["ignored_items"],
@@ -2721,7 +3007,11 @@ def webhook():
         name, quantity_text = parse_item_text(text)
         batch["items"][idx]["name"] = name
         batch["items"][idx]["was_corrected"] = False
-        normalized = normalize_item_quantity(name, quantity_text or "", allow_default_unit=True)
+        try:
+            alias_map = get_household_alias_map(batch["household_id"])
+        except Exception:
+            alias_map = {}
+        normalized = normalize_item_quantity(name, quantity_text or "", allow_default_unit=True, alias_map=alias_map)
         batch["items"][idx].update(normalized)
         preview = format_batch_preview(batch["items"], batch.get("ignored_items"))
         send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
@@ -2767,7 +3057,14 @@ def webhook():
     inv_mode = inventory_mode.pop(chat_id, None)
 
     if inv_mode == "adding":
-        result = parse_shopping_list_with_gemini(text)
+        try:
+            household_id, user_db_id = get_household_and_user(user_id, display_name)
+            alias_map = get_household_alias_map(household_id)
+        except Exception:
+            inventory_mode[chat_id] = "adding"
+            send_message(chat_id, INVENTORY_ERROR_MSG)
+            return "ok"
+        result = parse_shopping_list_with_gemini(text, alias_map=alias_map)
         if result is None:
             inventory_mode[chat_id] = "adding"
             send_message(
@@ -2786,7 +3083,6 @@ def webhook():
             return "ok"
         items = _auto_merge_in_place(items)
         try:
-            household_id, user_db_id = get_household_and_user(user_id, display_name)
             pending_inventory_batch[chat_id] = {
                 "items": items,
                 "ignored_items": result["ignored_items"],
@@ -2834,7 +3130,8 @@ def webhook():
             if intent == "edit_preview":
                 valid_updates = _validate_preview_updates(router_result["updates"], batch["items"])
                 if valid_updates:
-                    batch["items"] = _apply_preview_updates(batch["items"], valid_updates)
+                    alias_map = get_household_alias_map(batch["household_id"])
+                    batch["items"] = _apply_preview_updates(batch["items"], valid_updates, alias_map=alias_map)
                     preview = format_batch_preview(batch["items"], batch.get("ignored_items"))
                     send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
                 else:
@@ -2862,7 +3159,8 @@ def webhook():
             if intent == "edit_preview":
                 valid_updates = _validate_preview_updates(router_result["updates"], batch["items"])
                 if valid_updates:
-                    batch["items"] = _apply_preview_updates(batch["items"], valid_updates)
+                    alias_map = get_household_alias_map(batch["household_id"])
+                    batch["items"] = _apply_preview_updates(batch["items"], valid_updates, alias_map=alias_map)
                     preview = format_inventory_preview(batch["items"], batch.get("ignored_items"))
                     send_message(chat_id, preview, reply_markup=ADD_INVENTORY_PREVIEW_KEYBOARD)
                 else:
@@ -2905,7 +3203,8 @@ def webhook():
                     }
                     send_message(chat_id, _format_reconciliation_unit_clarify_question(next_ambiguous))
                 else:
-                    kind2, payload2 = _validate_reconcile_snapshot(combined, [], list_items)
+                    alias_map = get_household_alias_map(household_id)
+                    kind2, payload2 = _validate_reconcile_snapshot(combined, [], list_items, alias_map=alias_map)
                     if kind2 == "ok":
                         pending_inventory_reconciliation[chat_id] = {
                             "updates": payload2["updates"], "additions": payload2["additions"],
@@ -2921,6 +3220,67 @@ def webhook():
                         )
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
+            _preview_intercepted = True
+
+    elif active_list_context.get(chat_id) == "aliases":
+        try:
+            household_id, user_db_id = get_household_and_user(user_id, display_name)
+            router_result = _ask_gemini_alias_router(text)
+            kind, payload = _validate_alias_router_result(router_result)
+            if kind == "unresolved":
+                lines = ["Не зрозумів частину повідомлення:", ""]
+                lines += [f"• «{f}»" for f in payload]
+                lines.append("")
+                lines.append("Спробуй сформулювати інакше, наприклад: «сливки — це вершки».")
+                send_message(chat_id, "\n".join(lines))
+            elif kind == "list":
+                send_message(chat_id, format_alias_list(list_household_aliases(household_id)))
+            elif kind == "invalid":
+                send_message(chat_id, "Не зміг безпечно зрозуміти правило. Спробуй написати, наприклад: «сливки — це вершки».")
+            elif kind == "create_or_update":
+                alias_text = router_result["alias_text"].strip()
+                target_display_name = router_result["target_display_name"].strip()
+                existing = get_household_alias(household_id, payload)
+                if existing:
+                    pending_alias_action[chat_id] = {
+                        "kind": "update", "household_id": household_id, "user_db_id": user_db_id,
+                        "alias_text": alias_text, "target_display_name": target_display_name,
+                    }
+                    send_message(
+                        chat_id,
+                        _format_alias_update_preview(alias_text, existing["target_display_name"], target_display_name),
+                        reply_markup=ALIAS_UPDATE_CONFIRM_KEYBOARD,
+                    )
+                else:
+                    pending_alias_action[chat_id] = {
+                        "kind": "create", "household_id": household_id, "user_db_id": user_db_id,
+                        "alias_text": alias_text, "target_display_name": target_display_name,
+                    }
+                    send_message(
+                        chat_id,
+                        _format_alias_create_preview(alias_text, target_display_name),
+                        reply_markup=ALIAS_CREATE_CONFIRM_KEYBOARD,
+                    )
+            elif kind == "delete":
+                existing = get_household_alias(household_id, payload)
+                if existing is None:
+                    send_message(chat_id, "Не знайшов такого правила серед домашніх назв.")
+                else:
+                    pending_alias_action[chat_id] = {
+                        "kind": "delete", "household_id": household_id, "user_db_id": user_db_id,
+                        "alias_normalized": payload, "alias_text": existing["alias_text"],
+                        "target_display_name": existing["target_display_name"],
+                    }
+                    send_message(
+                        chat_id,
+                        _format_alias_delete_preview(existing["alias_text"], existing["target_display_name"]),
+                        reply_markup=ALIAS_DELETE_CONFIRM_KEYBOARD,
+                    )
+            # kind == "none": fall through to AI chat
+            if kind != "none":
+                _preview_intercepted = True
+        except Exception:
+            send_message(chat_id, "Не вдалося виконати дію з домашніми назвами. Спробуй ще раз трохи пізніше.")
             _preview_intercepted = True
 
     else:
@@ -2939,6 +3299,7 @@ def webhook():
         if ctx in ("shopping_saved", "inventory_saved"):
             try:
                 household_id, user_db_id = get_household_and_user(user_id, display_name)
+                alias_map = get_household_alias_map(household_id)
                 list_items = (
                     get_active_shopping_items(household_id)
                     if ctx == "shopping_saved"
@@ -3021,7 +3382,8 @@ def webhook():
                         _preview_intercepted = True
                     elif intent == "compound_inventory_operations" and ctx == "inventory_saved":
                         kind, payload = _validate_compound_operations(
-                            router_result.get("operations"), router_result.get("unresolved_fragments"), list_items
+                            router_result.get("operations"), router_result.get("unresolved_fragments"), list_items,
+                            alias_map=alias_map,
                         )
                         if kind == "ok":
                             pending_compound_inventory[chat_id] = {
@@ -3056,7 +3418,8 @@ def webhook():
                         _preview_intercepted = True
                     elif intent == "reconcile_inventory_snapshot" and ctx == "inventory_saved":
                         kind, payload = _validate_reconcile_snapshot(
-                            router_result.get("items"), router_result.get("unresolved_fragments"), list_items
+                            router_result.get("items"), router_result.get("unresolved_fragments"), list_items,
+                            alias_map=alias_map,
                         )
                         if kind == "ok":
                             pending_inventory_reconciliation[chat_id] = {
@@ -3102,7 +3465,7 @@ def webhook():
                 elif ctx == "shopping_saved":
                     router_result = _ask_gemini_saved_list_router(text, [], ctx)
                     if router_result["intent"] == "quick_add_to_inventory":
-                        parsed = _validate_quick_add_items(router_result.get("items"))
+                        parsed = _validate_quick_add_items(router_result.get("items"), alias_map=alias_map)
                         if parsed is not None:
                             quick_items, ignored_names = parsed
                             saved_list_context.pop(chat_id, None)
