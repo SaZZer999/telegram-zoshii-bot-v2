@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from collections import deque
 from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -22,6 +23,7 @@ from database import (
     delete_inventory_items_batch,
     apply_inventory_consumption,
     apply_compound_inventory_operations,
+    apply_inventory_reconciliation,
     execute_merge_shopping,
     execute_merge_inventory,
     update_shopping_items_batch,
@@ -79,6 +81,33 @@ pending_saved_edit = {}       # chat_id -> {items_snapshot, validated_updates, h
 pending_quick_purchase = {}   # chat_id -> {items, ignored_items, household_id, user_db_id}
 pending_inventory_consumption = {}  # chat_id -> {resolved, household_id, user_db_id}
 pending_compound_inventory = {}  # chat_id -> {inventory_changes, add_to_shopping, household_id, user_db_id}
+pending_inventory_reconciliation = {}  # chat_id -> {updates, additions, deletes, household_id, user_db_id}
+pending_inventory_reconciliation_clarify = {}  # chat_id -> {ambiguous_group, rest, household_id, user_db_id}
+
+_SEEN_UPDATE_IDS_MAXLEN = 1000
+_seen_update_ids = deque(maxlen=_SEEN_UPDATE_IDS_MAXLEN)   # oldest-first, bounded
+_seen_update_ids_set = set()                               # O(1) membership
+
+
+def _is_duplicate_update(update_id):
+    """Test-and-set idempotency guard for Telegram update_id.
+
+    Returns True if this update_id was already seen (caller should short-circuit
+    without re-processing or re-sending anything). Returns False and records the
+    id for a new update_id. Process-local, in-memory, bounded to the most recent
+    _SEEN_UPDATE_IDS_MAXLEN ids (oldest evicted first).
+    """
+    if update_id is None:
+        return False
+    if update_id in _seen_update_ids_set:
+        return True
+    if len(_seen_update_ids) >= _seen_update_ids.maxlen:
+        oldest = _seen_update_ids.popleft()
+        _seen_update_ids_set.discard(oldest)
+    _seen_update_ids.append(update_id)
+    _seen_update_ids_set.add(update_id)
+    return False
+
 
 SYSTEM_PROMPT = (
     "Ти корисний AI-помічник. Відповідай українською.\n"
@@ -88,7 +117,10 @@ SYSTEM_PROMPT = (
     "Якщо запитують поточну дату або час — використовуй надану нижче актуальну дату й час Europe/Warsaw "
     "як єдине надійне джерело.\n"
     "Якщо запитують погоду чи інші актуальні зовнішні дані — чесно відповідай: "
-    "«У цій версії бота я не маю доступу до актуального прогнозу чи інтернет-пошуку, тому не хочу вигадувати дані.»"
+    "«У цій версії бота я не маю доступу до актуального прогнозу чи інтернет-пошуку, тому не хочу вигадувати дані.»\n"
+    "Ніколи не пиши «Я зафіксував», «Я зберіг» або «Я оновив запаси», якщо в цьому чаті реально не відбулася "
+    "підтверджена операція над базою даних. Не вигадуй зміни в PostgreSQL, обсяги упаковок, перерахунки "
+    "одиниць виміру чи суми між несумісними одиницями — якщо не впевнений, чесно скажи, що не можеш це визначити."
 )
 
 _UA_WEEKDAYS = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
@@ -244,13 +276,21 @@ SAVED_LIST_EDIT_PROMPT = (
     "- «consume_inventory_quantity» — лише для контексту inventory_saved, якщо користувач повідомляє, "
     "що частково використав, з'їв, випив або витратив ЧАСТИНУ кількості товару, а не забрав/викинув/прибрав "
     "його повністю (напр. «Я з'їв 4 сосиски», «Використав одну приправу», «Випили 500 мл молока», "
-    "«Витратив 200 г сиру»). Ніколи не використовуй цей намір для shopping_saved. Якщо користувач хоче "
+    "«Витратив 200 г сиру», «Використав пів приправи до курки», «Випив пів літра молока», "
+    "«З'їв половину пачки печива»). Ніколи не використовуй цей намір для shopping_saved. Якщо користувач хоче "
     "прибрати товар повністю («видали», «викинь», «прибери все, крім X») — це start_action з remove_inventory\n"
     "- «compound_inventory_operations» — лише для контексту inventory_saved, коли одне повідомлення "
     "поєднує КІЛЬКА РІЗНИХ дій одразу: часткове списання одних позицій, повне прибирання інших і/або "
     "додавання товару до списку покупок (напр. «Вершки зіпсувались, і я з'їв 4 сосиски, плюс додай молоко "
     "до покупок»). Використовуй цей намір лише коли повідомлення НЕ можна повністю описати одним із "
     "намірів вище. Ніколи не використовуй для shopping_saved\n"
+    "- «reconcile_inventory_snapshot» — лише для контексту inventory_saved, коли користувач явно каже, "
+    "що надсилає ПОВНИЙ актуальний список запасів замість поточного (напр. «Мої запаси виглядають зараз так», "
+    "«Онови запаси за цим списком», «Звір мої запаси з цим списком», «Ось повний актуальний список запасів»), "
+    "і після цієї фрази йде структурований перелік товарів. НІКОЛИ не використовуй цей намір для звичайної "
+    "згадки продукту («Я люблю молоко»), питання («Що можна приготувати з сосисками?») чи одноразової покупки "
+    "(«Сьогодні купив хліб.») — для цього є quick_add_to_inventory або none. Ніколи не використовуй для "
+    "shopping_saved\n"
     "- «quick_add_to_inventory» — лише коли список порожній (позицій немає взагалі) і користувач "
     "повідомляє про продукти, які вже приніс/купив додому (напр. «Купив молоко і хліб», «Взяли сир»), "
     "навіть у минулому часі. Не використовуй цей намір, якщо є хоч одна позиція в списку, або текст — "
@@ -296,6 +336,17 @@ SAVED_LIST_EDIT_PROMPT = (
     "Для quick_add_to_inventory не вигадуй кількість: якщо явно не вказано число й одиницю — став "
     "quantity_value=1, quantity_unit=«шт.», quantity_inferred=true. «Молоко 2 л» → quantity_value=2, "
     "quantity_unit=«л», quantity_inferred=false.\n\n"
+    "Для reconcile_inventory_snapshot — поверни items: масив УСІХ товарів із надісланого повного списку "
+    "запасів, кожен з полями:\n"
+    "- name — назва товару\n"
+    "- canonical_name — назва в нижньому регістрі\n"
+    "- quantity_value — число або null, якщо кількість не вказана явно для цієї позиції\n"
+    "- quantity_unit — одне з «шт.», «л», «мл», «г», «кг», або null\n"
+    "- quantity_inferred — true, якщо кількість не вказана явно (тоді quantity_value=1, quantity_unit=«шт.»)\n"
+    "- category — категорія товару\n"
+    "- is_consumable — true лише для їжі, напоїв, спецій та соусів; побутові товари → false\n"
+    "Ти лише розбираєш список у JSON — не рахуй суми між різними одиницями, не вигадуй об'єм чи вагу упаковки, "
+    "не пиши жодного тексту поза JSON. Незрозумілі фрагменти списку клади в unresolved_fragments, а не мовчи\n\n"
     "Правила:\n"
     "- Не додавай нових позицій і не видаляй існуючих через edit_saved_items чи merge_duplicates\n"
     "- Для start_action не повертай updates і merge_groups\n"
@@ -305,7 +356,15 @@ SAVED_LIST_EDIT_PROMPT = (
     "(не можна одночасно прибрати й списати частково ту саму позицію); не вигадуй кількість; "
     "не повертай updates, merge_groups, action, selected_numbers, items, consumptions\n"
     "- Для quick_add_to_inventory не повертай updates, merge_groups, action, selected_numbers\n"
+    "- Для reconcile_inventory_snapshot не вигадуй кількість заднім числом для позицій, які й раніше не мали "
+    "вказаної кількості — якщо кількість не вказана явно в новому списку, став quantity_inferred=true і не "
+    "намагайся вгадати число\n"
+    "- Для reconcile_inventory_snapshot не повертай updates, merge_groups, action, selected_numbers, consumptions, operations\n"
     "- Нормалізуй одиниці: «2 штуки» → «2 шт.», «500 грам» → «500 г», «1.5 л» → «1,5 л»\n"
+    "- Нормалізуй дробові кількості: «пів», «половина», «пів пачки», «половинку», «половину пачки», "
+    "«півлітра» → quantity_value 0.5 з відповідною одиницею вихідного товару "
+    "(«з'їв половину пачки печива» → 0,5 шт., «випив півлітра молока» → 0,5 л); "
+    "ніколи не округлюй 0,5 до 1 і не вигадуй одиницю, якщо вона не випливає з контексту\n"
     "- Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON\n\n"
     "Приклад edit_saved_items:\n"
     "{\"intent\": \"edit_saved_items\", \"action\": null, \"selected_numbers\": [], "
@@ -318,6 +377,11 @@ SAVED_LIST_EDIT_PROMPT = (
     "{\"intent\": \"consume_inventory_quantity\", \"action\": null, \"selected_numbers\": [], "
     "\"updates\": [], \"merge_groups\": [], \"items\": [], "
     "\"consumptions\": [{\"item_number\": 2, \"quantity_value\": 4, \"quantity_unit\": \"шт.\"}]}\n"
+    "Приклад consume_inventory_quantity з половинною кількістю "
+    "(«Я використав пів приправи до курки» для позиції «Приправа до курки — 2 шт.»):\n"
+    "{\"intent\": \"consume_inventory_quantity\", \"action\": null, \"selected_numbers\": [], "
+    "\"updates\": [], \"merge_groups\": [], \"items\": [], "
+    "\"consumptions\": [{\"item_number\": 3, \"quantity_value\": 0.5, \"quantity_unit\": \"шт.\"}]}\n"
     "Приклад compound_inventory_operations:\n"
     "{\"intent\": \"compound_inventory_operations\", \"action\": null, \"selected_numbers\": [], "
     "\"updates\": [], \"merge_groups\": [], \"items\": [], \"consumptions\": [], "
@@ -332,7 +396,16 @@ SAVED_LIST_EDIT_PROMPT = (
     "{\"intent\": \"quick_add_to_inventory\", \"action\": null, \"selected_numbers\": [], "
     "\"updates\": [], \"merge_groups\": [], \"items\": ["
     "{\"name\": \"Молоко\", \"canonical_name\": \"молоко\", \"quantity_value\": 1, \"quantity_unit\": \"шт.\", "
-    "\"quantity_inferred\": true, \"category\": \"Молочне та яйця\", \"is_consumable\": true}]}"
+    "\"quantity_inferred\": true, \"category\": \"Молочне та яйця\", \"is_consumable\": true}]}\n"
+    "Приклад reconcile_inventory_snapshot:\n"
+    "{\"intent\": \"reconcile_inventory_snapshot\", \"action\": null, \"selected_numbers\": [], "
+    "\"updates\": [], \"merge_groups\": [], \"consumptions\": [], \"operations\": [], "
+    "\"items\": ["
+    "{\"name\": \"Молоко\", \"canonical_name\": \"молоко\", \"quantity_value\": 5.5, \"quantity_unit\": \"л\", "
+    "\"quantity_inferred\": false, \"category\": \"Молочне та яйця\", \"is_consumable\": true}, "
+    "{\"name\": \"Йогурт\", \"canonical_name\": \"йогурт\", \"quantity_value\": 1, \"quantity_unit\": \"шт.\", "
+    "\"quantity_inferred\": true, \"category\": \"Молочне та яйця\", \"is_consumable\": true}"
+    "], \"unresolved_fragments\": []}"
 )
 
 # =========================
@@ -446,17 +519,28 @@ COMPOUND_PREVIEW_KEYBOARD = {
     "one_time_keyboard": True,
 }
 
+RECONCILIATION_PREVIEW_KEYBOARD = {
+    "keyboard": [
+        ["✅ Підтвердити звіряння"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
 # =========================
 # FLASK APP
 # =========================
 app = Flask(__name__)
+
+SEND_MESSAGE_TIMEOUT = 10  # seconds; keeps webhook() from stalling past Telegram's retry window
 
 def send_message(chat_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
-    requests.post(url, json=payload)
+    requests.post(url, json=payload, timeout=SEND_MESSAGE_TIMEOUT)
 
 def call_gemini(history, system_prompt, temperature=0.7, model_url=None):
     if not GEMINI_API_KEY:
@@ -558,6 +642,8 @@ def clear_inventory_state(chat_id):
     pending_quick_purchase.pop(chat_id, None)
     pending_inventory_consumption.pop(chat_id, None)
     pending_compound_inventory.pop(chat_id, None)
+    pending_inventory_reconciliation.pop(chat_id, None)
+    pending_inventory_reconciliation_clarify.pop(chat_id, None)
 
 # =========================
 # QUANTITY HELPERS (local)
@@ -1278,7 +1364,7 @@ def _validate_compound_operations(operations, unresolved_fragments, items):
             value = op.get("quantity_value")
             unit = op.get("quantity_unit")
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-                reasons.append(f"«{item['name']}» — некоректна кількість для списання.")
+                reasons.append(f"«{item['name']}» — не можу безпечно визначити кількість для списання. Уточни, будь ласка.")
                 continue
             if unit not in STRUCTURED_UNITS:
                 reasons.append(f"«{item['name']}» — невідома одиниця вимірювання.")
@@ -1385,6 +1471,259 @@ def _compound_snapshot_is_stale(inventory_changes, current_items):
         if cur is None or cur.get("quantity_value") != c["old_value"] or cur.get("quantity_unit") != c["old_unit"]:
             return True
     return False
+
+
+# =========================
+# INVENTORY SNAPSHOT RECONCILIATION
+# =========================
+
+def _find_ambiguous_unit_group(raw_items):
+    """Group reconciliation raw_items by canonical_name; return the first group
+    (list of item dicts) whose quantity_unit values span more than one
+    _UNIT_GROUP (e.g. л/мл vs шт. for the same product), or None if none exist.
+    Items with quantity_unit not in _UNIT_GROUP are ignored for this check."""
+    by_name = {}
+    for it in raw_items:
+        canon = it.get("canonical_name") or canonicalize_name(it.get("name", ""))
+        by_name.setdefault(canon, []).append(it)
+    for group in by_name.values():
+        groups_seen = {_UNIT_GROUP[it["quantity_unit"]] for it in group if it.get("quantity_unit") in _UNIT_GROUP}
+        if len(groups_seen) > 1:
+            return group
+    return None
+
+
+def _sum_same_group_reconcile_items(group_items):
+    """Sum a list of same-canonical-name, same-_UNIT_GROUP item dicts into one,
+    using Decimal canonical-unit math (mirrors _resolve_consumption's conversion).
+    Result's quantity_inferred is True only if every input entry was inferred.
+    Caller must have already confirmed the group has no cross-group ambiguity
+    (via _find_ambiguous_unit_group returning None for this canonical_name)."""
+    valued = [it for it in group_items if it.get("quantity_unit") in _UNIT_GROUP]
+    if not valued:
+        return dict(group_items[0])
+    unit_group = _UNIT_GROUP[valued[0]["quantity_unit"]]
+    total = sum(
+        (Decimal(str(it["quantity_value"])) * _UNIT_TO_CANONICAL_FACTOR[it["quantity_unit"]] for it in valued),
+        Decimal("0"),
+    )
+    merged = dict(valued[0])
+    merged["quantity_value"] = float(total)
+    merged["quantity_unit"] = _CANONICAL_UNIT_FOR_GROUP[unit_group]
+    merged["quantity_inferred"] = all(bool(it.get("quantity_inferred")) for it in valued)
+    return merged
+
+
+def _validate_reconcile_snapshot(raw_items, unresolved_fragments, list_items):
+    """Validate/diff a reconcile_inventory_snapshot router result against the
+    current full inventory (list_items). Pure — no DB access, no side effects.
+
+    Returns:
+      ("unresolved", [fragment_str, ...])
+      ("ambiguous_unit_group", {"ambiguous_group": [...], "rest": [...]})
+      ("invalid", [reason_str, ...])
+      ("ok", {"updates": [...], "additions": [...], "deletes": [...], "unchanged": [...]})
+
+    updates/deletes entries carry item_id/old_value/old_unit so they can be fed
+    directly into _compound_snapshot_is_stale() for staleness checks at confirm time.
+    """
+    if unresolved_fragments:
+        if not isinstance(unresolved_fragments, list):
+            return "unresolved", ["(не вдалося розібрати частину повідомлення)"]
+        fragments = [str(f).strip() for f in unresolved_fragments if str(f).strip()]
+        return "unresolved", fragments or ["(не вдалося розібрати частину повідомлення)"]
+
+    if not isinstance(raw_items, list) or not raw_items:
+        return "invalid", ["Порожній список — нема з чим звіряти запаси."]
+
+    cleaned = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not raw.get("is_consumable", True):
+            continue
+        qty_value = raw.get("quantity_value")
+        qty_unit = raw.get("quantity_unit")
+        if (
+            not isinstance(qty_value, (int, float)) or isinstance(qty_value, bool)
+            or qty_value <= 0
+            or not isinstance(qty_unit, str) or qty_unit not in STRUCTURED_UNITS
+        ):
+            qty_value, qty_unit = None, None
+        cat = raw.get("category")
+        if not isinstance(cat, str) or cat not in VALID_CATEGORIES:
+            cat = DEFAULT_CATEGORY
+        cleaned.append({
+            "name": name.strip(),
+            "canonical_name": raw.get("canonical_name") or canonicalize_name(name),
+            "category": cat,
+            "quantity_value": qty_value,
+            "quantity_unit": qty_unit,
+            "quantity_inferred": bool(raw.get("quantity_inferred")) or qty_value is None,
+        })
+    if not cleaned:
+        return "invalid", ["Не знайшов жодного їстівного товару у надісланому списку."]
+
+    ambiguous_group = _find_ambiguous_unit_group(cleaned)
+    if ambiguous_group is not None:
+        ids = {id(it) for it in ambiguous_group}
+        rest = [it for it in cleaned if id(it) not in ids]
+        return "ambiguous_unit_group", {"ambiguous_group": ambiguous_group, "rest": rest}
+
+    new_by_canon = {}
+    for it in cleaned:
+        new_by_canon.setdefault(it["canonical_name"], []).append(it)
+    for canon, group in new_by_canon.items():
+        new_by_canon[canon] = _sum_same_group_reconcile_items(group) if len(group) > 1 else group[0]
+
+    updates, additions, deletes, unchanged = [], [], [], []
+    matched_canon = set()
+    for cur in list_items:
+        canon = cur.get("canonical_name") or canonicalize_name(cur["name"])
+        new_item = new_by_canon.get(canon)
+        old_value, old_unit = cur.get("quantity_value"), cur.get("quantity_unit")
+        old_display = format_quantity_display(old_value, old_unit)
+        if new_item is None:
+            deletes.append({
+                "item_id": cur["id"], "name": cur["name"],
+                "old_value": old_value, "old_unit": old_unit, "old_display": old_display,
+            })
+            continue
+        matched_canon.add(canon)
+        if new_item["quantity_inferred"]:
+            # New snapshot didn't restate a real quantity for this pre-existing item —
+            # never overwrite a known quantity with a guessed default, and never
+            # invent one for an item that was already unspecified.
+            unchanged.append({"item_id": cur["id"], "name": cur["name"], "old_display": old_display})
+            continue
+        new_value, new_unit = new_item["quantity_value"], new_item["quantity_unit"]
+        if new_value == old_value and new_unit == old_unit:
+            unchanged.append({"item_id": cur["id"], "name": cur["name"], "old_display": old_display})
+        else:
+            updates.append({
+                "item_id": cur["id"], "name": cur["name"],
+                "old_value": old_value, "old_unit": old_unit, "old_display": old_display,
+                "new_value": new_value, "new_unit": new_unit,
+                "new_display": format_quantity_display(new_value, new_unit),
+            })
+
+    for canon, new_item in new_by_canon.items():
+        if canon in matched_canon:
+            continue
+        additions.append({
+            "name": new_item["name"], "canonical_name": canon, "category": new_item["category"],
+            "quantity_value": new_item["quantity_value"], "quantity_unit": new_item["quantity_unit"],
+            "quantity_inferred": new_item["quantity_inferred"],
+            "quantity_text": format_quantity_display(new_item["quantity_value"], new_item["quantity_unit"]),
+        })
+
+    if not updates and not additions and not deletes:
+        return "invalid", ["Нічого не змінилося — надісланий список повністю збігається з поточними запасами."]
+    return "ok", {"updates": updates, "additions": additions, "deletes": deletes, "unchanged": unchanged}
+
+
+_RECONCILE_KEEP_SEPARATE_PHRASES = {"залиш окремо", "залишити окремо", "окремо", "не об'єднуй"}
+
+
+def _resolve_reconciliation_unit_clarification(ambiguous_group, text):
+    """Resolve a same-product/different-unit-group ambiguity from the user's free-text
+    reply. Reuses _parse_structured_quantity/STRUCTURED_UNITS — no new regex engine.
+
+    Returns ("kept_separate", None), ("merged", [merged_item]), or ("invalid", None).
+    Never guesses: anything that isn't the literal keep-separate phrase or an
+    unambiguous "value unit" in the matching unit group is rejected (caller re-asks).
+    Only auto-resolves the simple two-entry case (one «шт.» entry + one
+    volume/mass entry) — anything more complex is rejected rather than guessed at.
+    """
+    normalized = (text or "").strip().lower()
+    if normalized in _RECONCILE_KEEP_SEPARATE_PHRASES:
+        return "kept_separate", None
+
+    value, unit = _parse_structured_quantity(text)
+    if value is None or unit is None or value <= 0:
+        return "invalid", None
+
+    count_entries = [it for it in ambiguous_group if _UNIT_GROUP.get(it.get("quantity_unit")) == "count"]
+    other_entries = [it for it in ambiguous_group if _UNIT_GROUP.get(it.get("quantity_unit")) not in (None, "count")]
+    if len(count_entries) != 1 or len(other_entries) != 1:
+        return "invalid", None
+    other = other_entries[0]
+    if _UNIT_GROUP.get(unit) != _UNIT_GROUP.get(other["quantity_unit"]):
+        return "invalid", None
+
+    count_item = count_entries[0]
+    per_unit_canonical = Decimal(str(value)) * _UNIT_TO_CANONICAL_FACTOR[unit]
+    total_from_count = per_unit_canonical * Decimal(str(count_item["quantity_value"]))
+    other_canonical = Decimal(str(other["quantity_value"])) * _UNIT_TO_CANONICAL_FACTOR[other["quantity_unit"]]
+    merged_canonical = total_from_count + other_canonical
+    merged_unit = _CANONICAL_UNIT_FOR_GROUP[_UNIT_GROUP[unit]]
+
+    merged_item = dict(other)
+    merged_item["quantity_value"] = float(merged_canonical)
+    merged_item["quantity_unit"] = merged_unit
+    merged_item["quantity_inferred"] = False
+    return "merged", [merged_item]
+
+
+def _format_reconciliation_preview(diff):
+    lines = ["🔄 Буде звірено запаси", ""]
+    if diff["updates"]:
+        lines.append("✏️ Зміниться:")
+        lines.append("")
+        for u in diff["updates"]:
+            lines.append(f"• {u['name']} — {u['old_display']}")
+            lines.append(f"  → {u['name']} — {u['new_display']}")
+        lines.append("")
+    if diff["additions"]:
+        lines.append("➕ Буде додано:")
+        lines.append("")
+        for a in diff["additions"]:
+            label = a["name"]
+            if a["quantity_text"]:
+                label += f" — {a['quantity_text']}"
+            if a["quantity_inferred"]:
+                label += " (кількість не вказана)"
+            lines.append(f"• {label}")
+        lines.append("")
+    if diff["deletes"]:
+        lines.append("➖ Буде прибрано:")
+        lines.append("")
+        for d in diff["deletes"]:
+            label = d["name"] + (f" — {d['old_display']}" if d["old_display"] else "")
+            lines.append(f"• {label}")
+        lines.append("")
+    if diff["unchanged"]:
+        lines.append("Без змін:")
+        lines.append("")
+        for u in diff["unchanged"]:
+            label = u["name"] + (f" — {u['old_display']}" if u["old_display"] else "")
+            lines.append(f"• {label}")
+        lines.append("")
+    lines.append(
+        "Це повне звіряння: позиції, яких немає у надісланому списку, буде прибрано лише після підтвердження."
+    )
+    return "\n".join(lines).rstrip()
+
+
+def _format_reconciliation_unit_clarify_question(ambiguous_group):
+    name = ambiguous_group[0]["name"]
+    parts = [format_quantity_display(it.get("quantity_value"), it.get("quantity_unit")) for it in ambiguous_group]
+    lines = [f"Бачу дві позиції {name}:", ""]
+    for p in parts:
+        lines.append(f"• {name} — {p}")
+    lines.append("")
+    lines.append("Щоб об'єднати їх в одну позицію, мені треба знати об'єм цієї упаковки.")
+    lines.append("")
+    lines.append("Напиши, наприклад:")
+    lines.append("• 1 л")
+    lines.append("• 500 мл")
+    lines.append("")
+    lines.append("Або напиши:")
+    lines.append("• залиш окремо")
+    return "\n".join(lines)
 
 
 def _validate_quick_add_items(raw_items):
@@ -1578,6 +1917,7 @@ def _should_restore_persisted_context(chat_id):
             pending_mark_batch, pending_delete_batch, pending_remove_batch,
             pending_saved_edit, pending_quick_purchase, pending_merge,
             pending_inventory_consumption, pending_compound_inventory,
+            pending_inventory_reconciliation, pending_inventory_reconciliation_clarify,
         )
     )
 
@@ -1695,6 +2035,9 @@ def home():
 @app.route(f"/webhook/{TOKEN}", methods=["POST"])
 def webhook():
     data = request.get_json()
+
+    if _is_duplicate_update(data.get("update_id")):
+        return "ok"
 
     message = data.get("message")
     if not message:
@@ -1837,6 +2180,12 @@ def webhook():
             send_message(chat_id, "Дію скасовано.", reply_markup=INVENTORY_KEYBOARD)
         elif chat_id in pending_compound_inventory:
             pending_compound_inventory.pop(chat_id, None)
+            send_message(chat_id, "Дію скасовано.", reply_markup=INVENTORY_KEYBOARD)
+        elif chat_id in pending_inventory_reconciliation:
+            pending_inventory_reconciliation.pop(chat_id, None)
+            send_message(chat_id, "Дію скасовано.", reply_markup=INVENTORY_KEYBOARD)
+        elif chat_id in pending_inventory_reconciliation_clarify:
+            pending_inventory_reconciliation_clarify.pop(chat_id, None)
             send_message(chat_id, "Дію скасовано.", reply_markup=INVENTORY_KEYBOARD)
         elif chat_id in pending_quick_purchase:
             pending_quick_purchase.pop(chat_id, None)
@@ -2053,6 +2402,39 @@ def webhook():
                         f"✅ Зміни запасів застосовано: {inv_updated + inv_deleted}",
                         reply_markup=INVENTORY_KEYBOARD,
                     )
+            except Exception:
+                send_message(chat_id, INVENTORY_ERROR_MSG)
+        return "ok"
+
+    if text == "✅ Підтвердити звіряння":
+        if chat_id in pending_inventory_reconciliation:
+            recon_data = pending_inventory_reconciliation.pop(chat_id)
+            household_id = recon_data["household_id"]
+            user_db_id = recon_data["user_db_id"]
+            try:
+                current_items = get_inventory_items(household_id)
+                if _compound_snapshot_is_stale(recon_data["updates"] + recon_data["deletes"], current_items):
+                    send_message(
+                        chat_id,
+                        "Список змінився з іншого пристрою. Онови запаси й повтори звіряння.",
+                        reply_markup=INVENTORY_KEYBOARD,
+                    )
+                    return "ok"
+                updates_for_db = [
+                    {
+                        "item_id": u["item_id"],
+                        "quantity_value": u["new_value"],
+                        "quantity_unit": u["new_unit"],
+                        "quantity_text": u["new_display"],
+                    }
+                    for u in recon_data["updates"]
+                ]
+                delete_ids = [d["item_id"] for d in recon_data["deletes"]]
+                apply_inventory_reconciliation(
+                    household_id, user_db_id, updates_for_db, recon_data["additions"], delete_ids
+                )
+                send_message(chat_id, "✅ Запаси звірено.", reply_markup=INVENTORY_KEYBOARD)
+                send_message(chat_id, format_inventory_list(get_inventory_items(household_id)))
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
@@ -2505,6 +2887,47 @@ def webhook():
             send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
             _preview_intercepted = True
 
+    elif chat_id in pending_inventory_reconciliation_clarify:
+        clarify_data = pending_inventory_reconciliation_clarify[chat_id]
+        kind, resolved = _resolve_reconciliation_unit_clarification(clarify_data["ambiguous_group"], text)
+        if kind == "invalid":
+            send_message(chat_id, _format_reconciliation_unit_clarify_question(clarify_data["ambiguous_group"]))
+            _preview_intercepted = True
+        else:
+            pending_inventory_reconciliation_clarify.pop(chat_id, None)
+            combined = clarify_data["rest"] + (resolved if kind == "merged" else clarify_data["ambiguous_group"])
+            household_id = clarify_data["household_id"]
+            user_db_id = clarify_data["user_db_id"]
+            try:
+                list_items = get_inventory_items(household_id)
+                next_ambiguous = _find_ambiguous_unit_group(combined)
+                if next_ambiguous is not None:
+                    ids = {id(it) for it in next_ambiguous}
+                    rest2 = [it for it in combined if id(it) not in ids]
+                    pending_inventory_reconciliation_clarify[chat_id] = {
+                        "ambiguous_group": next_ambiguous, "rest": rest2,
+                        "household_id": household_id, "user_db_id": user_db_id,
+                    }
+                    send_message(chat_id, _format_reconciliation_unit_clarify_question(next_ambiguous))
+                else:
+                    kind2, payload2 = _validate_reconcile_snapshot(combined, [], list_items)
+                    if kind2 == "ok":
+                        pending_inventory_reconciliation[chat_id] = {
+                            "updates": payload2["updates"], "additions": payload2["additions"],
+                            "deletes": payload2["deletes"], "household_id": household_id, "user_db_id": user_db_id,
+                        }
+                        send_message(
+                            chat_id, _format_reconciliation_preview(payload2), reply_markup=RECONCILIATION_PREVIEW_KEYBOARD
+                        )
+                    else:
+                        send_message(
+                            chat_id,
+                            "Не зміг безпечно завершити звіряння запасів. Спробуй ще раз, надіславши повний список.",
+                        )
+            except Exception:
+                send_message(chat_id, INVENTORY_ERROR_MSG)
+            _preview_intercepted = True
+
     else:
         ctx = saved_list_context.get(chat_id)
         if _should_restore_persisted_context(chat_id):
@@ -2596,7 +3019,10 @@ def webhook():
                                 chat_id, f"У запасах є лише {available}, а ти вказав {requested}. Уточни кількість."
                             )
                         else:
-                            send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
+                            send_message(
+                                chat_id,
+                                "Не можу безпечно визначити, яку саме кількість потрібно списати. Уточни, будь ласка.",
+                            )
                         _preview_intercepted = True
                     elif intent == "compound_inventory_operations" and ctx == "inventory_saved":
                         kind, payload = _validate_compound_operations(
@@ -2628,6 +3054,50 @@ def webhook():
                                 "Не зміг безпечно обробити всі зміни. Нічого не було змінено.",
                                 "",
                                 "Не зрозумів або не можу виконати:",
+                            ]
+                            for reason in payload:
+                                lines.append(f"• {reason}")
+                            send_message(chat_id, "\n".join(lines))
+                        _preview_intercepted = True
+                    elif intent == "reconcile_inventory_snapshot" and ctx == "inventory_saved":
+                        kind, payload = _validate_reconcile_snapshot(
+                            router_result.get("items"), router_result.get("unresolved_fragments"), list_items
+                        )
+                        if kind == "ok":
+                            pending_inventory_reconciliation[chat_id] = {
+                                "updates": payload["updates"],
+                                "additions": payload["additions"],
+                                "deletes": payload["deletes"],
+                                "household_id": household_id,
+                                "user_db_id": user_db_id,
+                            }
+                            send_message(
+                                chat_id, _format_reconciliation_preview(payload), reply_markup=RECONCILIATION_PREVIEW_KEYBOARD
+                            )
+                        elif kind == "ambiguous_unit_group":
+                            pending_inventory_reconciliation_clarify[chat_id] = {
+                                "ambiguous_group": payload["ambiguous_group"],
+                                "rest": payload["rest"],
+                                "household_id": household_id,
+                                "user_db_id": user_db_id,
+                            }
+                            send_message(chat_id, _format_reconciliation_unit_clarify_question(payload["ambiguous_group"]))
+                        elif kind == "unresolved":
+                            lines = [
+                                "Я зрозумів частину списку, але не хочу мовчки пропустити решту.",
+                                "",
+                                "Не зміг зрозуміти:",
+                            ]
+                            for frag in payload:
+                                lines.append(f"• «{frag}»")
+                            lines.append("")
+                            lines.append("Спробуй надіслати весь список запасів ще раз.")
+                            send_message(chat_id, "\n".join(lines))
+                        else:
+                            lines = [
+                                "Не зміг безпечно звірити запаси. Нічого не було змінено.",
+                                "",
+                                "Причина:",
                             ]
                             for reason in payload:
                                 lines.append(f"• {reason}")

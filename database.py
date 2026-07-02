@@ -782,6 +782,52 @@ def apply_compound_inventory_operations(household_id, user_db_id, consume_update
         conn.commit()
     return updated, deleted, len(shopping_items)
 
+def apply_inventory_reconciliation(household_id, user_db_id, updates, insert_items, delete_item_ids):
+    """Apply a full inventory snapshot reconciliation (updates + deletes + inserts)
+    in one transaction. Mirrors apply_compound_inventory_operations's shape.
+
+    updates: list of {item_id, quantity_value, quantity_unit, quantity_text} — sets
+    structured quantity fields directly (already computed by the caller).
+    insert_items: item dicts (name, category, canonical_name, quantity_value,
+    quantity_unit, quantity_inferred) merged/inserted via _merge_or_insert_inventory_in_tx.
+    delete_item_ids: inventory item ids to delete entirely.
+    Returns (updated_count, deleted_count, inserted_count).
+    """
+    if not updates and not delete_item_ids and not insert_items:
+        return 0, 0, 0
+    updated = 0
+    deleted = 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for upd in updates:
+                cur.execute(
+                    "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
+                    "quantity_inferred=FALSE, updated_at=NOW() WHERE id=%s AND household_id=%s RETURNING id",
+                    (upd["quantity_text"], upd["quantity_value"], upd["quantity_unit"], upd["item_id"], household_id)
+                )
+                if cur.fetchone():
+                    updated += 1
+            if delete_item_ids:
+                placeholders = ",".join(["%s"] * len(delete_item_ids))
+                cur.execute(
+                    f"DELETE FROM inventory_items WHERE id IN ({placeholders}) AND household_id=%s",
+                    list(delete_item_ids) + [household_id]
+                )
+                deleted = cur.rowcount
+            for item in insert_items:
+                _merge_or_insert_inventory_in_tx(
+                    cur, household_id, user_db_id,
+                    item["name"],
+                    item.get("quantity_text") or "",
+                    item.get("category") or DEFAULT_CATEGORY,
+                    canonical_name=item.get("canonical_name"),
+                    quantity_value=item.get("quantity_value"),
+                    quantity_unit=item.get("quantity_unit"),
+                    quantity_inferred=item.get("quantity_inferred", False),
+                )
+        conn.commit()
+    return updated, deleted, len(insert_items)
+
 # =========================
 # MANUAL MERGE
 # =========================
