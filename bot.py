@@ -268,9 +268,16 @@ SELECTION_PROMPT = (
     "- числа і діапазони: «1 2 3», «1-4», «2, 5-7» → відповідні номери\n"
     "- назви або фрази → знайди відповідні позиції за назвою або змістом\n"
     "Правила відповіді:\n"
-    "- Відповідай ТІЛЬКИ валідним JSON без жодного тексту: {\"selected_numbers\": [1, 3, 5]}\n"
+    "- Відповідай ТІЛЬКИ валідним JSON без жодного тексту: "
+    "{\"selected_numbers\": [1, 3, 5], \"unresolved_fragments\": []}\n"
     "- Вказуй тільки номери, які є в списку; без дублікатів; за зростанням\n"
-    "- Якщо нічого не підходить — відповідай {\"selected_numbers\": []}\n"
+    "- Якщо нічого не підходить — відповідай {\"selected_numbers\": [], \"unresolved_fragments\": []}\n"
+    "- Якщо частину повідомлення не можна однозначно перетворити на позицію(ї) зі списку — постав ці "
+    "фрагменти в unresolved_fragments (масив рядків) і не вгадуй позицію. Завжди повертай це поле, "
+    "навіть порожнім масивом\n"
+    "Приклад із нерозпізнаним фрагментом («Видали молоко і те довге м'ясо», де в списку є лише "
+    "позиція 1 «Молоко»):\n"
+    "{\"selected_numbers\": [1], \"unresolved_fragments\": [\"те довге м'ясо\"]}\n"
 )
 
 INTENT_ROUTER_PROMPT = (
@@ -355,12 +362,19 @@ SAVED_LIST_EDIT_PROMPT = (
     "«remove_inventory» (прибрати із запасів — лише для запасів); обирай дію лише дозволену для поточного контексту\n"
     "- selected_numbers — номери обраних позицій за тими самими правилами, що й вибір позицій: "
     "«всі», «усе», «все куплено» тощо → всі номери; «все крім X» або «залиш X, решту...» → всі, крім X; "
-    "числа й діапазони («1 2 3», «1-4»); назви або фрази → знайди відповідні позиції за назвою або змістом\n\n"
+    "числа й діапазони («1 2 3», «1-4»); назви або фрази → знайди відповідні позиції за назвою або змістом\n"
+    "- Якщо частину повідомлення не можна однозначно перетворити на позицію(ї) для дії (наприклад "
+    "«Видали молоко і те довге м'ясо», де впізнано лише молоко) — постав ці фрагменти в "
+    "unresolved_fragments (масив рядків) і НЕ вгадуй позицію. Завжди повертай це поле для start_action, "
+    "навіть порожнім масивом\n\n"
     "Для consume_inventory_quantity — поверни consumptions: масив об'єктів для позицій, з яких частково "
     "списується кількість:\n"
     "- item_number — ціле число (номер позиції)\n"
     "- quantity_value — додатне число, скільки саме використано\n"
-    "- quantity_unit — одне з «шт.», «л», «мл», «г», «кг» — одиниця, у якій вказано використане\n\n"
+    "- quantity_unit — одне з «шт.», «л», «мл», «г», «кг» — одиниця, у якій вказано використане\n"
+    "- Якщо частину повідомлення не можна однозначно перетворити на consumptions — постав ці фрагменти "
+    "в unresolved_fragments (масив рядків) і не вгадуй кількість. Завжди повертай це поле для "
+    "consume_inventory_quantity, навіть порожнім масивом\n\n"
     "Для compound_inventory_operations — поверни operations: масив об'єктів, кожен з полем type:\n"
     "- {\"type\": \"remove_inventory\", \"item_number\": N} — повністю прибрати позицію N із запасів\n"
     "- {\"type\": \"consume_inventory_quantity\", \"item_number\": N, \"quantity_value\": число, "
@@ -418,16 +432,22 @@ SAVED_LIST_EDIT_PROMPT = (
     "\"merge_groups\": [], \"items\": []}\n"
     "Приклад start_action:\n"
     "{\"intent\": \"start_action\", \"action\": \"mark_bought\", \"selected_numbers\": [1, 3], "
-    "\"updates\": [], \"merge_groups\": [], \"items\": []}\n"
+    "\"updates\": [], \"merge_groups\": [], \"items\": [], \"unresolved_fragments\": []}\n"
+    "Приклад start_action із нерозпізнаним фрагментом "
+    "(«Видали молоко і те довге м'ясо», де в списку є лише позиція 1 «Молоко»):\n"
+    "{\"intent\": \"start_action\", \"action\": \"delete_shopping\", \"selected_numbers\": [1], "
+    "\"updates\": [], \"merge_groups\": [], \"items\": [], \"unresolved_fragments\": [\"те довге м'ясо\"]}\n"
     "Приклад consume_inventory_quantity:\n"
     "{\"intent\": \"consume_inventory_quantity\", \"action\": null, \"selected_numbers\": [], "
     "\"updates\": [], \"merge_groups\": [], \"items\": [], "
-    "\"consumptions\": [{\"item_number\": 2, \"quantity_value\": 4, \"quantity_unit\": \"шт.\"}]}\n"
+    "\"consumptions\": [{\"item_number\": 2, \"quantity_value\": 4, \"quantity_unit\": \"шт.\"}], "
+    "\"unresolved_fragments\": []}\n"
     "Приклад consume_inventory_quantity з половинною кількістю "
     "(«Я використав пів приправи до курки» для позиції «Приправа до курки — 2 шт.»):\n"
     "{\"intent\": \"consume_inventory_quantity\", \"action\": null, \"selected_numbers\": [], "
     "\"updates\": [], \"merge_groups\": [], \"items\": [], "
-    "\"consumptions\": [{\"item_number\": 3, \"quantity_value\": 0.5, \"quantity_unit\": \"шт.\"}]}\n"
+    "\"consumptions\": [{\"item_number\": 3, \"quantity_value\": 0.5, \"quantity_unit\": \"шт.\"}], "
+    "\"unresolved_fragments\": []}\n"
     "Приклад compound_inventory_operations:\n"
     "{\"intent\": \"compound_inventory_operations\", \"action\": null, \"selected_numbers\": [], "
     "\"updates\": [], \"merge_groups\": [], \"items\": [], \"consumptions\": [], "
@@ -1653,6 +1673,17 @@ _ACTIONS_BY_CONTEXT = {
 }
 
 
+def _format_unresolved_fragments_message(fragments):
+    """Ukrainian clarification message shown when part of a command couldn't
+    be resolved to a list item — used by start_action, consume_inventory_quantity,
+    and the standalone SELECTION_PROMPT flow."""
+    if len(fragments) == 1:
+        header = f"Не зміг зрозуміти частину команди: «{fragments[0]}»."
+    else:
+        header = "Не зміг зрозуміти частину команди:\n" + "\n".join(f"• «{f}»" for f in fragments)
+    return header + "\n\nУточни назву товару або напиши його номер зі списку."
+
+
 def _validate_start_action(action, selected_numbers, context_type, items):
     """Validate a start_action router result for the current open list.
 
@@ -1660,10 +1691,36 @@ def _validate_start_action(action, selected_numbers, context_type, items):
     selected_numbers the same way as button-triggered selection (dedup,
     order preserved, out-of-range dropped, empty rejected).
     Returns the ordered list of selected item dicts, or None if invalid.
+
+    Callers must check for unresolved_fragments (see
+    _check_unresolved_fragments) before calling this — this function only
+    validates action/selected_numbers, unchanged from before that check existed.
     """
     if action not in _ACTIONS_BY_CONTEXT.get(context_type, set()):
         return None
     return _validate_selected_numbers(selected_numbers, items)
+
+
+def _check_unresolved_fragments(router_result):
+    """Shared unresolved_fragments gate for start_action and
+    consume_inventory_quantity results from _ask_gemini_saved_list_router.
+
+    Unlike compound_inventory_operations/reconcile_inventory_snapshot (which
+    treat a missing field as "nothing unresolved" and must keep doing so —
+    not touched here), these destructive/selection intents must never
+    silently proceed when the router omitted the field — so a missing field
+    is treated as a block too.
+
+    Returns (True, [fragment_str, ...]) if blocked — the fragments list is
+    empty when the field was simply missing (no fragment text to show).
+    Returns (False, None) when clear to proceed with normal validation.
+    """
+    if not router_result.get("unresolved_fragments_present"):
+        return True, []
+    fragments = [str(f).strip() for f in router_result.get("unresolved_fragments") or [] if str(f).strip()]
+    if fragments:
+        return True, fragments
+    return False, None
 
 
 _UNIT_GROUP = {"л": "volume", "мл": "volume", "кг": "mass", "г": "mass", "шт.": "count"}
@@ -1710,6 +1767,9 @@ def _validate_consumptions(consumptions, items):
       ("insufficient", (item_name, available_display, requested_display)) — not enough left.
       ("invalid", None) — malformed input, out-of-range/duplicate item_number, bad unit,
           non-positive quantity, or incompatible units.
+
+    Callers must check for unresolved_fragments (see _check_unresolved_fragments)
+    before calling this — this function is unchanged from before that check existed.
     """
     if not isinstance(consumptions, list) or not consumptions:
         return "invalid", None
@@ -2259,7 +2319,7 @@ def _format_quick_purchase_preview(items, ignored_items=None):
 
 _SAVED_LIST_ROUTER_FALLBACK = {
     "intent": "none", "action": None, "selected_numbers": [], "updates": [], "merge_groups": [], "items": [],
-    "consumptions": [], "operations": [], "unresolved_fragments": [],
+    "consumptions": [], "operations": [], "unresolved_fragments": [], "unresolved_fragments_present": False,
 }
 
 
@@ -2289,6 +2349,7 @@ def _ask_gemini_saved_list_router(user_text, items, context_type):
             cleaned = m.group(1).strip()
     try:
         data = json.loads(cleaned)
+        raw_fragments = data.get("unresolved_fragments")
         return {
             "intent": data.get("intent", "none"),
             "action": data.get("action"),
@@ -2298,7 +2359,12 @@ def _ask_gemini_saved_list_router(user_text, items, context_type):
             "items": data.get("items") if isinstance(data.get("items"), list) else [],
             "consumptions": data.get("consumptions") if isinstance(data.get("consumptions"), list) else [],
             "operations": data.get("operations") if isinstance(data.get("operations"), list) else [],
-            "unresolved_fragments": data.get("unresolved_fragments") if isinstance(data.get("unresolved_fragments"), list) else [],
+            "unresolved_fragments": raw_fragments if isinstance(raw_fragments, list) else [],
+            # Distinct from the coerced "unresolved_fragments" above: this tracks whether
+            # Gemini actually included the field (vs. omitted/malformed), which start_action
+            # and consume_inventory_quantity treat as a hard block. compound/reconcile keep
+            # reading only the coerced key above and are unaffected.
+            "unresolved_fragments_present": isinstance(raw_fragments, list),
         }
     except (json.JSONDecodeError, ValueError, TypeError):
         return dict(_SAVED_LIST_ROUTER_FALLBACK)
@@ -2486,6 +2552,16 @@ def _should_restore_persisted_context(chat_id):
 
 
 def _ask_gemini_for_selection(user_text, items, list_label, action_label):
+    """Gemini call for the standalone selection flow (shopping_mode "marking"/
+    "deleting", inventory_mode "removing").
+
+    Returns one of:
+      ("unresolved", [fragment_str, ...]) — part of the message couldn't be
+          resolved to a list item, or Gemini omitted unresolved_fragments
+          entirely; nothing should be selected.
+      ("invalid", None) — call failed, malformed JSON, or no valid selection.
+      ("ok", [item, ...]) — the ordered list of selected item dicts.
+    """
     lines = []
     for i, item in enumerate(items):
         label = f"{i + 1}. {item['name']}"
@@ -2502,7 +2578,7 @@ def _ask_gemini_for_selection(user_text, items, list_label, action_label):
     )
     raw = call_gemini([{"role": "user", "content": prompt}], SELECTION_PROMPT, temperature=0.1)
     if not raw:
-        return None
+        return "invalid", None
     cleaned = raw.strip()
     if "```" in cleaned:
         m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
@@ -2510,9 +2586,18 @@ def _ask_gemini_for_selection(user_text, items, list_label, action_label):
             cleaned = m.group(1).strip()
     try:
         data = json.loads(cleaned)
-        return _validate_selected_numbers(data.get("selected_numbers"), items)
     except (json.JSONDecodeError, ValueError, TypeError):
-        return None
+        return "invalid", None
+    raw_fragments = data.get("unresolved_fragments")
+    if not isinstance(raw_fragments, list):
+        return "invalid", None
+    fragments = [str(f).strip() for f in raw_fragments if str(f).strip()]
+    if fragments:
+        return "unresolved", fragments
+    selected = _validate_selected_numbers(data.get("selected_numbers"), items)
+    if selected is None:
+        return "invalid", None
+    return "ok", selected
 
 def _show_mark_preview(chat_id, items, household_id, user_db_id):
     pending_mark_batch[chat_id] = {
@@ -3364,12 +3449,15 @@ def webhook():
             if not items:
                 send_message(chat_id, "Список покупок поки порожній.")
                 return "ok"
-            selected = _ask_gemini_for_selection(text, items, "Список покупок", "позначити купленими")
-            if selected is None:
-                send_message(chat_id, SELECTION_ERROR_MSG)
+            kind, payload = _ask_gemini_for_selection(text, items, "Список покупок", "позначити купленими")
+            if kind == "ok":
+                _show_mark_preview(chat_id, payload, household_id, user_db_id)
+            elif kind == "unresolved":
+                send_message(chat_id, _format_unresolved_fragments_message(payload))
                 shopping_mode[chat_id] = "marking"
             else:
-                _show_mark_preview(chat_id, selected, household_id, user_db_id)
+                send_message(chat_id, SELECTION_ERROR_MSG)
+                shopping_mode[chat_id] = "marking"
         except Exception:
             send_message(chat_id, DB_ERROR_MSG)
         return "ok"
@@ -3381,12 +3469,15 @@ def webhook():
             if not items:
                 send_message(chat_id, "Список покупок поки порожній.")
                 return "ok"
-            selected = _ask_gemini_for_selection(text, items, "Список покупок", "видалити зі списку")
-            if selected is None:
-                send_message(chat_id, SELECTION_ERROR_MSG)
+            kind, payload = _ask_gemini_for_selection(text, items, "Список покупок", "видалити зі списку")
+            if kind == "ok":
+                _show_delete_preview(chat_id, payload, household_id, user_db_id)
+            elif kind == "unresolved":
+                send_message(chat_id, _format_unresolved_fragments_message(payload))
                 shopping_mode[chat_id] = "deleting"
             else:
-                _show_delete_preview(chat_id, selected, household_id, user_db_id)
+                send_message(chat_id, SELECTION_ERROR_MSG)
+                shopping_mode[chat_id] = "deleting"
         except Exception:
             send_message(chat_id, DB_ERROR_MSG)
         return "ok"
@@ -3442,12 +3533,15 @@ def webhook():
             if not items:
                 send_message(chat_id, "Запаси поки порожні.")
                 return "ok"
-            selected = _ask_gemini_for_selection(text, items, "Список запасів", "прибрати із запасів")
-            if selected is None:
-                send_message(chat_id, SELECTION_ERROR_MSG)
+            kind, payload = _ask_gemini_for_selection(text, items, "Список запасів", "прибрати із запасів")
+            if kind == "ok":
+                _show_remove_preview(chat_id, payload, household_id, user_db_id)
+            elif kind == "unresolved":
+                send_message(chat_id, _format_unresolved_fragments_message(payload))
                 inventory_mode[chat_id] = "removing"
             else:
-                _show_remove_preview(chat_id, selected, household_id, user_db_id)
+                send_message(chat_id, SELECTION_ERROR_MSG)
+                inventory_mode[chat_id] = "removing"
         except Exception:
             send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
@@ -3631,48 +3725,65 @@ def webhook():
                             send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
                         _preview_intercepted = True
                     elif intent == "start_action":
-                        selected = _validate_start_action(
-                            router_result.get("action"), router_result.get("selected_numbers"), ctx, list_items
-                        )
-                        if selected is not None:
-                            saved_list_context.pop(chat_id, None)
-                            action = router_result.get("action")
-                            if action == "mark_bought":
-                                _show_mark_preview(chat_id, selected, household_id, user_db_id)
-                            elif action == "delete_shopping":
-                                _show_delete_preview(chat_id, selected, household_id, user_db_id)
-                            elif action == "remove_inventory":
-                                _show_remove_preview(chat_id, selected, household_id, user_db_id)
+                        blocked, fragments = _check_unresolved_fragments(router_result)
+                        if blocked:
+                            if fragments:
+                                send_message(chat_id, _format_unresolved_fragments_message(fragments))
+                            else:
+                                send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
                         else:
-                            send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
+                            selected = _validate_start_action(
+                                router_result.get("action"), router_result.get("selected_numbers"), ctx, list_items
+                            )
+                            if selected is not None:
+                                saved_list_context.pop(chat_id, None)
+                                action = router_result.get("action")
+                                if action == "mark_bought":
+                                    _show_mark_preview(chat_id, selected, household_id, user_db_id)
+                                elif action == "delete_shopping":
+                                    _show_delete_preview(chat_id, selected, household_id, user_db_id)
+                                elif action == "remove_inventory":
+                                    _show_remove_preview(chat_id, selected, household_id, user_db_id)
+                            else:
+                                send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
                         _preview_intercepted = True
                     elif intent == "consume_inventory_quantity" and ctx == "inventory_saved":
-                        kind, payload = _validate_consumptions(router_result.get("consumptions"), list_items)
-                        if kind == "ok":
-                            pending_inventory_consumption[chat_id] = {
-                                "resolved": payload,
-                                "household_id": household_id,
-                                "user_db_id": user_db_id,
-                            }
-                            send_message(
-                                chat_id, _format_consumption_preview(payload), reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD
-                            )
-                        elif kind == "missing_quantity":
-                            send_message(
-                                chat_id,
-                                f"Не можу безпечно відняти частину, бо для «{payload}» не вказана точна кількість. "
-                                "Спочатку відредагуй кількість товару.",
-                            )
-                        elif kind == "insufficient":
-                            name, available, requested = payload
-                            send_message(
-                                chat_id, f"У запасах є лише {available}, а ти вказав {requested}. Уточни кількість."
-                            )
+                        blocked, fragments = _check_unresolved_fragments(router_result)
+                        if blocked:
+                            if fragments:
+                                send_message(chat_id, _format_unresolved_fragments_message(fragments))
+                            else:
+                                send_message(
+                                    chat_id,
+                                    "Не можу безпечно визначити, яку саме кількість потрібно списати. Уточни, будь ласка.",
+                                )
                         else:
-                            send_message(
-                                chat_id,
-                                "Не можу безпечно визначити, яку саме кількість потрібно списати. Уточни, будь ласка.",
-                            )
+                            kind, payload = _validate_consumptions(router_result.get("consumptions"), list_items)
+                            if kind == "ok":
+                                pending_inventory_consumption[chat_id] = {
+                                    "resolved": payload,
+                                    "household_id": household_id,
+                                    "user_db_id": user_db_id,
+                                }
+                                send_message(
+                                    chat_id, _format_consumption_preview(payload), reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD
+                                )
+                            elif kind == "missing_quantity":
+                                send_message(
+                                    chat_id,
+                                    f"Не можу безпечно відняти частину, бо для «{payload}» не вказана точна кількість. "
+                                    "Спочатку відредагуй кількість товару.",
+                                )
+                            elif kind == "insufficient":
+                                name, available, requested = payload
+                                send_message(
+                                    chat_id, f"У запасах є лише {available}, а ти вказав {requested}. Уточни кількість."
+                                )
+                            else:
+                                send_message(
+                                    chat_id,
+                                    "Не можу безпечно визначити, яку саме кількість потрібно списати. Уточни, будь ласка.",
+                                )
                         _preview_intercepted = True
                     elif intent == "compound_inventory_operations" and ctx == "inventory_saved":
                         kind, payload = _validate_compound_operations(
