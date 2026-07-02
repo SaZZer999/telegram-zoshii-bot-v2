@@ -540,6 +540,31 @@ def delete_household_alias(household_id, alias_normalized):
         conn.commit()
     return row is not None
 
+def delete_household_aliases_batch(household_id, targets):
+    """Delete multiple household aliases in one transaction (bulk delete
+    preview confirm). `targets`: list of dicts with id, target_display_name,
+    target_canonical_name — the snapshot captured when the preview was built.
+    Re-verified for staleness inside this same transaction before anything is
+    deleted (StaleSnapshotError + full rollback, nothing partially applied, if
+    any target alias changed or vanished on another device since the preview
+    was shown). Returns count of deleted rows. Only ever deletes rows from
+    household_aliases — never shopping_items/inventory_items.
+    """
+    if not targets:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            _verify_alias_targets_in_tx(cur, household_id, targets)
+            ids = [t["id"] for t in targets]
+            placeholders = ",".join(["%s"] * len(ids))
+            cur.execute(
+                f"DELETE FROM household_aliases WHERE id IN ({placeholders}) AND household_id = %s",
+                list(ids) + [household_id]
+            )
+            count = cur.rowcount
+        conn.commit()
+    return count
+
 def add_shopping_item(household_id, name, quantity_text, created_by_user_id):
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -805,6 +830,32 @@ def _verify_targets_in_tx(cur, table, household_id, targets):
     for t in targets:
         seen = current.get(t["item_id"])
         if seen is None or seen != (t.get("quantity_value"), t.get("quantity_unit")):
+            raise StaleSnapshotError()
+
+
+def _verify_alias_targets_in_tx(cur, household_id, targets):
+    """Same guard as _verify_targets_in_tx, but for household_aliases rows
+    (which have no quantity fields — the "did this alias change on another
+    device" check compares target_display_name/target_canonical_name instead).
+    Raises StaleSnapshotError if any target alias is missing or its target
+    no longer matches the snapshot captured when the bulk-delete preview was
+    built. No-ops for empty/None targets.
+
+    targets: list of dicts with id, target_display_name, target_canonical_name.
+    """
+    if not targets:
+        return
+    ids = [t["id"] for t in targets]
+    placeholders = ",".join(["%s"] * len(ids))
+    cur.execute(
+        f"SELECT id, target_display_name, target_canonical_name FROM household_aliases "
+        f"WHERE id IN ({placeholders}) AND household_id=%s FOR UPDATE",
+        list(ids) + [household_id],
+    )
+    current = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+    for t in targets:
+        seen = current.get(t["id"])
+        if seen is None or seen != (t.get("target_display_name"), t.get("target_canonical_name")):
             raise StaleSnapshotError()
 
 # =========================

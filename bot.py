@@ -37,6 +37,7 @@ from database import (
     list_household_aliases,
     create_or_update_household_alias,
     delete_household_alias,
+    delete_household_aliases_batch,
 )
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
@@ -456,29 +457,45 @@ SAVED_LIST_EDIT_PROMPT = (
 ALIAS_ROUTER_PROMPT = (
     "Ти помічник для керування домашніми назвами товарів (aliases) — персональними правилами "
     "«моя назва → цільова назва товару» для одного домашнього господарства.\n"
+    "Тобі може бути наданий поточний список збережених домашніх назв (номер, назва, ціль).\n"
     "Визнач намір (intent):\n"
-    "- «create_or_update» — користувач хоче запам'ятати або змінити правило "
+    "- «create_or_update» — користувач хоче запам'ятати або змінити ОДНЕ правило "
     "(напр. «Запам'ятай, що сливки = Вершки», «Зміни: сливки = Вершки 30%», «сливки — це вершки»)\n"
-    "- «delete» — користувач хоче видалити правило (напр. «Забудь, що сливки», «Видали назву сливки»)\n"
+    "- «delete» — користувач хоче видалити ОДНЕ правило за назвою "
+    "(напр. «Забудь, що сливки», «Видали назву сливки»)\n"
+    "- «delete_aliases» — користувач хоче видалити КІЛЬКА або ВСІ домашні назви одразу "
+    "(напр. «Видали всі назви», «Забудь усі домашні назви», «Видали всі назви, крім сливки», "
+    "«Залиш тільки сливки, решту домашніх назв видали», «Видали назви 1 і 3»)\n"
     "- «list» — користувач хоче побачити список збережених назв (напр. «Покажи мої назви», «Який список назв?»)\n"
     "- «none» — повідомлення не стосується керування назвами товарів\n\n"
     "Для create_or_update і delete поверни:\n"
     "- alias_text — назва, яку вводить користувач (наприклад «сливки»)\n"
     "- target_display_name — цільова назва товару, на яку замінюється alias_text "
     "(лише для create_or_update; для delete залиш null)\n\n"
+    "Для delete_aliases поверни selected_numbers — масив номерів позицій з наданого списку, які треба "
+    "видалити: «всі»/«усі» → номери всіх позицій; «всі, крім X» або «залиш X, решту видали» → номери "
+    "всіх позицій, крім тієї що відповідає X; конкретні номери чи діапазони («1 і 3», «1-2») → відповідні "
+    "номери. Ніколи не вигадуй номер, якого немає у наданому списку.\n\n"
     "Це ПРОСТО правило заміни назви. Ніколи не вигадуй і не змінюй кількість чи одиницю виміру товару — "
     "alias_text і target_display_name це лише текстові назви, без чисел кількості.\n"
-    "Якщо ти не можеш однозначно визначити alias_text або target_display_name — не вгадуй. Додай незрозумілий "
-    "фрагмент тексту в unresolved_fragments (масив рядків) і залиш alias_text/target_display_name null.\n"
+    "Якщо ти не можеш однозначно визначити alias_text, target_display_name або selected_numbers — не вгадуй. "
+    "Додай незрозумілий фрагмент тексту в unresolved_fragments (масив рядків) і залиш інші поля порожніми.\n"
     "Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON:\n"
     "{\"intent\": \"create_or_update\", \"alias_text\": \"сливки\", \"target_display_name\": \"Вершки\", "
-    "\"unresolved_fragments\": []}\n"
+    "\"selected_numbers\": [], \"unresolved_fragments\": []}\n"
     "Приклад delete:\n"
-    "{\"intent\": \"delete\", \"alias_text\": \"сливки\", \"target_display_name\": null, \"unresolved_fragments\": []}\n"
+    "{\"intent\": \"delete\", \"alias_text\": \"сливки\", \"target_display_name\": null, "
+    "\"selected_numbers\": [], \"unresolved_fragments\": []}\n"
+    "Приклад delete_aliases (зі списком «1. сливки → Вершки», «2. приправа курка → Приправа до курки», "
+    "«3. вершки для пасти → Вершки 30%» і повідомленням «Видали всі назви, крім сливки»):\n"
+    "{\"intent\": \"delete_aliases\", \"alias_text\": null, \"target_display_name\": null, "
+    "\"selected_numbers\": [2, 3], \"unresolved_fragments\": []}\n"
     "Приклад list:\n"
-    "{\"intent\": \"list\", \"alias_text\": null, \"target_display_name\": null, \"unresolved_fragments\": []}\n"
+    "{\"intent\": \"list\", \"alias_text\": null, \"target_display_name\": null, "
+    "\"selected_numbers\": [], \"unresolved_fragments\": []}\n"
     "Приклад none:\n"
-    "{\"intent\": \"none\", \"alias_text\": null, \"target_display_name\": null, \"unresolved_fragments\": []}"
+    "{\"intent\": \"none\", \"alias_text\": null, \"target_display_name\": null, "
+    "\"selected_numbers\": [], \"unresolved_fragments\": []}"
 )
 
 # =========================
@@ -743,37 +760,91 @@ def _format_alias_delete_preview(alias_text, target_display_name):
             f"✅ Так, видалити\n❌ Скасувати")
 
 
+def _format_alias_bulk_delete_preview(selected, remaining):
+    lines = [f"🧠 Буде видалено домашніх назв: {len(selected)}", ""]
+    lines += [f"{i}. {a['alias_text']} → {a['target_display_name']}" for i, a in enumerate(selected, start=1)]
+    lines.append("")
+    if remaining:
+        lines.append("Залишиться:")
+        lines.append("")
+        lines += [f"• {a['alias_text']} → {a['target_display_name']}" for a in remaining]
+        lines.append("")
+    else:
+        lines.append("Не залишиться жодної домашньої назви.")
+        lines.append("")
+    lines.append("✅ Так, видалити\n❌ Скасувати")
+    return "\n".join(lines)
+
+
 ALIAS_GATE_UNRECOGNIZED_MSG = (
     "Не зміг зрозуміти домашню назву. Напиши, наприклад:\n\n"
     "Запам'ятай, що сливки = Вершки"
 )
 
 
+def _current_alias_origin(chat_id):
+    """Which context an alias command was issued from — the single source of
+    truth for where to return the user after confirm/cancel. This is the
+    real fix for the old "Додавання товарів скасовано" bug: that bug wasn't
+    a stray flag, it was this exact information never being tracked
+    precisely enough to know whether to send MAIN_KEYBOARD, SHOPPING_KEYBOARD
+    or INVENTORY_KEYBOARD back, so no explicit keyboard was sent at all and a
+    stale one-time alias-confirm keyboard was left visible client-side to be
+    pressed again after the flow had already completed.
+
+    Checked in this order: the dedicated aliases submenu; an open saved
+    shopping/inventory list; otherwise the main menu (covers the help screen
+    too, since it sets no special context of its own). The main-menu case is
+    reported as "global" — kept from the previous iteration's naming for this
+    one value since existing tests assert it literally; it is otherwise
+    exactly what the rest of this codebase calls "main menu".
+    """
+    if active_list_context.get(chat_id) == "aliases":
+        return "aliases_menu"
+    ctx = saved_list_context.get(chat_id)
+    if ctx in ("shopping_saved", "inventory_saved"):
+        return ctx
+    return "global"
+
+
 def _alias_origin_keyboard(origin):
-    """ALIASES_KEYBOARD when the action originated from the dedicated
-    submenu; None (no keyboard override) for a global alias command, so it
-    never changes whatever list/menu the user currently has open."""
-    return ALIASES_KEYBOARD if origin == "menu" else None
+    """The correct persistent keyboard to explicitly (re-)send for a given
+    alias-command origin — ALWAYS a concrete keyboard, never None. Sending an
+    explicit keyboard after every alias confirm/cancel (success, failure, or
+    stale-mismatch) is what prevents a stale one-time alias-confirm keyboard
+    from lingering client-side to be pressed again once the flow is done."""
+    if origin == "aliases_menu":
+        return ALIASES_KEYBOARD
+    if origin == "shopping_saved":
+        return SHOPPING_KEYBOARD
+    if origin == "inventory_saved":
+        return INVENTORY_KEYBOARD
+    return MAIN_KEYBOARD
 
 
 def _reply_after_alias_action(chat_id, household_id, origin, message):
     """After a confirmed alias create/update/delete: full refreshed list +
     ALIASES_KEYBOARD when the action originated from the dedicated submenu;
-    a short standalone confirmation with no keyboard override otherwise."""
-    if origin == "menu":
+    the short confirmation plus an explicit return-to-origin keyboard
+    otherwise (main menu / open shopping list / open inventory list)."""
+    if origin == "aliases_menu":
         send_message(chat_id, message)
         send_message(chat_id, format_alias_list(list_household_aliases(household_id)), reply_markup=ALIASES_KEYBOARD)
     else:
-        send_message(chat_id, message)
+        send_message(chat_id, message, reply_markup=_alias_origin_keyboard(origin))
 
 
 def _alias_command_gate(text):
     """Narrow, local gate for global alias commands — usable outside the
     dedicated aliases submenu (main menu, help, open shopping/inventory
     lists). Recognizes only unambiguous alias-management phrasing; it never
-    parses alias_text/target itself and never calls Gemini — that remains
-    entirely the job of the existing Gemini alias router. Kept deliberately
-    narrow so ordinary messages are never mistaken for alias commands.
+    parses alias_text/target/selected aliases itself and never calls Gemini
+    — that remains entirely the job of the existing Gemini alias router.
+    Deliberately NOT a big hand-enumerated phrase list: create/update mapping
+    syntax, the "forget" verb (unambiguous in this bot's domain), and an
+    explicit reference to the aliases topic itself (домашні назви / aliases /
+    синоніми, or "покажи .../мої/товарів назви") are the only signals — a bare
+    "Видали всі" never matches, since it says nothing about names/aliases.
     """
     if not isinstance(text, str):
         return False
@@ -783,45 +854,52 @@ def _alias_command_gate(text):
     lowered = stripped.lower()
     if lowered.startswith(("запам'ятай", "запам’ятай")) and "=" in stripped:
         return True
-    if lowered.startswith("зміни:") and "=" in stripped:
+    if lowered.startswith("зміни") and "=" in stripped:
         return True
     if lowered.startswith("забудь"):
         remainder = stripped[len("забудь"):].strip(" ,:.-")
-        return bool(remainder)
-    if lowered in ("покажи мої назви", "покажи назви товарів"):
+        if remainder:
+            return True
+    if "alias" in lowered or "синонім" in lowered:
+        return True
+    if "назв" in lowered and ("домашн" in lowered or "товар" in lowered or "покажи" in lowered or "мої" in lowered):
         return True
     return False
 
 
-def _handle_alias_command(chat_id, user_id, display_name, text, origin):
-    """Shared alias-router handling for the dedicated aliases submenu
-    (origin="menu") and the global alias command gate (origin="global").
+def _handle_alias_command(chat_id, user_id, display_name, text):
+    """Shared alias-router handling for both the dedicated aliases submenu
+    and the global alias command gate. Origin is derived once via
+    _current_alias_origin and threaded through pending_alias_action so
+    confirm/cancel always know exactly where to return the user.
 
     Returns True if the message was fully handled here (caller must not fall
     through to general AI-chat). Returns False only when intent is "none" and
-    origin == "menu" — the one case allowed to fall through, matching every
-    other router in this file. A global-gate command is never allowed to
-    fall through to AI-chat, even on "none"/"invalid" — the gate already
+    origin == "aliases_menu" — the one case allowed to fall through, matching
+    every other router in this file. A global-gate command is never allowed
+    to fall through to AI-chat, even on "none"/"invalid" — the gate already
     confirmed the text looks like an alias command.
     """
+    origin = _current_alias_origin(chat_id)
+    keyboard = _alias_origin_keyboard(origin)
     try:
         household_id, user_db_id = get_household_and_user(user_id, display_name)
-        router_result = _ask_gemini_alias_router(text)
-        kind, payload = _validate_alias_router_result(router_result)
-        menu_keyboard = _alias_origin_keyboard(origin)
+        aliases = list_household_aliases(household_id)
+        router_result = _ask_gemini_alias_router(text, aliases)
+        kind, payload = _validate_alias_router_result(router_result, aliases)
         if kind == "unresolved":
             lines = ["Не зрозумів частину повідомлення:", ""]
             lines += [f"• «{f}»" for f in payload]
             lines.append("")
             lines.append("Спробуй сформулювати інакше, наприклад: «сливки — це вершки».")
-            send_message(chat_id, "\n".join(lines), reply_markup=menu_keyboard)
+            send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
         elif kind == "list":
-            send_message(chat_id, format_alias_list(list_household_aliases(household_id)), reply_markup=menu_keyboard)
+            send_message(chat_id, format_alias_list(aliases), reply_markup=keyboard)
         elif kind == "invalid":
-            if origin == "menu":
+            if origin == "aliases_menu":
                 send_message(chat_id, "Не зміг безпечно зрозуміти правило. Спробуй написати, наприклад: «сливки — це вершки».")
             else:
-                send_message(chat_id, ALIAS_GATE_UNRECOGNIZED_MSG)
+                send_message(chat_id, ALIAS_GATE_UNRECOGNIZED_MSG, reply_markup=keyboard)
         elif kind == "create_or_update":
             alias_text = router_result["alias_text"].strip()
             target_display_name = router_result["target_display_name"].strip()
@@ -849,7 +927,7 @@ def _handle_alias_command(chat_id, user_id, display_name, text, origin):
         elif kind == "delete":
             existing = get_household_alias(household_id, payload)
             if existing is None:
-                send_message(chat_id, "Не знайшов такого правила серед домашніх назв.", reply_markup=menu_keyboard)
+                send_message(chat_id, "Не знайшов такого правила серед домашніх назв.", reply_markup=keyboard)
             else:
                 pending_alias_action[chat_id] = {
                     "kind": "delete", "household_id": household_id, "user_db_id": user_db_id,
@@ -861,13 +939,30 @@ def _handle_alias_command(chat_id, user_id, display_name, text, origin):
                     _format_alias_delete_preview(existing["alias_text"], existing["target_display_name"]),
                     reply_markup=ALIAS_DELETE_CONFIRM_KEYBOARD,
                 )
+        elif kind == "delete_aliases":
+            selected = payload
+            selected_ids = {a["id"] for a in selected}
+            remaining = [a for a in aliases if a["id"] not in selected_ids]
+            pending_alias_action[chat_id] = {
+                "kind": "bulk_delete", "household_id": household_id, "user_db_id": user_db_id,
+                "targets": [
+                    {"id": a["id"], "target_display_name": a["target_display_name"], "target_canonical_name": a["target_canonical_name"]}
+                    for a in selected
+                ],
+                "origin": origin,
+            }
+            send_message(
+                chat_id,
+                _format_alias_bulk_delete_preview(selected, remaining),
+                reply_markup=ALIAS_DELETE_CONFIRM_KEYBOARD,
+            )
         elif kind == "none":
-            if origin == "menu":
+            if origin == "aliases_menu":
                 return False
-            send_message(chat_id, ALIAS_GATE_UNRECOGNIZED_MSG)
+            send_message(chat_id, ALIAS_GATE_UNRECOGNIZED_MSG, reply_markup=keyboard)
         return True
     except Exception:
-        send_message(chat_id, "Не вдалося виконати дію з домашніми назвами. Спробуй ще раз трохи пізніше.")
+        send_message(chat_id, "Не вдалося виконати дію з домашніми назвами. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
         return True
 
 
@@ -1458,14 +1553,40 @@ def _validate_alias_action(alias_text, target_display_name):
     return alias_normalized
 
 
-def _validate_alias_router_result(router_result):
+def _validate_alias_bulk_delete(selected_numbers, aliases):
+    """Pure validation for delete_aliases against the current household alias
+    list (already household-scoped by the caller via list_household_aliases).
+    Checks: list non-empty, every number exists, duplicates removed, order
+    matches the CURRENT alias list order (not whatever order Gemini gave).
+    Returns ("ok", [alias dicts in list order]) or ("invalid", None).
+    """
+    if not isinstance(selected_numbers, list) or not selected_numbers:
+        return "invalid", None
+    total = len(aliases)
+    seen = set()
+    for n in selected_numbers:
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1 or n > total:
+            return "invalid", None
+        seen.add(n)
+    if not seen:
+        return "invalid", None
+    selected = [aliases[i - 1] for i in range(1, total + 1) if i in seen]
+    return "ok", selected
+
+
+def _validate_alias_router_result(router_result, aliases=None):
     """Pure decision logic for the alias router's JSON. Returns one of:
       ("unresolved", [fragment,...])   -- blocks any change regardless of intent
       ("list", None)
       ("create_or_update", alias_normalized)
       ("delete", alias_normalized)
-      ("invalid", None)                -- create_or_update/delete with unusable text
+      ("delete_aliases", [alias dicts, in current list order])
+      ("invalid", None)                -- create_or_update/delete/delete_aliases with unusable input
       ("none", None)
+
+    `aliases` (the current household's alias list) is only required for
+    delete_aliases — optional/defaulted so every other intent keeps working
+    exactly as before for callers that don't pass it.
     """
     fragments = router_result.get("unresolved_fragments")
     if isinstance(fragments, list):
@@ -1481,6 +1602,9 @@ def _validate_alias_router_result(router_result):
     if intent == "delete":
         alias_normalized = normalize_alias_text(router_result.get("alias_text"))
         return ("delete", alias_normalized) if alias_normalized else ("invalid", None)
+    if intent == "delete_aliases":
+        kind, payload = _validate_alias_bulk_delete(router_result.get("selected_numbers"), aliases or [])
+        return ("delete_aliases", payload) if kind == "ok" else ("invalid", None)
     return "none", None
 
 
@@ -2180,13 +2304,26 @@ def _ask_gemini_saved_list_router(user_text, items, context_type):
         return dict(_SAVED_LIST_ROUTER_FALLBACK)
 
 
-_ALIAS_ROUTER_FALLBACK = {"intent": "none", "alias_text": None, "target_display_name": None, "unresolved_fragments": []}
+_ALIAS_ROUTER_FALLBACK = {
+    "intent": "none", "alias_text": None, "target_display_name": None,
+    "selected_numbers": [], "unresolved_fragments": [],
+}
 
 
-def _ask_gemini_alias_router(user_text):
-    """ONE Gemini call per message in aliases mode. Gemini never touches SQL —
-    it only classifies intent and extracts alias_text/target_display_name."""
-    raw = call_gemini([{"role": "user", "content": f"Користувач написав: {user_text}"}], ALIAS_ROUTER_PROMPT, temperature=0.1)
+def _ask_gemini_alias_router(user_text, aliases=None):
+    """ONE Gemini call per message in aliases mode (or via the global gate).
+    `aliases` (from list_household_aliases, optional) is the current
+    household's alias list — passed so Gemini can select existing aliases by
+    number for bulk delete_aliases actions. Gemini never touches SQL — it
+    only classifies intent and extracts alias_text/target_display_name/
+    selected_numbers."""
+    aliases = aliases or []
+    lines = [f"{i}. {a['alias_text']} → {a['target_display_name']}" for i, a in enumerate(aliases, start=1)]
+    prompt = (
+        ("Поточні домашні назви:\n" + "\n".join(lines) if lines else "Домашніх назв поки немає.")
+        + f"\n\nКористувач написав: {user_text}"
+    )
+    raw = call_gemini([{"role": "user", "content": prompt}], ALIAS_ROUTER_PROMPT, temperature=0.1)
     if not raw:
         return dict(_ALIAS_ROUTER_FALLBACK)
     cleaned = raw.strip()
@@ -2200,6 +2337,7 @@ def _ask_gemini_alias_router(user_text):
             "intent": data.get("intent", "none"),
             "alias_text": data.get("alias_text"),
             "target_display_name": data.get("target_display_name"),
+            "selected_numbers": data.get("selected_numbers") if isinstance(data.get("selected_numbers"), list) else [],
             "unresolved_fragments": data.get("unresolved_fragments") if isinstance(data.get("unresolved_fragments"), list) else [],
         }
     except (json.JSONDecodeError, ValueError, TypeError):
@@ -2594,7 +2732,8 @@ def webhook():
             send_message(chat_id, "Дію скасовано.", reply_markup=SHOPPING_KEYBOARD)
         elif chat_id in pending_alias_action:
             alias_data = pending_alias_action.pop(chat_id, None)
-            send_message(chat_id, "Дію скасовано.", reply_markup=_alias_origin_keyboard((alias_data or {}).get("origin", "menu")))
+            origin = (alias_data or {}).get("origin", "global")
+            send_message(chat_id, "Дію з домашніми назвами скасовано.", reply_markup=_alias_origin_keyboard(origin))
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -2661,21 +2800,36 @@ def webhook():
                 send_message(chat_id, DB_ERROR_MSG)
         elif chat_id in pending_alias_action:
             data = pending_alias_action.pop(chat_id)
-            origin = data.get("origin", "menu")
-            if data.get("kind") == "delete":
+            origin = data.get("origin", "global")
+            kind = data.get("kind")
+            if kind == "delete":
                 try:
                     delete_household_alias(data["household_id"], data["alias_normalized"])
                     _reply_after_alias_action(chat_id, data["household_id"], origin, "✅ Видалив.")
                 except Exception:
                     send_message(chat_id, "Не вдалося видалити назву. Спробуй ще раз трохи пізніше.", reply_markup=_alias_origin_keyboard(origin))
+            elif kind == "bulk_delete":
+                try:
+                    count = delete_household_aliases_batch(data["household_id"], data["targets"])
+                    _reply_after_alias_action(chat_id, data["household_id"], origin, f"✅ Видалено домашніх назв: {count}.")
+                except StaleSnapshotError:
+                    send_message(
+                        chat_id,
+                        "Список домашніх назв змінився з іншого пристрою. Онови список і повтори дію.",
+                        reply_markup=_alias_origin_keyboard(origin),
+                    )
+                except Exception:
+                    send_message(chat_id, "Не вдалося видалити назви. Спробуй ще раз трохи пізніше.", reply_markup=_alias_origin_keyboard(origin))
             else:
                 send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
+        else:
+            send_message(chat_id, "Немає активної дії для підтвердження.")
         return "ok"
 
     if text == "✅ Так, запам'ятати":
         if chat_id in pending_alias_action:
             data = pending_alias_action.pop(chat_id)
-            origin = data.get("origin", "menu")
+            origin = data.get("origin", "global")
             if data.get("kind") == "create":
                 try:
                     create_or_update_household_alias(data["household_id"], data["alias_text"], data["target_display_name"], data["user_db_id"])
@@ -2684,12 +2838,14 @@ def webhook():
                     send_message(chat_id, "Не вдалося зберегти назву. Спробуй ще раз трохи пізніше.", reply_markup=_alias_origin_keyboard(origin))
             else:
                 send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
+        else:
+            send_message(chat_id, "Немає активної дії для підтвердження.")
         return "ok"
 
     if text == "✅ Так, змінити":
         if chat_id in pending_alias_action:
             data = pending_alias_action.pop(chat_id)
-            origin = data.get("origin", "menu")
+            origin = data.get("origin", "global")
             if data.get("kind") == "update":
                 try:
                     create_or_update_household_alias(data["household_id"], data["alias_text"], data["target_display_name"], data["user_db_id"])
@@ -2698,6 +2854,8 @@ def webhook():
                     send_message(chat_id, "Не вдалося змінити назву. Спробуй ще раз трохи пізніше.", reply_markup=_alias_origin_keyboard(origin))
             else:
                 send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
+        else:
+            send_message(chat_id, "Немає активної дії для підтвердження.")
         return "ok"
 
     if text == "✅ Так, прибрати":
@@ -3378,7 +3536,7 @@ def webhook():
             _preview_intercepted = True
 
     elif active_list_context.get(chat_id) == "aliases":
-        if _handle_alias_command(chat_id, user_id, display_name, text, origin="menu"):
+        if _handle_alias_command(chat_id, user_id, display_name, text):
             _preview_intercepted = True
         # else: intent was "none" — fall through to AI chat, same as every other router here.
 
@@ -3386,8 +3544,9 @@ def webhook():
         # Global alias command gate — narrow, local, no Gemini call here. Fires
         # from anywhere (main menu, help, open shopping/inventory lists) but
         # never overrides an active preview/confirm/mode and never touches
-        # saved_list_context.
-        _handle_alias_command(chat_id, user_id, display_name, text, origin="global")
+        # saved_list_context. _handle_alias_command derives the precise
+        # origin (main menu vs open shopping/inventory list) itself.
+        _handle_alias_command(chat_id, user_id, display_name, text)
         _preview_intercepted = True
 
     else:
