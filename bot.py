@@ -31,7 +31,10 @@ from database import (
     save_list_context,
     get_list_context,
     clear_list_context,
+    StaleSnapshotError,
 )
+
+STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
 # =========================
 # ENV
@@ -1139,7 +1142,9 @@ def _compute_saved_merge_groups(merge_groups_raw, items):
 
 
 def _validate_saved_updates(updates, items):
-    """Validate Gemini saved list edit updates. Returns list of valid updates (with item_id) or None."""
+    """Validate Gemini saved list edit updates. Returns list of valid updates (with
+    item_id plus old_value/old_unit — the snapshot quantity at preview time, used to
+    detect a stale precondition at confirm time) or None."""
     if not isinstance(updates, list) or not updates:
         return None
     total = len(items)
@@ -1169,6 +1174,8 @@ def _validate_saved_updates(updates, items):
             "name": name,
             "quantity_text": qty,
             "category": cat,
+            "old_value": items[num - 1].get("quantity_value"),
+            "old_unit": items[num - 1].get("quantity_unit"),
         })
     return valid
 
@@ -1901,6 +1908,28 @@ def _snapshot_is_stale(item_ids, current_items):
     return not set(item_ids).issubset(current_ids)
 
 
+def _snapshot_targets(items):
+    """Build a {item_id, quantity_value, quantity_unit} snapshot-target list for the
+    shared stale-precondition guard (database._verify_targets_in_tx). This is the one
+    reusable mechanism every confirm-flow uses to describe "what did these target rows
+    look like when the preview was built" — the actual check-and-mutate happens inside
+    a single transaction on the database side, never as a separate pre-check.
+
+    Accepts either raw inventory/shopping item dicts (id, quantity_value, quantity_unit,
+    as returned by get_inventory_items/get_active_shopping_items) or already-resolved
+    change dicts (item_id, old_value, old_unit, as built by _validate_consumptions/
+    _validate_compound_operations/_validate_reconcile_snapshot/_validate_saved_updates)
+    — whichever shape is present.
+    """
+    targets = []
+    for it in items:
+        item_id = it["item_id"] if "item_id" in it else it["id"]
+        value = it["old_value"] if "old_value" in it else it.get("quantity_value")
+        unit = it["old_unit"] if "old_unit" in it else it.get("quantity_unit")
+        targets.append({"item_id": item_id, "quantity_value": value, "quantity_unit": unit})
+    return targets
+
+
 def _should_restore_persisted_context(chat_id):
     """True if there's no RAM saved_list_context and no other active preview
     or special mode that must take priority over restoring a persisted context.
@@ -2206,12 +2235,9 @@ def webhook():
         if chat_id in pending_mark_batch:
             mark_data = pending_mark_batch.pop(chat_id)
             try:
-                current_items = get_active_shopping_items(mark_data["household_id"])
                 item_ids = [item["id"] for item in mark_data["items"]]
-                if _snapshot_is_stale(item_ids, current_items):
-                    send_message(chat_id, "Список змінився з іншого пристрою. Онови список і повтори дію.", reply_markup=SHOPPING_KEYBOARD)
-                    return "ok"
-                count = mark_items_batch(item_ids, mark_data["user_db_id"])
+                targets = _snapshot_targets(mark_data["items"])
+                count = mark_items_batch(mark_data["household_id"], item_ids, mark_data["user_db_id"], targets)
                 for item in mark_data["items"]:
                     add_or_merge_inventory_item(
                         mark_data["household_id"],
@@ -2225,6 +2251,8 @@ def webhook():
                         quantity_inferred=item.get("quantity_inferred", False),
                     )
                 send_message(chat_id, f"✅ Куплено й додано до запасів: {count}", reply_markup=SHOPPING_KEYBOARD)
+            except StaleSnapshotError:
+                send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=SHOPPING_KEYBOARD)
             except Exception:
                 send_message(chat_id, "Не вдалося завершити покупку. Спробуйте ще раз трохи пізніше.")
         return "ok"
@@ -2233,13 +2261,12 @@ def webhook():
         if chat_id in pending_mark_batch:
             mark_data = pending_mark_batch.pop(chat_id)
             try:
-                current_items = get_active_shopping_items(mark_data["household_id"])
                 item_ids = [item["id"] for item in mark_data["items"]]
-                if _snapshot_is_stale(item_ids, current_items):
-                    send_message(chat_id, "Список змінився з іншого пристрою. Онови список і повтори дію.", reply_markup=SHOPPING_KEYBOARD)
-                    return "ok"
-                count = mark_items_batch(item_ids, mark_data["user_db_id"])
+                targets = _snapshot_targets(mark_data["items"])
+                count = mark_items_batch(mark_data["household_id"], item_ids, mark_data["user_db_id"], targets)
                 send_message(chat_id, f"✅ Позначено купленими: {count}", reply_markup=SHOPPING_KEYBOARD)
+            except StaleSnapshotError:
+                send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=SHOPPING_KEYBOARD)
             except Exception:
                 send_message(chat_id, "Не вдалося завершити покупку. Спробуйте ще раз трохи пізніше.")
         return "ok"
@@ -2248,13 +2275,12 @@ def webhook():
         if chat_id in pending_delete_batch:
             del_data = pending_delete_batch.pop(chat_id)
             try:
-                current_items = get_active_shopping_items(del_data["household_id"])
                 item_ids = [item["id"] for item in del_data["items"]]
-                if _snapshot_is_stale(item_ids, current_items):
-                    send_message(chat_id, "Список змінився з іншого пристрою. Онови список і повтори дію.", reply_markup=SHOPPING_KEYBOARD)
-                    return "ok"
-                count = delete_items_batch(item_ids)
+                targets = _snapshot_targets(del_data["items"])
+                count = delete_items_batch(del_data["household_id"], item_ids, targets)
                 send_message(chat_id, f"🗑️ Видалено зі списку: {count}", reply_markup=SHOPPING_KEYBOARD)
+            except StaleSnapshotError:
+                send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=SHOPPING_KEYBOARD)
             except Exception:
                 send_message(chat_id, DB_ERROR_MSG)
         return "ok"
@@ -2263,13 +2289,12 @@ def webhook():
         if chat_id in pending_remove_batch:
             rem_data = pending_remove_batch.pop(chat_id)
             try:
-                current_items = get_inventory_items(rem_data["household_id"])
                 item_ids = [item["id"] for item in rem_data["items"]]
-                if _snapshot_is_stale(item_ids, current_items):
-                    send_message(chat_id, "Список змінився з іншого пристрою. Онови список і повтори дію.", reply_markup=INVENTORY_KEYBOARD)
-                    return "ok"
-                count = delete_inventory_items_batch(item_ids)
+                targets = _snapshot_targets(rem_data["items"])
+                count = delete_inventory_items_batch(rem_data["household_id"], item_ids, targets)
                 send_message(chat_id, f"✅ Прибрано із запасів: {count}", reply_markup=INVENTORY_KEYBOARD)
+            except StaleSnapshotError:
+                send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=INVENTORY_KEYBOARD)
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
@@ -2303,25 +2328,13 @@ def webhook():
             valid_updates = edit_data["validated_updates"]
             keyboard = SHOPPING_KEYBOARD if ctx == "shopping_saved" else INVENTORY_KEYBOARD
             try:
-                current_items = (
-                    get_active_shopping_items(household_id)
-                    if ctx == "shopping_saved"
-                    else get_inventory_items(household_id)
-                )
-                current_ids = {it["id"] for it in current_items}
-                required_ids = {upd["item_id"] for upd in valid_updates}
-                if not required_ids.issubset(current_ids):
-                    send_message(
-                        chat_id,
-                        "Список змінився з іншого пристрою. Онови список і повтори дію.",
-                        reply_markup=keyboard,
-                    )
-                    return "ok"
                 if ctx == "shopping_saved":
                     update_shopping_items_batch(household_id, valid_updates)
                 else:
                     update_inventory_items_batch(household_id, valid_updates)
                 send_message(chat_id, "✅ Зміни застосовано.", reply_markup=keyboard)
+            except StaleSnapshotError:
+                send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=keyboard)
             except Exception:
                 send_message(chat_id, DB_ERROR_MSG if ctx == "shopping_saved" else INVENTORY_ERROR_MSG)
         elif chat_id in pending_inventory_consumption:
@@ -2329,21 +2342,7 @@ def webhook():
             household_id = consume_data["household_id"]
             resolved = consume_data["resolved"]
             try:
-                current_items = get_inventory_items(household_id)
-                current_by_id = {it["id"]: it for it in current_items}
-                stale = False
-                for r in resolved:
-                    cur = current_by_id.get(r["item_id"])
-                    if cur is None or cur.get("quantity_value") != r["old_value"] or cur.get("quantity_unit") != r["old_unit"]:
-                        stale = True
-                        break
-                if stale:
-                    send_message(
-                        chat_id,
-                        "Список змінився з іншого пристрою. Онови список і повтори дію.",
-                        reply_markup=INVENTORY_KEYBOARD,
-                    )
-                    return "ok"
+                targets = _snapshot_targets(resolved)
                 updates = [
                     {
                         "item_id": r["item_id"],
@@ -2354,8 +2353,10 @@ def webhook():
                     for r in resolved if not r["will_remove"]
                 ]
                 delete_ids = [r["item_id"] for r in resolved if r["will_remove"]]
-                updated, deleted = apply_inventory_consumption(household_id, updates, delete_ids)
+                updated, deleted = apply_inventory_consumption(household_id, updates, delete_ids, targets)
                 send_message(chat_id, f"✅ Оновлено запасів: {updated + deleted}", reply_markup=INVENTORY_KEYBOARD)
+            except StaleSnapshotError:
+                send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=INVENTORY_KEYBOARD)
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
@@ -2368,14 +2369,7 @@ def webhook():
             inventory_changes = compound_data["inventory_changes"]
             add_to_shopping = compound_data["add_to_shopping"]
             try:
-                current_items = get_inventory_items(household_id)
-                if _compound_snapshot_is_stale(inventory_changes, current_items):
-                    send_message(
-                        chat_id,
-                        "Список змінився з іншого пристрою. Онови запаси й повтори дію.",
-                        reply_markup=INVENTORY_KEYBOARD,
-                    )
-                    return "ok"
+                targets = _snapshot_targets(inventory_changes)
                 consume_updates = [
                     {
                         "item_id": c["item_id"],
@@ -2387,7 +2381,7 @@ def webhook():
                 ]
                 delete_ids = [c["item_id"] for c in inventory_changes if c["will_remove"]]
                 inv_updated, inv_deleted, shopping_added = apply_compound_inventory_operations(
-                    household_id, user_db_id, consume_updates, delete_ids, add_to_shopping
+                    household_id, user_db_id, consume_updates, delete_ids, add_to_shopping, targets
                 )
                 if shopping_added:
                     send_message(
@@ -2402,6 +2396,8 @@ def webhook():
                         f"✅ Зміни запасів застосовано: {inv_updated + inv_deleted}",
                         reply_markup=INVENTORY_KEYBOARD,
                     )
+            except StaleSnapshotError:
+                send_message(chat_id, "Список змінився з іншого пристрою. Онови запаси й повтори дію.", reply_markup=INVENTORY_KEYBOARD)
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"
@@ -2412,14 +2408,7 @@ def webhook():
             household_id = recon_data["household_id"]
             user_db_id = recon_data["user_db_id"]
             try:
-                current_items = get_inventory_items(household_id)
-                if _compound_snapshot_is_stale(recon_data["updates"] + recon_data["deletes"], current_items):
-                    send_message(
-                        chat_id,
-                        "Список змінився з іншого пристрою. Онови запаси й повтори звіряння.",
-                        reply_markup=INVENTORY_KEYBOARD,
-                    )
-                    return "ok"
+                targets = _snapshot_targets(recon_data["updates"] + recon_data["deletes"])
                 updates_for_db = [
                     {
                         "item_id": u["item_id"],
@@ -2431,10 +2420,16 @@ def webhook():
                 ]
                 delete_ids = [d["item_id"] for d in recon_data["deletes"]]
                 apply_inventory_reconciliation(
-                    household_id, user_db_id, updates_for_db, recon_data["additions"], delete_ids
+                    household_id, user_db_id, updates_for_db, recon_data["additions"], delete_ids, targets
                 )
                 send_message(chat_id, "✅ Запаси звірено.", reply_markup=INVENTORY_KEYBOARD)
                 send_message(chat_id, format_inventory_list(get_inventory_items(household_id)))
+            except StaleSnapshotError:
+                send_message(
+                    chat_id,
+                    "Список змінився з іншого пристрою. Онови запаси й повтори звіряння.",
+                    reply_markup=INVENTORY_KEYBOARD,
+                )
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         return "ok"

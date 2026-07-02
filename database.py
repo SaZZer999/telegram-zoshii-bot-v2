@@ -586,6 +586,56 @@ def _merge_or_insert_inventory_in_tx(cur, household_id, user_db_id, name, qty_te
     )
 
 # =========================
+# STALE SNAPSHOT PROTECTION
+#
+# Shared guard reused by every confirm-flow that mutates or removes existing
+# rows based on a snapshot captured earlier (when a preview was built). The
+# check and the mutation always happen inside the same transaction/cursor —
+# never a separate SELECT beforehand — so there is no gap between "verify"
+# and "write" for a concurrent change from another device to slip into.
+# =========================
+
+class StaleSnapshotError(Exception):
+    """Raised inside an open transaction when a confirmed household action's
+    target rows no longer match the snapshot captured when its preview was
+    built (edited or removed from another device/session in the meantime).
+
+    Raising this aborts the whole transaction (the caller's `with get_connection()`
+    block rolls back automatically since the exception propagates out of it) —
+    nothing from the action is applied, not even partially.
+    """
+    pass
+
+
+def _verify_targets_in_tx(cur, table, household_id, targets):
+    """Re-read `targets` for `table` ("shopping_items" or "inventory_items")
+    inside the caller's open transaction and lock the rows (FOR UPDATE) so no
+    concurrent write can slip in before this transaction commits. Raises
+    StaleSnapshotError if any target row is missing or its quantity_value/
+    quantity_unit no longer match the snapshot. No-ops for empty/None targets.
+
+    targets: list of dicts with item_id, quantity_value, quantity_unit — the
+    values captured when the preview/snapshot was built.
+    """
+    if not targets:
+        return
+    ids = [t["item_id"] for t in targets]
+    placeholders = ",".join(["%s"] * len(ids))
+    cur.execute(
+        f"SELECT id, quantity_value, quantity_unit FROM {table} "
+        f"WHERE id IN ({placeholders}) AND household_id=%s FOR UPDATE",
+        list(ids) + [household_id],
+    )
+    current = {
+        row[0]: (float(row[1]) if row[1] is not None else None, row[2])
+        for row in cur.fetchall()
+    }
+    for t in targets:
+        seen = current.get(t["item_id"])
+        if seen is None or seen != (t.get("quantity_value"), t.get("quantity_unit")):
+            raise StaleSnapshotError()
+
+# =========================
 # BATCH ADD
 # =========================
 
@@ -646,31 +696,45 @@ def add_or_merge_inventory_item(household_id, created_by_user_id, name, quantity
 # MARK / DELETE BATCH
 # =========================
 
-def mark_items_batch(item_ids, completed_by_user_id):
-    """Mark multiple items as completed in one transaction. Returns count of updated rows."""
+def mark_items_batch(household_id, item_ids, completed_by_user_id, targets=None):
+    """Mark multiple items as completed in one transaction. Returns count of updated rows.
+
+    targets (optional): snapshot of {item_id, quantity_value, quantity_unit} for
+    each item_id, captured when the preview was built. Verified for staleness
+    inside this same transaction before anything is written — raises
+    StaleSnapshotError (transaction rolled back, nothing applied) if any
+    target no longer matches the live row.
+    """
     if not item_ids:
         return 0
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "shopping_items", household_id, targets)
             placeholders = ",".join(["%s"] * len(item_ids))
             cur.execute(
-                f"UPDATE shopping_items SET is_completed = TRUE, completed_by_user_id = %s, completed_at = NOW() WHERE id IN ({placeholders}) AND is_completed = FALSE",
-                [completed_by_user_id] + list(item_ids)
+                f"UPDATE shopping_items SET is_completed = TRUE, completed_by_user_id = %s, completed_at = NOW() "
+                f"WHERE id IN ({placeholders}) AND household_id = %s AND is_completed = FALSE",
+                [completed_by_user_id] + list(item_ids) + [household_id]
             )
             count = cur.rowcount
         conn.commit()
     return count
 
-def delete_items_batch(item_ids):
-    """Delete multiple shopping items in one transaction. Returns count of deleted rows."""
+def delete_items_batch(household_id, item_ids, targets=None):
+    """Delete multiple shopping items in one transaction. Returns count of deleted rows.
+
+    targets (optional): see mark_items_batch — verified for staleness inside
+    this same transaction before anything is deleted.
+    """
     if not item_ids:
         return 0
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "shopping_items", household_id, targets)
             placeholders = ",".join(["%s"] * len(item_ids))
             cur.execute(
-                f"DELETE FROM shopping_items WHERE id IN ({placeholders}) AND is_completed = FALSE",
-                list(item_ids)
+                f"DELETE FROM shopping_items WHERE id IN ({placeholders}) AND household_id = %s AND is_completed = FALSE",
+                list(item_ids) + [household_id]
             )
             count = cur.rowcount
         conn.commit()
@@ -687,28 +751,39 @@ def delete_inventory_item_by_id(item_id):
         conn.commit()
     return row[0] if row else None
 
-def delete_inventory_items_batch(item_ids):
-    """Delete multiple inventory items in one transaction. Returns count of deleted rows."""
+def delete_inventory_items_batch(household_id, item_ids, targets=None):
+    """Delete multiple inventory items in one transaction. Returns count of deleted rows.
+
+    targets (optional): see mark_items_batch — verified for staleness inside
+    this same transaction before anything is deleted. This is what prevents a
+    stale "remove everything" preview from deleting a row whose quantity was
+    changed by another device after the preview was built.
+    """
     if not item_ids:
         return 0
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, targets)
             placeholders = ",".join(["%s"] * len(item_ids))
             cur.execute(
-                f"DELETE FROM inventory_items WHERE id IN ({placeholders})",
-                list(item_ids)
+                f"DELETE FROM inventory_items WHERE id IN ({placeholders}) AND household_id = %s",
+                list(item_ids) + [household_id]
             )
             count = cur.rowcount
         conn.commit()
     return count
 
-def apply_inventory_consumption(household_id, updates, delete_item_ids):
+def apply_inventory_consumption(household_id, updates, delete_item_ids, targets=None):
     """Apply partial consumption updates and full removals in a single transaction.
 
     updates: list of {item_id, quantity_value, quantity_unit, quantity_text} — sets
     structured quantity fields directly (already computed by the caller), unlike
     update_inventory_items_batch which re-derives them from free text.
     delete_item_ids: item ids consumed down to zero, deleted entirely.
+    targets (optional): snapshot of {item_id, quantity_value, quantity_unit} for
+    every item this consumption touches (both partially reduced and deleted
+    outright) — verified for staleness inside this same transaction before
+    anything is written.
     Returns (updated_count, deleted_count).
     """
     if not updates and not delete_item_ids:
@@ -717,6 +792,7 @@ def apply_inventory_consumption(household_id, updates, delete_item_ids):
     deleted = 0
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, targets)
             for upd in updates:
                 cur.execute(
                     "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
@@ -735,7 +811,7 @@ def apply_inventory_consumption(household_id, updates, delete_item_ids):
         conn.commit()
     return updated, deleted
 
-def apply_compound_inventory_operations(household_id, user_db_id, consume_updates, delete_item_ids, shopping_items):
+def apply_compound_inventory_operations(household_id, user_db_id, consume_updates, delete_item_ids, shopping_items, targets=None):
     """Apply partial consumption, full removal, and shopping-list additions in one transaction.
 
     consume_updates: list of {item_id, quantity_value, quantity_unit, quantity_text} — sets
@@ -745,6 +821,10 @@ def apply_compound_inventory_operations(household_id, user_db_id, consume_update
     shopping_items: item dicts (name, category, canonical_name, quantity_value,
     quantity_unit, quantity_inferred) merged/inserted into shopping_items using the same
     safe merge rules as add_shopping_items_batch.
+    targets (optional): snapshot of {item_id, quantity_value, quantity_unit} for every
+    inventory item this batch touches (consume + remove operations) — verified for
+    staleness inside this same transaction before anything is written. New shopping_items
+    are plain inserts/merges and need no staleness check.
     Returns (inventory_updated_count, inventory_deleted_count, shopping_added_count).
     """
     if not consume_updates and not delete_item_ids and not shopping_items:
@@ -753,6 +833,7 @@ def apply_compound_inventory_operations(household_id, user_db_id, consume_update
     deleted = 0
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, targets)
             for upd in consume_updates:
                 cur.execute(
                     "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
@@ -782,7 +863,7 @@ def apply_compound_inventory_operations(household_id, user_db_id, consume_update
         conn.commit()
     return updated, deleted, len(shopping_items)
 
-def apply_inventory_reconciliation(household_id, user_db_id, updates, insert_items, delete_item_ids):
+def apply_inventory_reconciliation(household_id, user_db_id, updates, insert_items, delete_item_ids, targets=None):
     """Apply a full inventory snapshot reconciliation (updates + deletes + inserts)
     in one transaction. Mirrors apply_compound_inventory_operations's shape.
 
@@ -791,6 +872,10 @@ def apply_inventory_reconciliation(household_id, user_db_id, updates, insert_ite
     insert_items: item dicts (name, category, canonical_name, quantity_value,
     quantity_unit, quantity_inferred) merged/inserted via _merge_or_insert_inventory_in_tx.
     delete_item_ids: inventory item ids to delete entirely.
+    targets (optional): snapshot of {item_id, quantity_value, quantity_unit} for every
+    item this reconciliation touches (updates + deletes) — verified for staleness
+    inside this same transaction before anything is written. New insert_items are
+    plain inserts/merges and need no staleness check.
     Returns (updated_count, deleted_count, inserted_count).
     """
     if not updates and not delete_item_ids and not insert_items:
@@ -799,6 +884,7 @@ def apply_inventory_reconciliation(household_id, user_db_id, updates, insert_ite
     deleted = 0
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, targets)
             for upd in updates:
                 cur.execute(
                     "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
@@ -877,14 +963,23 @@ def execute_merge_shopping(household_id, validated_groups):
 def update_shopping_items_batch(household_id, updates):
     """Update name/quantity_text/category for multiple active shopping items in one transaction.
 
-    Each update: {item_id, name (or None), quantity_text (or None), category (or None)}.
-    Only non-None fields are changed. Returns count of rows updated.
+    Each update: {item_id, name (or None), quantity_text (or None), category (or None),
+    old_value (or None), old_unit (or None)}. Only non-None name/quantity_text/category
+    fields are changed. old_value/old_unit are the snapshot quantity captured when the
+    preview was built — every update entry is re-verified against the live row inside
+    this same transaction before anything is written (StaleSnapshotError + rollback if
+    any target changed or vanished). Returns count of rows updated.
     """
     if not updates:
         return 0
     updated = 0
     with get_connection() as conn:
         with conn.cursor() as cur:
+            targets = [
+                {"item_id": upd["item_id"], "quantity_value": upd.get("old_value"), "quantity_unit": upd.get("old_unit")}
+                for upd in updates
+            ]
+            _verify_targets_in_tx(cur, "shopping_items", household_id, targets)
             for upd in updates:
                 sets, params = [], []
                 if upd.get("name") is not None:
@@ -922,14 +1017,23 @@ def update_shopping_items_batch(household_id, updates):
 def update_inventory_items_batch(household_id, updates):
     """Update name/quantity_text/category for multiple inventory items in one transaction.
 
-    Each update: {item_id, name (or None), quantity_text (or None), category (or None)}.
-    Only non-None fields are changed. Returns count of rows updated.
+    Each update: {item_id, name (or None), quantity_text (or None), category (or None),
+    old_value (or None), old_unit (or None)}. Only non-None name/quantity_text/category
+    fields are changed. old_value/old_unit are the snapshot quantity captured when the
+    preview was built — every update entry is re-verified against the live row inside
+    this same transaction before anything is written (StaleSnapshotError + rollback if
+    any target changed or vanished). Returns count of rows updated.
     """
     if not updates:
         return 0
     updated = 0
     with get_connection() as conn:
         with conn.cursor() as cur:
+            targets = [
+                {"item_id": upd["item_id"], "quantity_value": upd.get("old_value"), "quantity_unit": upd.get("old_unit")}
+                for upd in updates
+            ]
+            _verify_targets_in_tx(cur, "inventory_items", household_id, targets)
             for upd in updates:
                 sets, params = [], []
                 if upd.get("name") is not None:
