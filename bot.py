@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sys
 from collections import deque
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -44,6 +45,7 @@ from database import (
     get_recent_expenses_for_deletion,
     delete_expense,
 )
+import expenses
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -98,9 +100,12 @@ pending_compound_inventory = {}  # chat_id -> {inventory_changes, add_to_shoppin
 pending_inventory_reconciliation = {}  # chat_id -> {updates, additions, deletes, household_id, user_db_id}
 pending_inventory_reconciliation_clarify = {}  # chat_id -> {ambiguous_group, rest, household_id, user_db_id}
 pending_alias_action = {}     # chat_id -> {kind: "create"|"update"|"delete", household_id, user_db_id, alias_text, target_display_name, alias_normalized (delete only)}
-pending_expense = {}          # chat_id -> {household_id, user_db_id, amount, currency, category, description, expense_date, origin}
-pending_expense_delete = {}   # chat_id -> {expense_id, household_id, snapshot: {amount, category, expense_date, description}, origin}
-expense_delete_selection = {}  # chat_id -> {household_id, user_db_id, expenses: [snapshot list from get_recent_expenses_for_deletion], origin}
+# Expense pending state now lives in expenses.py — re-exported here (same
+# dict objects, not copies) so every existing bot.<name> reference/test
+# keeps working unchanged.
+pending_expense = expenses.pending_expense
+pending_expense_delete = expenses.pending_expense_delete
+expense_delete_selection = expenses.expense_delete_selection
 
 # Every OTHER flow's pending preview/confirm state — deliberately excludes
 # pending_alias_action itself (a new global alias command is allowed to
@@ -243,12 +248,6 @@ _UA_MONTHS_GENITIVE = [
     "січня", "лютого", "березня", "квітня", "травня", "червня",
     "липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
 ]
-_UA_MONTHS_NOMINATIVE = [
-    "січень", "лютий", "березень", "квітень", "травень", "червень",
-    "липень", "серпень", "вересень", "жовтень", "листопад", "грудень",
-]
-
-
 def get_warsaw_datetime_context(now=None):
     """Authoritative Europe/Warsaw date/time string for the general AI chat prompt.
 
@@ -320,35 +319,16 @@ CATEGORY_EMOJIS = {
     "Інше їстівне":               "🛒",
 }
 
-EXPENSES_INTRO_TEXT = (
-    "💸 Витрати\n\n"
-    "Напиши витрату, наприклад:\n"
-    "• Biedronka 86,40 zł — продукти\n"
-    "• Запиши 120 zł за інтернет\n"
-    "• Кава 14 zł"
-)
-
-DEFAULT_EXPENSE_CATEGORY = "Інше"
-
-EXPENSE_CATEGORIES = [
-    "Продукти", "Дім і рахунки", "Транспорт", "Здоров’я",
-    "Кафе / ресторани", "Побут", "Дитина", "Інше",
-]
-
-VALID_EXPENSE_CATEGORIES = set(EXPENSE_CATEGORIES)
-
-EXPENSE_MAX_AMOUNT = Decimal("1000000")
-EXPENSE_DESCRIPTION_MAX_LEN = 200
-
-EXPENSE_GATE_UNRECOGNIZED_MSG = (
-    "Не зміг зрозуміти витрату. Напиши, наприклад:\n\n"
-    "Biedronka 86,40 zł — продукти"
-)
-
-EXPENSE_PREVIEW_GUARD_MSG = (
-    "У тебе є незавершена дія з витратами.\n\n"
-    "Підтвердь її або скасуй перед новою командою."
-)
+# Expense constants now live in expenses.py — re-exported here so existing
+# bot.<name> references/tests keep working unchanged.
+EXPENSES_INTRO_TEXT = expenses.EXPENSES_INTRO_TEXT
+DEFAULT_EXPENSE_CATEGORY = expenses.DEFAULT_EXPENSE_CATEGORY
+EXPENSE_CATEGORIES = expenses.EXPENSE_CATEGORIES
+VALID_EXPENSE_CATEGORIES = expenses.VALID_EXPENSE_CATEGORIES
+EXPENSE_MAX_AMOUNT = expenses.EXPENSE_MAX_AMOUNT
+EXPENSE_DESCRIPTION_MAX_LEN = expenses.EXPENSE_DESCRIPTION_MAX_LEN
+EXPENSE_GATE_UNRECOGNIZED_MSG = expenses.EXPENSE_GATE_UNRECOGNIZED_MSG
+EXPENSE_PREVIEW_GUARD_MSG = expenses.EXPENSE_PREVIEW_GUARD_MSG
 
 SHOPPING_PARSE_PROMPT = (
     "Розбий текст на список продуктів для покупки. Правила:\n"
@@ -631,45 +611,8 @@ ALIAS_ROUTER_PROMPT = (
     "\"selected_numbers\": [], \"unresolved_fragments\": []}"
 )
 
-EXPENSE_ROUTER_PROMPT = (
-    "Ти помічник, який розпізнає повідомлення про побутову витрату для одного домашнього господарства "
-    "(наприклад «Biedronka 86,40 zł», «Запиши 120 zł за інтернет», «Кава 14 zł»). "
-    "Тобі надається поточна локальна дата й час Europe/Warsaw як єдине надійне джерело часу, і іноді — "
-    "нумерований список останніх записаних витрат (номер, дата, опис, сума, категорія).\n"
-    "Визнач намір (intent):\n"
-    "- «create_expense» — повідомлення описує одну НОВУ конкретну витрату з сумою в злотих\n"
-    "- «delete_expense» — користувач хоче видалити/скасувати ОДНУ вже записану витрату зі списку останніх "
-    "витрат, наданого нижче (напр. «Видали витрату за булочку 4 zł», «Скасуй витрату Biedronka», «2»)\n"
-    "- «none» — повідомлення не описує ні нову витрату, ні видалення існуючої\n\n"
-    "Для create_expense поверни:\n"
-    "- amount — сума як рядок з крапкою або комою (наприклад «86.40» або «86,40»); ніколи не округлюй "
-    "і не вигадуй суму, якої немає в тексті\n"
-    "- currency — завжди «PLN»\n"
-    "- category — ОБОВ'ЯЗКОВО одна з рівно цих восьми: Продукти, Дім і рахунки, Транспорт, Здоров'я, "
-    "Кафе / ресторани, Побут, Дитина, Інше; якщо не можеш впевнено визначити категорію — постав «Інше»\n"
-    "- description — короткий опис (назва магазину/товару/послуги), без суми й категорії всередині тексту\n"
-    "- expense_date — дата у форматі YYYY-MM-DD; якщо в тексті не вказано дату явно — використовуй сьогоднішню "
-    "дату з наданого контексту; ніколи не вигадуй дату в майбутньому\n\n"
-    "Для delete_expense поверни selected_numbers — масив номерів позицій з наданого списку останніх витрат, "
-    "які відповідають описаній витраті: якщо підходить рівно одна позиція — один номер; якщо запит "
-    "неоднозначний (може підходити кілька позицій) або жодна позиція явно не підходить — залиш "
-    "selected_numbers порожнім масивом і опиши це в unresolved_fragments. Ніколи не вигадуй номер, якого "
-    "немає у наданому списку, і ніколи не повертай більше одного номера.\n\n"
-    "Якщо в повідомленні немає жодної явної суми в злотих і воно явно не про видалення існуючої витрати — "
-    "поверни «none». Якщо щось важливе неоднозначне чи суперечливе — додай короткий опис незрозумілого "
-    "фрагмента в unresolved_fragments (масив рядків) замість того, щоб вгадувати.\n"
-    "Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON:\n"
-    "{\"intent\": \"create_expense\", \"amount\": \"86.40\", \"currency\": \"PLN\", \"category\": \"Продукти\", "
-    "\"description\": \"Biedronka\", \"expense_date\": \"2026-07-03\", \"selected_numbers\": [], "
-    "\"unresolved_fragments\": []}\n"
-    "Приклад delete_expense (зі списком «1. 03.07 — Булочка — 4,00 zł [Продукти]», "
-    "«2. 03.07 — Biedronka — 86,40 zł [Продукти]» і повідомленням «Видали булочку 4 zł»):\n"
-    "{\"intent\": \"delete_expense\", \"amount\": null, \"currency\": null, \"category\": null, "
-    "\"description\": null, \"expense_date\": null, \"selected_numbers\": [1], \"unresolved_fragments\": []}\n"
-    "Приклад none:\n"
-    "{\"intent\": \"none\", \"amount\": null, \"currency\": null, \"category\": null, \"description\": null, "
-    "\"expense_date\": null, \"selected_numbers\": [], \"unresolved_fragments\": []}"
-)
+# Expense router prompt now lives in expenses.py — re-exported here.
+EXPENSE_ROUTER_PROMPT = expenses.EXPENSE_ROUTER_PROMPT
 
 # =========================
 # KEYBOARDS
@@ -828,33 +771,10 @@ ALIAS_DELETE_CONFIRM_KEYBOARD = {
     "one_time_keyboard": True,
 }
 
-EXPENSES_KEYBOARD = {
-    "keyboard": [
-        ["🧾 Останні витрати", "📊 Цей місяць"],
-        ["🗑️ Видалити витрату"],
-        ["⬅️ Головне меню"],
-    ],
-    "resize_keyboard": True,
-    "is_persistent": True,
-}
-
-EXPENSE_PREVIEW_KEYBOARD = {
-    "keyboard": [
-        ["✅ Так, додати"],
-        ["❌ Скасувати"],
-    ],
-    "resize_keyboard": True,
-    "one_time_keyboard": True,
-}
-
-EXPENSE_DELETE_PREVIEW_KEYBOARD = {
-    "keyboard": [
-        ["✅ Так, видалити"],
-        ["❌ Скасувати"],
-    ],
-    "resize_keyboard": True,
-    "one_time_keyboard": True,
-}
+# Expense keyboards now live in expenses.py — re-exported here.
+EXPENSES_KEYBOARD = expenses.EXPENSES_KEYBOARD
+EXPENSE_PREVIEW_KEYBOARD = expenses.EXPENSE_PREVIEW_KEYBOARD
+EXPENSE_DELETE_PREVIEW_KEYBOARD = expenses.EXPENSE_DELETE_PREVIEW_KEYBOARD
 
 # =========================
 # FLASK APP
@@ -1023,22 +943,9 @@ def _alias_origin_keyboard(origin):
     return MAIN_KEYBOARD
 
 
-def _current_expense_origin(chat_id):
-    """Where an expense command was issued from — the two return destinations
-    the expense flow supports: the dedicated expenses submenu, or the main
-    menu (covers everywhere else — help, open shopping/inventory lists —
-    since expenses never sets saved_list_context of its own)."""
-    if active_list_context.get(chat_id) == "expenses":
-        return "expenses_menu"
-    return "global"
-
-
-def _expense_origin_keyboard(origin):
-    """The correct persistent keyboard to explicitly (re-)send for a given
-    expense-command origin — ALWAYS a concrete keyboard, never None."""
-    if origin == "expenses_menu":
-        return EXPENSES_KEYBOARD
-    return MAIN_KEYBOARD
+# Origin helpers now live in expenses.py — re-exported here.
+_current_expense_origin = expenses._current_expense_origin
+_expense_origin_keyboard = expenses._expense_origin_keyboard
 
 
 def _reply_after_alias_action(chat_id, household_id, origin, message):
@@ -1086,77 +993,10 @@ def _alias_command_gate(text):
     return False
 
 
-_EXPENSE_AMOUNT_RE = re.compile(r"\d[\d\s.,]*\s*(zł|zl|pln)\b")
-
-
-def _expense_command_gate(text):
-    """Narrow, local gate for explicit expense commands — usable outside the
-    dedicated expenses submenu (main menu, help, open shopping/inventory
-    lists). Recognizes only unambiguous expense phrasing: an amount tagged
-    with zł/zl/PLN, or the explicit "Запиши витрату" prefix. Never parses
-    amount/category/date itself — that remains entirely the job of the
-    Gemini expense router.
-    """
-    if not isinstance(text, str):
-        return False
-    stripped = text.strip()
-    if not stripped:
-        return False
-    lowered = stripped.lower()
-    if lowered.startswith("запиши витрату"):
-        return True
-    if _EXPENSE_AMOUNT_RE.search(lowered):
-        return True
-    return False
-
-
-def _expense_report_gate(text):
-    """Narrow, local gate for the two read-only expense report commands —
-    recognizes both the dedicated expenses-submenu buttons and free-text
-    equivalents from anywhere. Returns "recent", "monthly", or None. Never
-    calls Gemini — these are plain read-only lookups, not something that
-    needs interpretation.
-    """
-    if not isinstance(text, str):
-        return None
-    stripped = text.strip()
-    if not stripped:
-        return None
-    if stripped == "🧾 Останні витрати":
-        return "recent"
-    if stripped == "📊 Цей місяць":
-        return "monthly"
-    lowered = stripped.lower()
-    if "останні витрати" in lowered:
-        return "recent"
-    if "підсумок за цей місяць" in lowered or "скільки витратили цього місяця" in lowered:
-        return "monthly"
-    return None
-
-
-_EXPENSE_DELETE_VERBS = ("видали", "видалити", "скасуй", "скасувати")
-
-
-def _expense_delete_command_gate(text):
-    """Narrow, local gate for explicit expense-deletion commands — usable
-    both as the dedicated "🗑️ Видалити витрату" button and as free text from
-    anywhere. Requires an explicit mention of "витрат(у/и)" together with a
-    delete/cancel verb, so a bare "Видали булочку" (no mention of an expense
-    at all) never matches — that's plausibly about the shopping list instead,
-    not something this gate should silently swallow. Never decides WHICH
-    expense itself; that stays entirely the job of the Gemini expense router.
-    """
-    if not isinstance(text, str):
-        return False
-    stripped = text.strip()
-    if not stripped:
-        return False
-    if stripped == "🗑️ Видалити витрату":
-        return True
-    lowered = stripped.lower()
-    if "витрат" not in lowered:
-        return False
-    return any(verb in lowered for verb in _EXPENSE_DELETE_VERBS)
+# Expense routing gates now live in expenses.py — re-exported here.
+_expense_command_gate = expenses._expense_command_gate
+_expense_report_gate = expenses._expense_report_gate
+_expense_delete_command_gate = expenses._expense_delete_command_gate
 
 
 def _handle_alias_command(chat_id, user_id, display_name, text):
@@ -1280,9 +1120,7 @@ def clear_shopping_state(chat_id):
     pending_saved_edit.pop(chat_id, None)
     pending_quick_purchase.pop(chat_id, None)
     pending_alias_action.pop(chat_id, None)
-    pending_expense.pop(chat_id, None)
-    pending_expense_delete.pop(chat_id, None)
-    expense_delete_selection.pop(chat_id, None)
+    expenses.clear_expense_state(chat_id)
 
 def clear_inventory_state(chat_id):
     inventory_mode.pop(chat_id, None)
@@ -1297,17 +1135,13 @@ def clear_inventory_state(chat_id):
     pending_inventory_reconciliation.pop(chat_id, None)
     pending_inventory_reconciliation_clarify.pop(chat_id, None)
     pending_alias_action.pop(chat_id, None)
-    pending_expense.pop(chat_id, None)
-    pending_expense_delete.pop(chat_id, None)
-    expense_delete_selection.pop(chat_id, None)
+    expenses.clear_expense_state(chat_id)
 
 def clear_alias_state(chat_id):
     pending_alias_action.pop(chat_id, None)
 
-def clear_expense_state(chat_id):
-    pending_expense.pop(chat_id, None)
-    pending_expense_delete.pop(chat_id, None)
-    expense_delete_selection.pop(chat_id, None)
+# Expense state clearing now lives in expenses.py — re-exported here.
+clear_expense_state = expenses.clear_expense_state
 
 # =========================
 # QUANTITY HELPERS (local)
@@ -2693,421 +2527,28 @@ def _ask_gemini_alias_router(user_text, aliases=None):
         return dict(_ALIAS_ROUTER_FALLBACK)
 
 
-_EXPENSE_ROUTER_FALLBACK = {
-    "intent": "none", "amount": None, "currency": None, "category": None,
-    "description": None, "expense_date": None, "selected_numbers": [], "unresolved_fragments": [],
-}
-
-
-def _ask_gemini_expense_router(user_text, recent_expenses=None):
-    """ONE Gemini call per message for expense parsing — covers both adding a
-    new expense (expenses submenu / the create-expense global gate) and
-    identifying an existing expense to delete (expenses submenu / the
-    delete-expense global gate). `recent_expenses` (optional, shaped like
-    get_recent_expenses's return value) is the household's numbered
-    recent-expense list; pass it whenever a delete command might be in
-    play — Gemini uses it only to pick selected_numbers, never to invent
-    amount/category/date for a NEW expense. Gemini never touches SQL — every
-    field is re-validated in Python before anything is shown as a preview."""
-    prompt_parts = [get_warsaw_datetime_context()]
-    if recent_expenses:
-        lines = [
-            f"{i}. {exp['expense_date'].strftime('%d.%m')} — {exp['description'] or exp['category']} — "
-            f"{_format_expense_amount(exp['amount'])} [{exp['category']}]"
-            for i, exp in enumerate(recent_expenses, start=1)
-        ]
-        prompt_parts.append("Останні витрати цього household:\n" + "\n".join(lines))
-    prompt_parts.append(f"Користувач написав: {user_text}")
-    prompt = "\n\n".join(prompt_parts)
-    raw = call_gemini([{"role": "user", "content": prompt}], EXPENSE_ROUTER_PROMPT, temperature=0.1)
-    if not raw:
-        return dict(_EXPENSE_ROUTER_FALLBACK)
-    cleaned = raw.strip()
-    if "```" in cleaned:
-        m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
-        if m:
-            cleaned = m.group(1).strip()
-    try:
-        data = json.loads(cleaned)
-        return {
-            "intent": data.get("intent", "none"),
-            "amount": data.get("amount"),
-            "currency": data.get("currency"),
-            "category": data.get("category"),
-            "description": data.get("description"),
-            "expense_date": data.get("expense_date"),
-            "selected_numbers": data.get("selected_numbers") if isinstance(data.get("selected_numbers"), list) else [],
-            "unresolved_fragments": data.get("unresolved_fragments") if isinstance(data.get("unresolved_fragments"), list) else [],
-        }
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return dict(_EXPENSE_ROUTER_FALLBACK)
-
-
-def _parse_expense_amount(raw_amount):
-    """Parse a Gemini-provided amount into an exact Decimal — never float.
-    Accepts comma or dot decimal separators and stray currency text/spaces.
-    Returns a Decimal rounded to 2 places, or None if unparseable,
-    non-positive, or larger than EXPENSE_MAX_AMOUNT.
-    """
-    if raw_amount is None:
-        return None
-    if isinstance(raw_amount, (int, float)):
-        # Never trust float precision from Gemini directly — route through
-        # str() first so e.g. 86.4 becomes "86.4", not a binary-float artifact.
-        raw_amount = str(raw_amount)
-    if not isinstance(raw_amount, str):
-        return None
-    cleaned = raw_amount.strip().lower()
-    cleaned = cleaned.replace("zł", "").replace("zl", "").replace("pln", "")
-    cleaned = cleaned.replace(" ", "").replace(",", ".").strip()
-    if not cleaned:
-        return None
-    try:
-        amount = Decimal(cleaned)
-    except (InvalidOperation, ValueError):
-        return None
-    if amount <= 0 or amount > EXPENSE_MAX_AMOUNT:
-        return None
-    return amount.quantize(Decimal("0.01"))
-
-
-def _validate_expense_date(raw_date, now=None):
-    """Parse+validate an ISO (YYYY-MM-DD) expense_date string against "not in
-    the future", using the same Europe/Warsaw clock as the rest of the
-    expense flow. Returns a date object, or None if missing/invalid/future.
-    """
-    if not isinstance(raw_date, str) or not raw_date.strip():
-        return None
-    try:
-        parsed = datetime.strptime(raw_date.strip(), "%Y-%m-%d").date()
-    except ValueError:
-        return None
-    if now is None:
-        now = datetime.now(ZoneInfo("Europe/Warsaw"))
-    if parsed > now.date():
-        return None
-    return parsed
-
-
-def _validate_expense_category(raw_category):
-    """Category must exactly match one of the fixed EXPENSE_CATEGORIES.
-    Anything else silently falls back to DEFAULT_EXPENSE_CATEGORY (never
-    blocks the expense) — the caller surfaces this fallback in the preview.
-    Returns (category, was_defaulted).
-    """
-    if isinstance(raw_category, str) and raw_category.strip() in VALID_EXPENSE_CATEGORIES:
-        return raw_category.strip(), False
-    return DEFAULT_EXPENSE_CATEGORY, True
-
-
-def _clean_expense_description(raw_description):
-    """Collapse whitespace and cap length; never raises, never None."""
-    if not isinstance(raw_description, str):
-        return ""
-    return re.sub(r"\s+", " ", raw_description.strip())[:EXPENSE_DESCRIPTION_MAX_LEN]
-
-
-def _validate_expense_router_result(router_result, now=None):
-    """Pure decision logic for the expense router's JSON. Returns one of:
-      ("unresolved", [fragment,...])  -- blocks preview regardless of intent
-      ("ok", payload)                 -- payload: amount/currency/category/
-                                          category_was_defaulted/description/expense_date
-      ("delete", [number,...])        -- delete_expense intent; raw selected_numbers,
-                                          still to be matched against the shown list by the caller
-      ("invalid", None)               -- create_expense/delete_expense with unusable fields
-      ("none", None)
-    """
-    fragments = router_result.get("unresolved_fragments")
-    if isinstance(fragments, list):
-        cleaned = [str(f).strip() for f in fragments if str(f).strip()]
-        if cleaned:
-            return "unresolved", cleaned
-    intent = router_result.get("intent")
-    if intent == "delete_expense":
-        numbers = router_result.get("selected_numbers")
-        return ("delete", numbers) if isinstance(numbers, list) else ("invalid", None)
-    if intent != "create_expense":
-        return "none", None
-    currency = router_result.get("currency")
-    if currency not in (None, "PLN"):
-        return "invalid", None
-    amount = _parse_expense_amount(router_result.get("amount"))
-    if amount is None:
-        return "invalid", None
-    expense_date = _validate_expense_date(router_result.get("expense_date"), now=now)
-    if expense_date is None:
-        return "invalid", None
-    category, category_was_defaulted = _validate_expense_category(router_result.get("category"))
-    description = _clean_expense_description(router_result.get("description"))
-    return "ok", {
-        "amount": amount,
-        "currency": "PLN",
-        "category": category,
-        "category_was_defaulted": category_was_defaulted,
-        "description": description,
-        "expense_date": expense_date,
-    }
-
-
-def _format_expense_amount(amount):
-    """Format a Decimal amount as Ukrainian-locale PLN display: comma
-    decimal, always two decimal places (money, unlike item quantities)."""
-    return f"{amount:.2f}".replace(".", ",") + " zł"
-
-
-def _format_expense_date_display(expense_date, now=None):
-    if now is None:
-        now = datetime.now(ZoneInfo("Europe/Warsaw"))
-    if expense_date == now.date():
-        return "сьогодні"
-    weekday = _UA_WEEKDAYS[expense_date.weekday()]
-    month = _UA_MONTHS_GENITIVE[expense_date.month - 1]
-    return f"{expense_date.day} {month} {expense_date.year}"
-
-
-def _format_expense_preview(payload, now=None):
-    lines = [
-        "💸 Додати витрату?",
-        "",
-        f"Сума: {_format_expense_amount(payload['amount'])}",
-        f"Категорія: {payload['category']}" + (" (не вдалося визначити точно)" if payload["category_was_defaulted"] else ""),
-    ]
-    if payload["description"]:
-        lines.append(f"Опис: {payload['description']}")
-    lines.append(f"Дата: {_format_expense_date_display(payload['expense_date'], now=now)}")
-    lines.append("")
-    lines.append("✅ Так, додати")
-    lines.append("❌ Скасувати")
-    return "\n".join(lines)
-
-
-def _format_recent_expenses(expenses):
-    """Render up to 10 most-recent expenses (already sorted by the DB
-    helper) plus their sum. `expenses` items come from get_recent_expenses."""
-    if not expenses:
-        return "Витрат поки немає."
-    lines = ["💸 Останні витрати:", ""]
-    total = Decimal("0")
-    for i, exp in enumerate(expenses, start=1):
-        total += exp["amount"]
-        date_str = exp["expense_date"].strftime("%d.%m")
-        label = exp["description"] or exp["category"]
-        lines.append(f"{i}. {date_str} — {label} — {_format_expense_amount(exp['amount'])}")
-        lines.append(f"   {exp['category']}")
-    lines.append("")
-    lines.append(f"Разом: {_format_expense_amount(total)}")
-    return "\n".join(lines)
-
-
-def _format_expense_month_summary(summary, year, month):
-    """Render the current-month category breakdown. `summary` comes from
-    get_expense_month_summary: {"total": Decimal, "by_category": {category: Decimal}}.
-    Categories sorted by amount descending, then name ascending on ties;
-    zero-amount categories (never actually produced by SUM over positive
-    amounts, but checked defensively) are skipped."""
-    header = f"📊 Витрати за {_UA_MONTHS_NOMINATIVE[month - 1]} {year}"
-    by_category = summary["by_category"]
-    if not by_category:
-        return f"{header}\n\nВитрат за цей місяць поки немає."
-    lines = [header, "", f"Разом: {_format_expense_amount(summary['total'])}", ""]
-    ordered = sorted(by_category.items(), key=lambda kv: (-kv[1], kv[0]))
-    for category, amount in ordered:
-        if amount == 0:
-            continue
-        lines.append(f"{category} — {_format_expense_amount(amount)}")
-    return "\n".join(lines)
-
-
-def _handle_expense_report_command(chat_id, user_id, display_name, kind):
-    """Shared handler for both read-only expense report commands ("recent"/
-    "monthly"). Never touches pending state or active_list_context — a pure
-    read, safe to run from anywhere without disturbing whatever flow the
-    chat is currently in. Never calls Gemini.
-    """
-    origin = _current_expense_origin(chat_id)
-    keyboard = _expense_origin_keyboard(origin)
-    try:
-        household_id, _ = get_household_and_user(user_id, display_name)
-        if kind == "recent":
-            expenses = get_recent_expenses(household_id, limit=10)
-            send_message(chat_id, _format_recent_expenses(expenses), reply_markup=keyboard)
-        else:
-            now = datetime.now(ZoneInfo("Europe/Warsaw"))
-            summary = get_expense_month_summary(household_id, now.year, now.month)
-            send_message(chat_id, _format_expense_month_summary(summary, now.year, now.month), reply_markup=keyboard)
-    except Exception:
-        send_message(chat_id, "Не вдалося отримати витрати. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
-
-
-def _handle_expense_command(chat_id, user_id, display_name, text):
-    """Shared expense-router handling for both the dedicated expenses submenu
-    and the global expense command gate. Mirrors _handle_alias_command:
-    returns True if the message was fully handled here (caller must not fall
-    through to general AI-chat). Returns False only when intent is "none" and
-    origin == "expenses_menu" — the one case allowed to fall through, matching
-    every other router in this file. A global-gate command (origin=="global")
-    is never allowed to fall through, even on "none"/"invalid"/"unresolved" —
-    the gate already confirmed the text looks like an expense command.
-    """
-    origin = _current_expense_origin(chat_id)
-    keyboard = _expense_origin_keyboard(origin)
-    try:
-        household_id, user_db_id = get_household_and_user(user_id, display_name)
-        router_result = _ask_gemini_expense_router(text)
-        kind, payload = _validate_expense_router_result(router_result)
-        if kind == "unresolved":
-            lines = ["Не зрозумів частину витрати:", ""]
-            lines += [f"• «{f}»" for f in payload]
-            lines.append("")
-            lines.append("Спробуй сформулювати інакше, наприклад: «Biedronka 86,40 zł — продукти».")
-            send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
-        elif kind == "invalid":
-            send_message(chat_id, EXPENSE_GATE_UNRECOGNIZED_MSG, reply_markup=keyboard)
-        elif kind in ("none", "delete"):
-            # "delete" here means Gemini classified this as delete_expense
-            # despite no recent-expenses context being given (the dedicated
-            # expense-delete gate normally intercepts genuine delete phrasing
-            # before it ever reaches this add-expense router) — treated the
-            # same as "none" rather than assuming an add-expense payload shape.
-            if origin == "expenses_menu":
-                return False
-            send_message(chat_id, EXPENSE_GATE_UNRECOGNIZED_MSG, reply_markup=keyboard)
-        else:
-            pending_expense[chat_id] = {
-                "household_id": household_id, "user_db_id": user_db_id,
-                "amount": payload["amount"], "currency": payload["currency"],
-                "category": payload["category"], "description": payload["description"],
-                "expense_date": payload["expense_date"], "origin": origin,
-            }
-            send_message(chat_id, _format_expense_preview(payload), reply_markup=EXPENSE_PREVIEW_KEYBOARD)
-        return True
-    except Exception:
-        send_message(chat_id, "Не вдалося обробити витрату. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
-        return True
-
-
-def _format_expense_delete_list(expenses):
-    """Numbered recent-expense list shown before/while picking one to
-    delete — the exact numbering the expense router's selected_numbers and
-    _validate_selected_numbers resolve against."""
-    lines = ["🗑️ Яку витрату видалити?", ""]
-    for i, exp in enumerate(expenses, start=1):
-        date_str = exp["expense_date"].strftime("%d.%m")
-        label = exp["description"] or exp["category"]
-        lines.append(f"{i}. {date_str} — {label} — {_format_expense_amount(exp['amount'])}")
-    lines.append("")
-    lines.append("Напиши номер або, наприклад:")
-    lines.append("• Видали булочку 4 zł")
-    lines.append("• Видали витрату Biedronka 86,40 zł")
-    return "\n".join(lines)
-
-
-def _format_expense_delete_preview(expense):
-    label = expense["description"] or expense["category"]
-    date_str = expense["expense_date"].strftime("%d.%m")
-    lines = [
-        "💸 Видалити витрату?",
-        "",
-        f"{date_str} — {label} — {_format_expense_amount(expense['amount'])}",
-        f"Категорія: {expense['category']}",
-        "",
-        "✅ Так, видалити",
-        "❌ Скасувати",
-    ]
-    return "\n".join(lines)
-
-
-def _resolve_expense_delete_selection(chat_id, household_id, user_db_id, origin, keyboard, text, recent_expenses):
-    """Shared resolution step for both the global expense-delete gate and the
-    dedicated selection mode (chat_id in expense_delete_selection). Calls the
-    expense router with `recent_expenses` as context and either builds the
-    delete preview (exactly one match) or re-shows the numbered list and
-    stays in selection mode (zero matches, more than one match, or an
-    unresolved/invalid/none router result — never guesses). Always fully
-    handles the message; never falls through to AI-chat.
-    """
-    router_result = _ask_gemini_expense_router(text, recent_expenses=recent_expenses)
-    kind, payload = _validate_expense_router_result(router_result)
-    matched = _validate_selected_numbers(payload, recent_expenses) if kind == "delete" else None
-    if matched is not None and len(matched) == 1:
-        expense = matched[0]
-        pending_expense_delete[chat_id] = {
-            "expense_id": expense["id"], "household_id": household_id,
-            "snapshot": {
-                "amount": expense["amount"], "category": expense["category"],
-                "expense_date": expense["expense_date"], "description": expense["description"],
-            },
-            "origin": origin,
-        }
-        expense_delete_selection.pop(chat_id, None)
-        send_message(chat_id, _format_expense_delete_preview(expense), reply_markup=EXPENSE_DELETE_PREVIEW_KEYBOARD)
-        return
-    # Zero matches, more than one match, or the router didn't produce a
-    # usable delete selection (unresolved/invalid/none) — never guess; stay
-    # in selection mode and ask the user to pick a number from the list.
-    expense_delete_selection[chat_id] = {
-        "household_id": household_id, "user_db_id": user_db_id,
-        "expenses": recent_expenses, "origin": origin,
-    }
-    send_message(
-        chat_id,
-        "Не зміг однозначно визначити витрату.\n\n" + _format_expense_delete_list(recent_expenses),
-        reply_markup=keyboard,
-    )
-
-
-def _handle_expense_delete_button(chat_id, user_id, display_name):
-    """Entry point for the "🗑️ Видалити витрату" button — no Gemini call at
-    this stage (a bare button press carries no target description), just
-    shows up to 10 numbered recent expenses and enters selection mode."""
-    origin = _current_expense_origin(chat_id)
-    keyboard = _expense_origin_keyboard(origin)
-    try:
-        household_id, user_db_id = get_household_and_user(user_id, display_name)
-        expenses = get_recent_expenses_for_deletion(household_id, limit=10)
-        if not expenses:
-            send_message(chat_id, "Витрат поки немає.", reply_markup=keyboard)
-            return
-        expense_delete_selection[chat_id] = {
-            "household_id": household_id, "user_db_id": user_db_id,
-            "expenses": expenses, "origin": origin,
-        }
-        send_message(chat_id, _format_expense_delete_list(expenses), reply_markup=keyboard)
-    except Exception:
-        send_message(chat_id, "Не вдалося отримати витрати. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
-
-
-def _handle_expense_delete_global_command(chat_id, user_id, display_name, text):
-    """Global expense-delete gate handler — fetches a fresh recent-expenses
-    list (there is no pre-shown numbered list yet) and resolves it via the
-    expense router. Falls back to showing the list and entering selection
-    mode if ambiguous, exactly like the dedicated button does."""
-    origin = _current_expense_origin(chat_id)
-    keyboard = _expense_origin_keyboard(origin)
-    try:
-        household_id, user_db_id = get_household_and_user(user_id, display_name)
-        recent_expenses = get_recent_expenses_for_deletion(household_id, limit=10)
-        if not recent_expenses:
-            send_message(chat_id, "Витрат поки немає.", reply_markup=keyboard)
-            return
-        _resolve_expense_delete_selection(
-            chat_id, household_id, user_db_id, origin, keyboard, text, recent_expenses
-        )
-    except Exception:
-        send_message(chat_id, "Не вдалося обробити видалення витрати. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
-
-
-def _handle_expense_delete_selection_text(chat_id, text):
-    """Free text while a numbered recent-expense list is already on screen
-    (button press, or an earlier ambiguous global-gate attempt) — resolved
-    against that SAME stored list so numbering never shifts mid-conversation."""
-    data = expense_delete_selection.pop(chat_id, None)
-    if data is None:
-        return
-    _resolve_expense_delete_selection(
-        chat_id, data["household_id"], data["user_db_id"], data["origin"],
-        _expense_origin_keyboard(data["origin"]), text, data["expenses"],
-    )
+# Expense Gemini router, validators, formatters, and Telegram handlers now
+# live in expenses.py — re-exported here so existing bot.<name> references
+# and tests keep working unchanged.
+_ask_gemini_expense_router = expenses._ask_gemini_expense_router
+_parse_expense_amount = expenses._parse_expense_amount
+_validate_expense_date = expenses._validate_expense_date
+_validate_expense_category = expenses._validate_expense_category
+_clean_expense_description = expenses._clean_expense_description
+_validate_expense_router_result = expenses._validate_expense_router_result
+_format_expense_amount = expenses._format_expense_amount
+_format_expense_date_display = expenses._format_expense_date_display
+_format_expense_preview = expenses._format_expense_preview
+_format_recent_expenses = expenses._format_recent_expenses
+_format_expense_month_summary = expenses._format_expense_month_summary
+_handle_expense_report_command = expenses._handle_expense_report_command
+_handle_expense_command = expenses._handle_expense_command
+_format_expense_delete_list = expenses._format_expense_delete_list
+_format_expense_delete_preview = expenses._format_expense_delete_preview
+_resolve_expense_delete_selection = expenses._resolve_expense_delete_selection
+_handle_expense_delete_button = expenses._handle_expense_delete_button
+_handle_expense_delete_global_command = expenses._handle_expense_delete_global_command
+_handle_expense_delete_selection_text = expenses._handle_expense_delete_selection_text
 
 
 def _format_saved_edit_preview(items_snapshot, validated_updates, context_type):
@@ -3546,18 +2987,8 @@ def webhook():
             alias_data = pending_alias_action.pop(chat_id, None)
             origin = (alias_data or {}).get("origin", "global")
             send_message(chat_id, "Дію з домашніми назвами скасовано.", reply_markup=_alias_origin_keyboard(origin))
-        elif chat_id in pending_expense:
-            expense_data = pending_expense.pop(chat_id, None)
-            origin = (expense_data or {}).get("origin", "global")
-            send_message(chat_id, "Додавання витрати скасовано.", reply_markup=_expense_origin_keyboard(origin))
-        elif chat_id in pending_expense_delete:
-            delete_data = pending_expense_delete.pop(chat_id, None)
-            origin = (delete_data or {}).get("origin", "global")
-            send_message(chat_id, "Видалення витрати скасовано.", reply_markup=_expense_origin_keyboard(origin))
-        elif chat_id in expense_delete_selection:
-            selection_data = expense_delete_selection.pop(chat_id, None)
-            origin = (selection_data or {}).get("origin", "global")
-            send_message(chat_id, "Видалення витрати скасовано.", reply_markup=_expense_origin_keyboard(origin))
+        elif chat_id in pending_expense or chat_id in pending_expense_delete or chat_id in expense_delete_selection:
+            expenses.handle_cancel(chat_id)
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -3647,16 +3078,7 @@ def webhook():
             else:
                 send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
         elif chat_id in pending_expense_delete:
-            data = pending_expense_delete.pop(chat_id)
-            origin = data.get("origin", "global")
-            keyboard = _expense_origin_keyboard(origin)
-            try:
-                delete_expense(data["household_id"], data["expense_id"], data["snapshot"])
-                send_message(chat_id, "✅ Витрату видалено.", reply_markup=keyboard)
-            except StaleSnapshotError:
-                send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=keyboard)
-            except Exception:
-                send_message(chat_id, "Не вдалося видалити витрату. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+            expenses.handle_delete_confirm(chat_id)
         else:
             send_message(chat_id, "Немає активної дії для підтвердження.")
         return "ok"
@@ -3694,20 +3116,7 @@ def webhook():
         return "ok"
 
     if text == "✅ Так, додати":
-        if chat_id in pending_expense:
-            data = pending_expense.pop(chat_id)
-            origin = data.get("origin", "global")
-            keyboard = _expense_origin_keyboard(origin)
-            try:
-                add_expense(
-                    data["household_id"], data["user_db_id"], data["amount"], data["currency"],
-                    data["category"], data["description"], data["expense_date"],
-                )
-                send_message(chat_id, "✅ Витрату додано.", reply_markup=keyboard)
-            except Exception:
-                send_message(chat_id, "Не вдалося зберегти витрату. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
-        else:
-            send_message(chat_id, "Немає активної дії для підтвердження.")
+        expenses.handle_add_confirm(chat_id)
         return "ok"
 
     if text == "✅ Так, прибрати":
@@ -4735,6 +4144,14 @@ def webhook():
 
     send_message(chat_id, answer)
     return "ok"
+
+
+# Wire expenses.py's dependencies now that everything it needs (send_message,
+# get_household_and_user, call_gemini, get_warsaw_datetime_context,
+# _validate_selected_numbers, the expense database helpers, active_list_context,
+# MAIN_KEYBOARD) is defined above. Must run before any webhook request is
+# handled; expenses.py itself never imports bot.py (see its module docstring).
+expenses.configure(sys.modules[__name__], active_list_context, MAIN_KEYBOARD)
 
 
 if __name__ == "__main__":
