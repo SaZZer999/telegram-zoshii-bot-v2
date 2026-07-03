@@ -178,6 +178,21 @@ def _has_blocking_pending_state_for_expense_delete(chat_id):
     return any(chat_id in d for d in _EXPENSE_DELETE_GATE_BLOCKING_PENDING_STATES)
 
 
+# The two states an unconfirmed expense preview can be in — deliberately
+# excludes expense_delete_selection (the earlier "pick a number" stage,
+# which already has its own correct handling: any text there resolves
+# against the shown list, and that behavior is unchanged by this guard).
+_ACTIVE_EXPENSE_PREVIEW_STATES = (pending_expense, pending_expense_delete)
+
+
+def _has_active_expense_preview(chat_id):
+    """True if an expense add-preview or delete-preview is awaiting
+    confirm/cancel for this chat. While true, no OTHER plain text may start
+    a new expense router, replace the pending preview, touch the database,
+    or reach general AI-chat — see EXPENSE_PREVIEW_GUARD_MSG."""
+    return any(chat_id in d for d in _ACTIVE_EXPENSE_PREVIEW_STATES)
+
+
 _SEEN_UPDATE_IDS_MAXLEN = 1000
 _seen_update_ids = deque(maxlen=_SEEN_UPDATE_IDS_MAXLEN)   # oldest-first, bounded
 _seen_update_ids_set = set()                               # O(1) membership
@@ -328,6 +343,11 @@ EXPENSE_DESCRIPTION_MAX_LEN = 200
 EXPENSE_GATE_UNRECOGNIZED_MSG = (
     "Не зміг зрозуміти витрату. Напиши, наприклад:\n\n"
     "Biedronka 86,40 zł — продукти"
+)
+
+EXPENSE_PREVIEW_GUARD_MSG = (
+    "У тебе є незавершена дія з витратами.\n\n"
+    "Підтвердь її або скасуй перед новою командою."
 )
 
 SHOPPING_PARSE_PROMPT = (
@@ -4393,6 +4413,17 @@ def webhook():
         # ahead of everything else, same priority as pending_batch/
         # pending_inventory_batch above.
         _handle_expense_delete_selection_text(chat_id, text)
+        _preview_intercepted = True
+
+    elif _has_active_expense_preview(chat_id):
+        # An expense add-preview or delete-preview is awaiting confirm/cancel
+        # (the matching "✅ Так, додати"/"✅ Так, видалити"/"❌ Скасувати"
+        # button texts are already handled earlier, before this router chain
+        # — reaching here means the text is something else). Checked ahead of
+        # every gate/submenu branch below so it can never start a new expense
+        # router, replace the pending preview, touch the database, or reach
+        # general AI-chat — the preview must be confirmed or cancelled first.
+        send_message(chat_id, EXPENSE_PREVIEW_GUARD_MSG)
         _preview_intercepted = True
 
     elif not _has_blocking_pending_state_for_reports(chat_id) and _expense_report_gate(text):
