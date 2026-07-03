@@ -1,6 +1,7 @@
 import os
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 import psycopg
 
 HOUSEHOLD_NAME = "Спільний дім"
@@ -608,6 +609,62 @@ def add_expense(household_id, user_db_id, amount, currency, category, descriptio
             row = cur.fetchone()
         conn.commit()
     return row[0]
+
+
+def get_recent_expenses(household_id, limit=10):
+    """Up to `limit` most recent expenses for one household — newest
+    expense_date first, then newest created_at, then newest id (stable
+    tie-break for same-instant inserts). Never crosses household_id.
+    Read-only, no Gemini involved.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT amount, currency, category, description, expense_date, created_at
+                FROM expenses
+                WHERE household_id = %s
+                ORDER BY expense_date DESC, created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (household_id, limit)
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "amount": r[0], "currency": r[1], "category": r[2],
+            "description": r[3], "expense_date": r[4], "created_at": r[5],
+        }
+        for r in rows
+    ]
+
+
+def get_expense_month_summary(household_id, year, month):
+    """Per-category subtotals (Decimal) and grand total for one household's
+    expenses within one calendar month (expense_date in [first day of month,
+    first day of next month)). Never crosses household_id. Categories are
+    only present here if at least one expense row exists for them — there is
+    no such thing as a stored zero-amount expense, so a zero subtotal can
+    never occur (SUM over a non-empty group of positive amounts is always
+    positive).
+    """
+    start = date(year, month, 1)
+    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT category, SUM(amount)
+                FROM expenses
+                WHERE household_id = %s AND expense_date >= %s AND expense_date < %s
+                GROUP BY category
+                """,
+                (household_id, start, end)
+            )
+            rows = cur.fetchall()
+    by_category = {category: amount for category, amount in rows}
+    total = sum(by_category.values(), Decimal("0"))
+    return {"total": total, "by_category": by_category}
 
 
 def add_shopping_item(household_id, name, quantity_text, created_by_user_id):
