@@ -306,6 +306,23 @@ def init_db():
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_household_aliases_unique
                 ON household_aliases (household_id, alias_normalized)
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS expenses (
+                    id                  SERIAL PRIMARY KEY,
+                    household_id        INTEGER NOT NULL REFERENCES households(id),
+                    amount              NUMERIC NOT NULL,
+                    currency            TEXT NOT NULL DEFAULT 'PLN',
+                    category            TEXT NOT NULL,
+                    description         TEXT,
+                    expense_date        DATE NOT NULL,
+                    created_by_user_id  INTEGER REFERENCES users(id),
+                    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_expenses_household
+                ON expenses (household_id, expense_date)
+            """)
         conn.commit()
     _backfill_structured_quantities()
 
@@ -564,6 +581,34 @@ def delete_household_aliases_batch(household_id, targets):
             count = cur.rowcount
         conn.commit()
     return count
+
+# =========================
+# EXPENSES
+# =========================
+
+def add_expense(household_id, user_db_id, amount, currency, category, description, expense_date):
+    """Insert one expense row for a household — a single DB operation, called
+    exactly once per confirmed preview. `amount` must already be a validated
+    Decimal > 0 and `category` already validated against the fixed category
+    list; this function trusts its caller (bot.py) for those business rules
+    and only performs the parameterized SQL insert. Never touches
+    shopping_items/inventory_items. Returns the new row id.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO expenses
+                    (household_id, amount, currency, category, description, expense_date, created_by_user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (household_id, amount, currency, category, description or None, expense_date, user_db_id)
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return row[0]
+
 
 def add_shopping_item(household_id, name, quantity_text, created_by_user_id):
     with get_connection() as conn:

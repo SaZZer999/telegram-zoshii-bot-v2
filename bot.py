@@ -3,7 +3,7 @@ import os
 import re
 from collections import deque
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 from flask import Flask, request
 from dotenv import load_dotenv
@@ -38,6 +38,7 @@ from database import (
     create_or_update_household_alias,
     delete_household_alias,
     delete_household_aliases_batch,
+    add_expense,
 )
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
@@ -93,6 +94,7 @@ pending_compound_inventory = {}  # chat_id -> {inventory_changes, add_to_shoppin
 pending_inventory_reconciliation = {}  # chat_id -> {updates, additions, deletes, household_id, user_db_id}
 pending_inventory_reconciliation_clarify = {}  # chat_id -> {ambiguous_group, rest, household_id, user_db_id}
 pending_alias_action = {}     # chat_id -> {kind: "create"|"update"|"delete", household_id, user_db_id, alias_text, target_display_name, alias_normalized (delete only)}
+pending_expense = {}          # chat_id -> {household_id, user_db_id, amount, currency, category, description, expense_date, origin}
 
 # Every OTHER flow's pending preview/confirm state — deliberately excludes
 # pending_alias_action itself (a new global alias command is allowed to
@@ -114,6 +116,22 @@ def _has_blocking_pending_state(chat_id):
     """True if some other flow's pending preview/confirm is currently active
     for this chat — the global alias command gate must never interrupt it."""
     return any(chat_id in d for d in _ALIAS_GATE_BLOCKING_PENDING_STATES)
+
+
+# Every OTHER flow's pending preview/confirm state that must block the global
+# expense command gate — everything the alias gate already guards against,
+# PLUS an active alias action itself. Unlike the alias gate (which deliberately
+# allows a new global alias command to overwrite its own already-pending alias
+# action), the expense gate must never override an alias preview: per spec,
+# aliases has priority over a new expense command. pending_expense's own state
+# is deliberately excluded, same reasoning as the alias gate excluding its own.
+_EXPENSE_GATE_BLOCKING_PENDING_STATES = _ALIAS_GATE_BLOCKING_PENDING_STATES + (pending_alias_action,)
+
+
+def _has_blocking_pending_state_for_expense(chat_id):
+    """True if some other flow's pending preview/confirm — including an
+    active alias action — is currently active for this chat."""
+    return any(chat_id in d for d in _EXPENSE_GATE_BLOCKING_PENDING_STATES)
 
 
 _SEEN_UPDATE_IDS_MAXLEN = 1000
@@ -156,7 +174,9 @@ SYSTEM_PROMPT = (
     "Це стосується й домашніх назв товарів (aliases): ти НІКОЛИ не маєш права стверджувати, що «запам'ятав», "
     "«зберіг» чи «оновив» домашню назву товару, або що вона тепер діятиме надалі. Створення, зміну й видалення "
     "домашніх назв виконує лише код бота після явного підтвердження користувача кнопкою — якщо такого "
-    "підтвердження в цьому чаті не було, чесно скажи, що не можеш це зробити в звичайній розмові."
+    "підтвердження в цьому чаті не було, чесно скажи, що не можеш це зробити в звичайній розмові.\n"
+    "Це стосується й витрат: ти НІКОЛИ не маєш права стверджувати, що витрату «записав», «додав» чи "
+    "«зберіг», якщо в цьому чаті реально не відбулося підтвердженого користувачем кнопкою запису витрати."
 )
 
 _UA_WEEKDAYS = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
@@ -236,6 +256,31 @@ CATEGORY_EMOJIS = {
     "Заморожене":                 "🧊",
     "Інше їстівне":               "🛒",
 }
+
+EXPENSES_INTRO_TEXT = (
+    "💸 Витрати\n\n"
+    "Напиши витрату, наприклад:\n"
+    "• Biedronka 86,40 zł — продукти\n"
+    "• Запиши 120 zł за інтернет\n"
+    "• Кава 14 zł"
+)
+
+DEFAULT_EXPENSE_CATEGORY = "Інше"
+
+EXPENSE_CATEGORIES = [
+    "Продукти", "Дім і рахунки", "Транспорт", "Здоров’я",
+    "Кафе / ресторани", "Побут", "Дитина", "Інше",
+]
+
+VALID_EXPENSE_CATEGORIES = set(EXPENSE_CATEGORIES)
+
+EXPENSE_MAX_AMOUNT = Decimal("1000000")
+EXPENSE_DESCRIPTION_MAX_LEN = 200
+
+EXPENSE_GATE_UNRECOGNIZED_MSG = (
+    "Не зміг зрозуміти витрату. Напиши, наприклад:\n\n"
+    "Biedronka 86,40 zł — продукти"
+)
 
 SHOPPING_PARSE_PROMPT = (
     "Розбий текст на список продуктів для покупки. Правила:\n"
@@ -518,6 +563,33 @@ ALIAS_ROUTER_PROMPT = (
     "\"selected_numbers\": [], \"unresolved_fragments\": []}"
 )
 
+EXPENSE_ROUTER_PROMPT = (
+    "Ти помічник, який розпізнає повідомлення про побутову витрату для одного домашнього господарства "
+    "(наприклад «Biedronka 86,40 zł», «Запиши 120 zł за інтернет», «Кава 14 zł»). "
+    "Тобі надається поточна локальна дата й час Europe/Warsaw як єдине надійне джерело часу.\n"
+    "Визнач намір (intent):\n"
+    "- «create_expense» — повідомлення описує одну конкретну витрату з сумою в злотих\n"
+    "- «none» — повідомлення не описує витрату\n\n"
+    "Для create_expense поверни:\n"
+    "- amount — сума як рядок з крапкою або комою (наприклад «86.40» або «86,40»); ніколи не округлюй "
+    "і не вигадуй суму, якої немає в тексті\n"
+    "- currency — завжди «PLN»\n"
+    "- category — ОБОВ'ЯЗКОВО одна з рівно цих восьми: Продукти, Дім і рахунки, Транспорт, Здоров'я, "
+    "Кафе / ресторани, Побут, Дитина, Інше; якщо не можеш впевнено визначити категорію — постав «Інше»\n"
+    "- description — короткий опис (назва магазину/товару/послуги), без суми й категорії всередині тексту\n"
+    "- expense_date — дата у форматі YYYY-MM-DD; якщо в тексті не вказано дату явно — використовуй сьогоднішню "
+    "дату з наданого контексту; ніколи не вигадуй дату в майбутньому\n\n"
+    "Якщо в повідомленні немає жодної явної суми в злотих — це НЕ витрата, поверни «none». "
+    "Якщо суму видно, але щось важливе неоднозначне чи суперечливе — додай короткий опис незрозумілого "
+    "фрагмента в unresolved_fragments (масив рядків) замість того, щоб вгадувати.\n"
+    "Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON:\n"
+    "{\"intent\": \"create_expense\", \"amount\": \"86.40\", \"currency\": \"PLN\", \"category\": \"Продукти\", "
+    "\"description\": \"Biedronka\", \"expense_date\": \"2026-07-03\", \"unresolved_fragments\": []}\n"
+    "Приклад none:\n"
+    "{\"intent\": \"none\", \"amount\": null, \"currency\": null, \"category\": null, \"description\": null, "
+    "\"expense_date\": null, \"unresolved_fragments\": []}"
+)
+
 # =========================
 # KEYBOARDS
 # =========================
@@ -525,7 +597,7 @@ MAIN_KEYBOARD = {
     "keyboard": [
         ["🛒 Покупки", "🧊 Запаси"],
         ["🍽️ Що приготувати", "ℹ️ Допомога"],
-        ["🧠 Назви товарів"]
+        ["🧠 Назви товарів", "💸 Витрати"]
     ],
     "resize_keyboard": True,
     "is_persistent": True
@@ -669,6 +741,23 @@ ALIAS_UPDATE_CONFIRM_KEYBOARD = {
 ALIAS_DELETE_CONFIRM_KEYBOARD = {
     "keyboard": [
         ["✅ Так, видалити"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+EXPENSES_KEYBOARD = {
+    "keyboard": [
+        ["⬅️ Головне меню"],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+EXPENSE_PREVIEW_KEYBOARD = {
+    "keyboard": [
+        ["✅ Так, додати"],
         ["❌ Скасувати"],
     ],
     "resize_keyboard": True,
@@ -842,6 +931,24 @@ def _alias_origin_keyboard(origin):
     return MAIN_KEYBOARD
 
 
+def _current_expense_origin(chat_id):
+    """Where an expense command was issued from — the two return destinations
+    the expense flow supports: the dedicated expenses submenu, or the main
+    menu (covers everywhere else — help, open shopping/inventory lists —
+    since expenses never sets saved_list_context of its own)."""
+    if active_list_context.get(chat_id) == "expenses":
+        return "expenses_menu"
+    return "global"
+
+
+def _expense_origin_keyboard(origin):
+    """The correct persistent keyboard to explicitly (re-)send for a given
+    expense-command origin — ALWAYS a concrete keyboard, never None."""
+    if origin == "expenses_menu":
+        return EXPENSES_KEYBOARD
+    return MAIN_KEYBOARD
+
+
 def _reply_after_alias_action(chat_id, household_id, origin, message):
     """After a confirmed alias create/update/delete: full refreshed list +
     ALIASES_KEYBOARD when the action originated from the dedicated submenu;
@@ -883,6 +990,30 @@ def _alias_command_gate(text):
     if "alias" in lowered or "синонім" in lowered:
         return True
     if "назв" in lowered and ("домашн" in lowered or "товар" in lowered or "покажи" in lowered or "мої" in lowered):
+        return True
+    return False
+
+
+_EXPENSE_AMOUNT_RE = re.compile(r"\d[\d\s.,]*\s*(zł|zl|pln)\b")
+
+
+def _expense_command_gate(text):
+    """Narrow, local gate for explicit expense commands — usable outside the
+    dedicated expenses submenu (main menu, help, open shopping/inventory
+    lists). Recognizes only unambiguous expense phrasing: an amount tagged
+    with zł/zl/PLN, or the explicit "Запиши витрату" prefix. Never parses
+    amount/category/date itself — that remains entirely the job of the
+    Gemini expense router.
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if lowered.startswith("запиши витрату"):
+        return True
+    if _EXPENSE_AMOUNT_RE.search(lowered):
         return True
     return False
 
@@ -1008,6 +1139,7 @@ def clear_shopping_state(chat_id):
     pending_saved_edit.pop(chat_id, None)
     pending_quick_purchase.pop(chat_id, None)
     pending_alias_action.pop(chat_id, None)
+    pending_expense.pop(chat_id, None)
 
 def clear_inventory_state(chat_id):
     inventory_mode.pop(chat_id, None)
@@ -1022,9 +1154,13 @@ def clear_inventory_state(chat_id):
     pending_inventory_reconciliation.pop(chat_id, None)
     pending_inventory_reconciliation_clarify.pop(chat_id, None)
     pending_alias_action.pop(chat_id, None)
+    pending_expense.pop(chat_id, None)
 
 def clear_alias_state(chat_id):
     pending_alias_action.pop(chat_id, None)
+
+def clear_expense_state(chat_id):
+    pending_expense.pop(chat_id, None)
 
 # =========================
 # QUANTITY HELPERS (local)
@@ -2410,6 +2546,216 @@ def _ask_gemini_alias_router(user_text, aliases=None):
         return dict(_ALIAS_ROUTER_FALLBACK)
 
 
+_EXPENSE_ROUTER_FALLBACK = {
+    "intent": "none", "amount": None, "currency": None, "category": None,
+    "description": None, "expense_date": None, "unresolved_fragments": [],
+}
+
+
+def _ask_gemini_expense_router(user_text):
+    """ONE Gemini call per message for expense parsing (expenses submenu or
+    the global gate). Gemini only extracts fields into JSON — it never
+    touches SQL, and every field is re-validated in Python (amount via
+    Decimal, category against the fixed list, date bounds) before anything
+    is shown as a preview."""
+    prompt = f"{get_warsaw_datetime_context()}\n\nКористувач написав: {user_text}"
+    raw = call_gemini([{"role": "user", "content": prompt}], EXPENSE_ROUTER_PROMPT, temperature=0.1)
+    if not raw:
+        return dict(_EXPENSE_ROUTER_FALLBACK)
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
+        if m:
+            cleaned = m.group(1).strip()
+    try:
+        data = json.loads(cleaned)
+        return {
+            "intent": data.get("intent", "none"),
+            "amount": data.get("amount"),
+            "currency": data.get("currency"),
+            "category": data.get("category"),
+            "description": data.get("description"),
+            "expense_date": data.get("expense_date"),
+            "unresolved_fragments": data.get("unresolved_fragments") if isinstance(data.get("unresolved_fragments"), list) else [],
+        }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return dict(_EXPENSE_ROUTER_FALLBACK)
+
+
+def _parse_expense_amount(raw_amount):
+    """Parse a Gemini-provided amount into an exact Decimal — never float.
+    Accepts comma or dot decimal separators and stray currency text/spaces.
+    Returns a Decimal rounded to 2 places, or None if unparseable,
+    non-positive, or larger than EXPENSE_MAX_AMOUNT.
+    """
+    if raw_amount is None:
+        return None
+    if isinstance(raw_amount, (int, float)):
+        # Never trust float precision from Gemini directly — route through
+        # str() first so e.g. 86.4 becomes "86.4", not a binary-float artifact.
+        raw_amount = str(raw_amount)
+    if not isinstance(raw_amount, str):
+        return None
+    cleaned = raw_amount.strip().lower()
+    cleaned = cleaned.replace("zł", "").replace("zl", "").replace("pln", "")
+    cleaned = cleaned.replace(" ", "").replace(",", ".").strip()
+    if not cleaned:
+        return None
+    try:
+        amount = Decimal(cleaned)
+    except (InvalidOperation, ValueError):
+        return None
+    if amount <= 0 or amount > EXPENSE_MAX_AMOUNT:
+        return None
+    return amount.quantize(Decimal("0.01"))
+
+
+def _validate_expense_date(raw_date, now=None):
+    """Parse+validate an ISO (YYYY-MM-DD) expense_date string against "not in
+    the future", using the same Europe/Warsaw clock as the rest of the
+    expense flow. Returns a date object, or None if missing/invalid/future.
+    """
+    if not isinstance(raw_date, str) or not raw_date.strip():
+        return None
+    try:
+        parsed = datetime.strptime(raw_date.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    if now is None:
+        now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    if parsed > now.date():
+        return None
+    return parsed
+
+
+def _validate_expense_category(raw_category):
+    """Category must exactly match one of the fixed EXPENSE_CATEGORIES.
+    Anything else silently falls back to DEFAULT_EXPENSE_CATEGORY (never
+    blocks the expense) — the caller surfaces this fallback in the preview.
+    Returns (category, was_defaulted).
+    """
+    if isinstance(raw_category, str) and raw_category.strip() in VALID_EXPENSE_CATEGORIES:
+        return raw_category.strip(), False
+    return DEFAULT_EXPENSE_CATEGORY, True
+
+
+def _clean_expense_description(raw_description):
+    """Collapse whitespace and cap length; never raises, never None."""
+    if not isinstance(raw_description, str):
+        return ""
+    return re.sub(r"\s+", " ", raw_description.strip())[:EXPENSE_DESCRIPTION_MAX_LEN]
+
+
+def _validate_expense_router_result(router_result, now=None):
+    """Pure decision logic for the expense router's JSON. Returns one of:
+      ("unresolved", [fragment,...])  -- blocks preview regardless of intent
+      ("ok", payload)                 -- payload: amount/currency/category/
+                                          category_was_defaulted/description/expense_date
+      ("invalid", None)               -- create_expense with unusable amount/currency/date
+      ("none", None)
+    """
+    fragments = router_result.get("unresolved_fragments")
+    if isinstance(fragments, list):
+        cleaned = [str(f).strip() for f in fragments if str(f).strip()]
+        if cleaned:
+            return "unresolved", cleaned
+    if router_result.get("intent") != "create_expense":
+        return "none", None
+    currency = router_result.get("currency")
+    if currency not in (None, "PLN"):
+        return "invalid", None
+    amount = _parse_expense_amount(router_result.get("amount"))
+    if amount is None:
+        return "invalid", None
+    expense_date = _validate_expense_date(router_result.get("expense_date"), now=now)
+    if expense_date is None:
+        return "invalid", None
+    category, category_was_defaulted = _validate_expense_category(router_result.get("category"))
+    description = _clean_expense_description(router_result.get("description"))
+    return "ok", {
+        "amount": amount,
+        "currency": "PLN",
+        "category": category,
+        "category_was_defaulted": category_was_defaulted,
+        "description": description,
+        "expense_date": expense_date,
+    }
+
+
+def _format_expense_amount(amount):
+    """Format a Decimal amount as Ukrainian-locale PLN display: comma
+    decimal, always two decimal places (money, unlike item quantities)."""
+    return f"{amount:.2f}".replace(".", ",") + " zł"
+
+
+def _format_expense_date_display(expense_date, now=None):
+    if now is None:
+        now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    if expense_date == now.date():
+        return "сьогодні"
+    weekday = _UA_WEEKDAYS[expense_date.weekday()]
+    month = _UA_MONTHS_GENITIVE[expense_date.month - 1]
+    return f"{expense_date.day} {month} {expense_date.year}"
+
+
+def _format_expense_preview(payload, now=None):
+    lines = [
+        "💸 Додати витрату?",
+        "",
+        f"Сума: {_format_expense_amount(payload['amount'])}",
+        f"Категорія: {payload['category']}" + (" (не вдалося визначити точно)" if payload["category_was_defaulted"] else ""),
+    ]
+    if payload["description"]:
+        lines.append(f"Опис: {payload['description']}")
+    lines.append(f"Дата: {_format_expense_date_display(payload['expense_date'], now=now)}")
+    lines.append("")
+    lines.append("✅ Так, додати")
+    lines.append("❌ Скасувати")
+    return "\n".join(lines)
+
+
+def _handle_expense_command(chat_id, user_id, display_name, text):
+    """Shared expense-router handling for both the dedicated expenses submenu
+    and the global expense command gate. Mirrors _handle_alias_command:
+    returns True if the message was fully handled here (caller must not fall
+    through to general AI-chat). Returns False only when intent is "none" and
+    origin == "expenses_menu" — the one case allowed to fall through, matching
+    every other router in this file. A global-gate command (origin=="global")
+    is never allowed to fall through, even on "none"/"invalid"/"unresolved" —
+    the gate already confirmed the text looks like an expense command.
+    """
+    origin = _current_expense_origin(chat_id)
+    keyboard = _expense_origin_keyboard(origin)
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        router_result = _ask_gemini_expense_router(text)
+        kind, payload = _validate_expense_router_result(router_result)
+        if kind == "unresolved":
+            lines = ["Не зрозумів частину витрати:", ""]
+            lines += [f"• «{f}»" for f in payload]
+            lines.append("")
+            lines.append("Спробуй сформулювати інакше, наприклад: «Biedronka 86,40 zł — продукти».")
+            send_message(chat_id, "\n".join(lines), reply_markup=keyboard)
+        elif kind == "invalid":
+            send_message(chat_id, EXPENSE_GATE_UNRECOGNIZED_MSG, reply_markup=keyboard)
+        elif kind == "none":
+            if origin == "expenses_menu":
+                return False
+            send_message(chat_id, EXPENSE_GATE_UNRECOGNIZED_MSG, reply_markup=keyboard)
+        else:
+            pending_expense[chat_id] = {
+                "household_id": household_id, "user_db_id": user_db_id,
+                "amount": payload["amount"], "currency": payload["currency"],
+                "category": payload["category"], "description": payload["description"],
+                "expense_date": payload["expense_date"], "origin": origin,
+            }
+            send_message(chat_id, _format_expense_preview(payload), reply_markup=EXPENSE_PREVIEW_KEYBOARD)
+        return True
+    except Exception:
+        send_message(chat_id, "Не вдалося обробити витрату. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+        return True
+
+
 def _format_saved_edit_preview(items_snapshot, validated_updates, context_type):
     """Format before/after preview for a saved list edit."""
     icon = "🛒" if context_type == "shopping_saved" else "🧊"
@@ -2846,6 +3192,10 @@ def webhook():
             alias_data = pending_alias_action.pop(chat_id, None)
             origin = (alias_data or {}).get("origin", "global")
             send_message(chat_id, "Дію з домашніми назвами скасовано.", reply_markup=_alias_origin_keyboard(origin))
+        elif chat_id in pending_expense:
+            expense_data = pending_expense.pop(chat_id, None)
+            origin = (expense_data or {}).get("origin", "global")
+            send_message(chat_id, "Додавання витрати скасовано.", reply_markup=_expense_origin_keyboard(origin))
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -2966,6 +3316,23 @@ def webhook():
                     send_message(chat_id, "Не вдалося змінити назву. Спробуй ще раз трохи пізніше.", reply_markup=_alias_origin_keyboard(origin))
             else:
                 send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
+        else:
+            send_message(chat_id, "Немає активної дії для підтвердження.")
+        return "ok"
+
+    if text == "✅ Так, додати":
+        if chat_id in pending_expense:
+            data = pending_expense.pop(chat_id)
+            origin = data.get("origin", "global")
+            keyboard = _expense_origin_keyboard(origin)
+            try:
+                add_expense(
+                    data["household_id"], data["user_db_id"], data["amount"], data["currency"],
+                    data["category"], data["description"], data["expense_date"],
+                )
+                send_message(chat_id, "✅ Витрату додано.", reply_markup=keyboard)
+            except Exception:
+                send_message(chat_id, "Не вдалося зберегти витрату. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
         else:
             send_message(chat_id, "Немає активної дії для підтвердження.")
         return "ok"
@@ -3286,6 +3653,15 @@ def webhook():
             send_message(chat_id, format_alias_list(list_household_aliases(household_id)), reply_markup=ALIASES_KEYBOARD)
         except Exception:
             send_message(chat_id, "Не вдалося показати домашні назви. Спробуй ще раз трохи пізніше.", reply_markup=ALIASES_KEYBOARD)
+        return "ok"
+
+    if text == "💸 Витрати":
+        waiting_for_ingredients.pop(chat_id, None)
+        active_list_context[chat_id] = "expenses"
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        clear_expense_state(chat_id)
+        send_message(chat_id, EXPENSES_INTRO_TEXT, reply_markup=EXPENSES_KEYBOARD)
         return "ok"
 
     if text == "🧊 Запаси":
@@ -3668,6 +4044,20 @@ def webhook():
         # saved_list_context. _handle_alias_command derives the precise
         # origin (main menu vs open shopping/inventory list) itself.
         _handle_alias_command(chat_id, user_id, display_name, text)
+        _preview_intercepted = True
+
+    elif active_list_context.get(chat_id) == "expenses":
+        if _handle_expense_command(chat_id, user_id, display_name, text):
+            _preview_intercepted = True
+        # else: intent was "none" — fall through to AI chat, same as every other router here.
+
+    elif not _has_blocking_pending_state_for_expense(chat_id) and _expense_command_gate(text):
+        # Global expense command gate — narrow, local, no Gemini call here.
+        # Fires from anywhere but never overrides an active preview/confirm
+        # from ANY other flow, aliases included (aliases has priority over a
+        # new expense command per spec). _handle_expense_command derives the
+        # precise origin (expenses submenu vs main menu) itself.
+        _handle_expense_command(chat_id, user_id, display_name, text)
         _preview_intercepted = True
 
     else:
