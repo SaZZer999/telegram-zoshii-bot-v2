@@ -639,6 +639,35 @@ def get_recent_expenses(household_id, limit=10):
     ]
 
 
+def get_recent_expenses_for_deletion(household_id, limit=10):
+    """Same recency ordering as get_recent_expenses, but each row also
+    carries its id — needed only by the expense-deletion flow to know
+    exactly which row a chosen list number refers to. A separate function
+    (rather than adding id to get_recent_expenses) so the existing v1.2
+    reports helper/shape/tests are left untouched. Never crosses household_id.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, amount, currency, category, description, expense_date, created_at
+                FROM expenses
+                WHERE household_id = %s
+                ORDER BY expense_date DESC, created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (household_id, limit)
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r[0], "amount": r[1], "currency": r[2], "category": r[3],
+            "description": r[4], "expense_date": r[5], "created_at": r[6],
+        }
+        for r in rows
+    ]
+
+
 def get_expense_month_summary(household_id, year, month):
     """Per-category subtotals (Decimal) and grand total for one household's
     expenses within one calendar month (expense_date in [first day of month,
@@ -665,6 +694,42 @@ def get_expense_month_summary(household_id, year, month):
     by_category = {category: amount for category, amount in rows}
     total = sum(by_category.values(), Decimal("0"))
     return {"total": total, "by_category": by_category}
+
+
+def delete_expense(household_id, expense_id, snapshot):
+    """Delete exactly one expense row, but only after re-verifying inside
+    this same transaction (row locked FOR UPDATE, so no concurrent write can
+    slip in first) that it still exists, belongs to household_id, and its
+    amount/category/expense_date/description still match `snapshot` — the
+    values captured when the delete preview was built. Raises
+    StaleSnapshotError (full rollback, nothing deleted) if the row is gone
+    or has changed since. A second call with the same arguments after a
+    successful delete also raises StaleSnapshotError (the row is simply
+    gone), so a repeated confirm can never delete a second row.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT amount, category, expense_date, description FROM expenses "
+                "WHERE id = %s AND household_id = %s FOR UPDATE",
+                (expense_id, household_id)
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise StaleSnapshotError()
+            amount, category, expense_date, description = row
+            if (
+                amount != snapshot["amount"]
+                or category != snapshot["category"]
+                or expense_date != snapshot["expense_date"]
+                or (description or None) != (snapshot.get("description") or None)
+            ):
+                raise StaleSnapshotError()
+            cur.execute(
+                "DELETE FROM expenses WHERE id = %s AND household_id = %s",
+                (expense_id, household_id)
+            )
+        conn.commit()
 
 
 def add_shopping_item(household_id, name, quantity_text, created_by_user_id):
