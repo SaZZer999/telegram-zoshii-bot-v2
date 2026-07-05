@@ -127,6 +127,15 @@ pending_inventory_quantity_clarification = {}  # chat_id -> {household_id, user_
                                 #             add_shopping_items, add_inventory_items,
                                 #             consume_changes, new_expense, delete_expense}
 
+# Global Bare Add v1 — short-lived RAM-only continuation state for a bare
+# "Додай молоко" (no destination phrase) typed from a menu that doesn't
+# already imply one (main menu, aliases, expenses). Holds only the already
+# Gemini-parsed-and-validated item payloads (household_router.
+# parse_bare_add_items), never raw text/Gemini history/database ids, so the
+# next reply ("До покупок"/"У запаси") can build the preview via
+# household_router.build_add_preview_from_items without a second Gemini call.
+pending_add_destination_clarification = {}  # chat_id -> {household_id, user_db_id, origin, validated_items}
+
 # Every OTHER flow's pending preview/confirm state — deliberately excludes
 # pending_alias_action itself (a new global alias command is allowed to
 # overwrite an already-pending alias action, same as the dedicated aliases
@@ -149,6 +158,10 @@ _ALIAS_GATE_BLOCKING_PENDING_STATES = (
     # reasoning: while active, no other gate/flow may start a new preview,
     # touch the database, or reach general AI-chat.
     pending_inventory_quantity_clarification,
+    # Global Bare Add v1's own continuation state — same reasoning: while a
+    # "куди додати?" question is unanswered, no other gate/flow may start a
+    # new preview, touch the database, or reach general AI-chat.
+    pending_add_destination_clarification,
 )
 
 
@@ -805,6 +818,27 @@ GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD = {
 GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG = (
     "У тебе є незавершений план змін.\n\n"
     "Підтвердь його або скасуй перед новою командою."
+)
+
+ADD_DESTINATION_CLARIFICATION_KEYBOARD = {
+    "keyboard": [
+        ["🛒 До покупок", "🧊 До запасів"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+ADD_DESTINATION_CLARIFICATION_QUESTION = (
+    "Куди додати ці позиції?\n\n"
+    "🛒 До покупок\n"
+    "🧊 До запасів"
+)
+
+ADD_DESTINATION_CLARIFICATION_INVALID_MSG = (
+    "Обери, куди додати ці позиції:\n\n"
+    "🛒 До покупок\n"
+    "🧊 До запасів"
 )
 
 RECONCILIATION_PREVIEW_KEYBOARD = {
@@ -3685,9 +3719,9 @@ def _try_global_explicit_add(chat_id, user_id, display_name, text):
     regardless of which menu is open. Returns True if handled (a preview,
     clarification, or invalid/unresolved message was sent). Returns False
     only when no explicit destination phrase is present at all, letting
-    the caller fall through to the existing legacy gates/AI-chat exactly
-    as before this route existed — this is the ONLY case bare "Додай
-    молоко" (no destination) ever hits, so its behavior is untouched.
+    the caller fall through to _try_global_bare_add (Global Bare Add v1,
+    see below) exactly as before this route existed for every OTHER
+    message shape.
     """
     destination, item_text = household_router.detect_explicit_add_destination(text)
     if destination is None:
@@ -3705,6 +3739,90 @@ def _try_global_explicit_add(chat_id, user_id, display_name, text):
     except Exception:
         send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
         return True
+
+
+def _finish_global_bare_add(chat_id, destination, validated_items, household_id, user_db_id, origin, keyboard):
+    """Shared tail for both an immediately-resolved bare add (menu already
+    implies a destination) and a resolved destination-clarification reply —
+    never calls Gemini, only household_router.build_add_preview_from_items
+    on already-validated items, then the same clarify/ok dispatch every
+    other household-router-shaped result uses."""
+    inventory_items = get_inventory_items(household_id) if destination == "add_inventory" else []
+    kind, payload = household_router.build_add_preview_from_items(destination, validated_items, inventory_items)
+    return _handle_household_router_result(chat_id, kind, payload, household_id, user_db_id, origin, keyboard)
+
+
+def _try_global_bare_add(chat_id, user_id, display_name, text):
+    """Global Bare Add v1 — "Додай молоко" with NO destination phrase at all
+    (see household_router.detect_bare_add). Returns True if handled: either
+    a shopping/inventory preview was built directly (active menu is
+    "shopping"/"inventory"), or a "Куди додати ці позиції?" destination
+    clarification was started (pending_add_destination_clarification).
+    Returns False only when the text isn't a bare add at all (no "Додай"
+    verb, or it carries an expense-amount marker like "за 10 zł" — see
+    detect_bare_add's docstring), letting the caller fall through to the
+    existing legacy gates/AI-chat exactly as before this route existed.
+    """
+    item_text = household_router.detect_bare_add(text)
+    if item_text is None:
+        return False
+    origin = household_router.current_origin(chat_id)
+    keyboard = household_router.origin_keyboard(origin)
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        alias_map = get_household_alias_map(household_id)
+        kind, data = household_router.parse_bare_add_items(item_text, alias_map=alias_map)
+        if kind == "unresolved":
+            send_message(chat_id, household_router.format_unresolved_message(data), reply_markup=keyboard)
+            return True
+        if kind == "invalid":
+            send_message(chat_id, household_router.format_invalid_message(data), reply_markup=keyboard)
+            return True
+        # kind == "items" — parsed and validated, destination not yet known.
+        validated_items = data
+        menu = active_list_context.get(chat_id)
+        if menu == "shopping":
+            return _finish_global_bare_add(
+                chat_id, "add_shopping", validated_items, household_id, user_db_id, origin, keyboard,
+            )
+        if menu == "inventory":
+            return _finish_global_bare_add(
+                chat_id, "add_inventory", validated_items, household_id, user_db_id, origin, keyboard,
+            )
+        pending_add_destination_clarification[chat_id] = {
+            "household_id": household_id,
+            "user_db_id": user_db_id,
+            "origin": origin,
+            "validated_items": validated_items,
+        }
+        send_message(chat_id, ADD_DESTINATION_CLARIFICATION_QUESTION, reply_markup=ADD_DESTINATION_CLARIFICATION_KEYBOARD)
+        return True
+    except Exception:
+        send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+        return True
+
+
+def _continue_add_destination_clarification(chat_id, text):
+    """Handle a plain-text reply while pending_add_destination_clarification
+    is active for this chat (Global Bare Add v1). Never re-calls Gemini —
+    works entirely off the validated item payloads captured when the
+    clarification started. Always returns having fully handled the message
+    (the caller must not fall through to anything else)."""
+    destination = household_router.parse_add_destination_answer(text)
+    if destination is None:
+        send_message(chat_id, ADD_DESTINATION_CLARIFICATION_INVALID_MSG)
+        return
+    data = pending_add_destination_clarification.pop(chat_id)
+    household_id = data["household_id"]
+    user_db_id = data["user_db_id"]
+    origin = data.get("origin", "global")
+    keyboard = household_router.origin_keyboard(origin)
+    try:
+        _finish_global_bare_add(
+            chat_id, destination, data["validated_items"], household_id, user_db_id, origin, keyboard,
+        )
+    except Exception:
+        send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
 
 
 def _apply_global_household_confirm(chat_id):
@@ -4035,6 +4153,10 @@ def webhook():
             data = pending_inventory_quantity_clarification.pop(chat_id, None)
             origin = (data or {}).get("origin", "global")
             send_message(chat_id, "Уточнення скасовано.", reply_markup=household_router.origin_keyboard(origin))
+        elif chat_id in pending_add_destination_clarification:
+            data = pending_add_destination_clarification.pop(chat_id, None)
+            origin = (data or {}).get("origin", "global")
+            send_message(chat_id, "Вибір місця додавання скасовано.", reply_markup=household_router.origin_keyboard(origin))
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -4365,6 +4487,7 @@ def webhook():
         clear_inventory_state(chat_id)
         clear_list_context(chat_id)
         pending_inventory_quantity_clarification.pop(chat_id, None)
+        pending_add_destination_clarification.pop(chat_id, None)
         send_message(
             chat_id,
             "Привіт! Я твій домашній помічник 🏠\n\n"
@@ -4380,6 +4503,7 @@ def webhook():
         clear_inventory_state(chat_id)
         clear_list_context(chat_id)
         pending_inventory_quantity_clarification.pop(chat_id, None)
+        pending_add_destination_clarification.pop(chat_id, None)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -4467,6 +4591,7 @@ def webhook():
         clear_inventory_state(chat_id)
         clear_list_context(chat_id)
         pending_inventory_quantity_clarification.pop(chat_id, None)
+        pending_add_destination_clarification.pop(chat_id, None)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -4975,6 +5100,19 @@ def webhook():
         send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
         _preview_intercepted = True
 
+    elif chat_id in pending_add_destination_clarification:
+        # Global Bare Add v1: a bare "Додай молоко" (no destination phrase,
+        # active menu didn't already imply one) is awaiting a "До покупок"/
+        # "У запаси" reply (the matching "❌ Скасувати" button text is
+        # already handled earlier, before this router chain — reaching here
+        # means the text is something else). Checked ahead of explicit add/
+        # the household_router gate/every legacy gate below so no new text
+        # can start a new preview, touch the database, or reach general
+        # AI-chat while this question is unanswered — an invalid reply just
+        # re-asks the same question instead of falling through anywhere.
+        _continue_add_destination_clarification(chat_id, text)
+        _preview_intercepted = True
+
     elif (
         not _has_blocking_pending_state_for_reports(chat_id)
         and _try_global_explicit_add(chat_id, user_id, display_name, text)
@@ -4985,8 +5123,24 @@ def webhook():
         # list regardless of which menu is open. Checked ahead of the
         # household_router gate below so an explicit destination always
         # wins; _try_global_explicit_add itself returns False when no such
-        # phrase is present at all, falling through unchanged to every gate
+        # phrase is present at all, falling through to Global Bare Add v1
         # below exactly as before this route existed.
+        _preview_intercepted = True
+
+    elif (
+        not _has_blocking_pending_state_for_reports(chat_id)
+        and _try_global_bare_add(chat_id, user_id, display_name, text)
+    ):
+        # Global Bare Add v1 — a bare "Додай молоко" with NO destination
+        # phrase at all (see household_router.detect_bare_add). Checked
+        # right after explicit add (which already claimed every destination
+        # phrase) and ahead of the household_router gate below. Builds the
+        # preview directly when the active menu is "shopping"/"inventory",
+        # otherwise starts pending_add_destination_clarification above.
+        # _try_global_bare_add itself returns False when the text isn't a
+        # bare add at all (no "Додай" verb, or it carries an expense-amount
+        # marker), falling through unchanged to every gate below exactly as
+        # before this route existed.
         _preview_intercepted = True
 
     elif (

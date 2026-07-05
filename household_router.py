@@ -843,6 +843,47 @@ def _validate_explicit_add_items(items_raw, alias_map):
     return result
 
 
+def build_add_preview_from_items(destination, validated_items, inventory_items):
+    """Shared tail of Global Explicit Add v1 and Global Bare Add v1: turns an
+    already-validated item list plus a decided `destination` ("add_shopping"
+    or "add_inventory") into the exact (kind, payload) shape
+    _validate_operations_detailed produces — ("ok", payload) or
+    ("clarify", {...}) for the inventory representation guard. Never touches
+    Gemini — callers have already done that (or never needed to)."""
+    if destination == "add_shopping":
+        add_shopping_items = _bot._auto_merge_in_place(validated_items)
+        return "ok", {
+            "add_shopping_items": add_shopping_items,
+            "add_inventory_items": [],
+            "consume_changes": [],
+            "new_expense": None,
+            "delete_expense": None,
+            "inventory_merge_targets": [],
+        }
+
+    # destination == "add_inventory"
+    add_inventory_items = _bot._auto_merge_in_place(validated_items)
+    guard_kind, guard_result = apply_inventory_representation_guard(add_inventory_items, inventory_items)
+    if guard_kind == "clarify":
+        return "clarify", {
+            **guard_result,
+            "add_shopping_items": [],
+            "add_inventory_items": add_inventory_items,
+            "consume_changes": [],
+            "new_expense": None,
+            "delete_expense": None,
+        }
+    add_inventory_items, inventory_merge_targets = guard_result
+    return "ok", {
+        "add_shopping_items": [],
+        "add_inventory_items": add_inventory_items,
+        "consume_changes": [],
+        "new_expense": None,
+        "delete_expense": None,
+        "inventory_merge_targets": inventory_merge_targets,
+    }
+
+
 def build_explicit_add_preview(destination, item_text, inventory_items, alias_map=None):
     """Top-level entry point for Global Explicit Add v1. `destination`
     ("add_shopping" or "add_inventory") and `item_text` (destination phrase
@@ -877,35 +918,90 @@ def build_explicit_add_preview(destination, item_text, inventory_items, alias_ma
     if validated is None:
         return "invalid", ["Не зміг безпечно розпізнати товар."]
 
-    if destination == "add_shopping":
-        add_shopping_items = _bot._auto_merge_in_place(validated)
-        return "ok", {
-            "add_shopping_items": add_shopping_items,
-            "add_inventory_items": [],
-            "consume_changes": [],
-            "new_expense": None,
-            "delete_expense": None,
-            "inventory_merge_targets": [],
-        }
+    return build_add_preview_from_items(destination, validated, inventory_items)
 
-    # destination == "add_inventory"
-    add_inventory_items = _bot._auto_merge_in_place(validated)
-    guard_kind, guard_result = apply_inventory_representation_guard(add_inventory_items, inventory_items)
-    if guard_kind == "clarify":
-        return "clarify", {
-            **guard_result,
-            "add_shopping_items": [],
-            "add_inventory_items": add_inventory_items,
-            "consume_changes": [],
-            "new_expense": None,
-            "delete_expense": None,
-        }
-    add_inventory_items, inventory_merge_targets = guard_result
-    return "ok", {
-        "add_shopping_items": [],
-        "add_inventory_items": add_inventory_items,
-        "consume_changes": [],
-        "new_expense": None,
-        "delete_expense": None,
-        "inventory_merge_targets": inventory_merge_targets,
-    }
+
+# =========================
+# GLOBAL BARE ADD v1 — "Додай молоко" with NO destination phrase at all.
+# detect_bare_add strips just the bare "Додай"/"Додайте" verb (deterministic,
+# no Gemini) and deliberately refuses any fragment carrying an expense-amount
+# marker (zł/zl/pln/a bare "z"), so a message like "Додай молоко за 10 zł"
+# is never treated as a bare add at all — it falls through unchanged to
+# whichever existing gate already owns that phrasing (the expense-add gate),
+# exactly like before this feature existed. Item parsing itself
+# (parse_bare_add_items) reuses the SAME Gemini prompt/validation as Global
+# Explicit Add v1 — there is no second parser — and is destination-agnostic,
+# so callers can parse once, ask "покупки чи запаси?" if the active menu
+# doesn't already answer that, and only then call
+# build_add_preview_from_items without ever calling Gemini a second time.
+# =========================
+_BARE_ADD_RE = re.compile(r"^додай(?:те)?\s+", re.IGNORECASE)
+
+
+def detect_bare_add(text):
+    """Returns the item text (bare "Додай"/"Додайте" verb stripped) if `text`
+    is a bare add command with no explicit destination and no expense-amount
+    marker, or None otherwise. Caller must already have ruled out an explicit
+    destination phrase (detect_explicit_add_destination) before calling this
+    — a message that matches both is always handled as the explicit-add one.
+    """
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    match = _BARE_ADD_RE.match(stripped)
+    if not match:
+        return None
+    rest = stripped[match.end():].strip()
+    if not rest:
+        return None
+    if expenses._EXPENSE_AMOUNT_RE.search(rest):
+        return None
+    return rest
+
+
+def parse_bare_add_items(item_text, alias_map=None):
+    """The destination-agnostic first half of Global Bare Add v1: ONE Gemini
+    call (the same EXPLICIT_ADD_ITEM_PROMPT Global Explicit Add v1 already
+    uses) plus the same validation, before any destination is known. Returns
+    ("unresolved", [fragments]) / ("invalid", [reasons]) / ("items", [validated
+    items]) — the caller decides the destination (from the active menu, or by
+    asking) and then calls build_add_preview_from_items with the same
+    validated items, never re-parsing.
+    """
+    router_result = _ask_gemini_explicit_add_items(item_text)
+    fragments = router_result.get("unresolved_fragments")
+    if isinstance(fragments, list):
+        cleaned_fragments = [str(f).strip() for f in fragments if str(f).strip()]
+        if cleaned_fragments:
+            return "unresolved", cleaned_fragments
+
+    raw_items = router_result.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        return "invalid", ["Не зміг розпізнати жодного товару в повідомленні."]
+
+    validated = _validate_explicit_add_items(raw_items, alias_map)
+    if validated is None:
+        return "invalid", ["Не зміг безпечно розпізнати товар."]
+
+    return "items", validated
+
+
+_DESTINATION_ANSWER_SHOPPING = {"до покупок", "у покупки", "в покупки", "покупки", "🛒 до покупок"}
+_DESTINATION_ANSWER_INVENTORY = {"до запасів", "у запаси", "в запаси", "запаси", "🧊 до запасів"}
+
+
+def parse_add_destination_answer(text):
+    """Parses a reply to the Global Bare Add v1 "Куди додати ці позиції?"
+    question into "add_shopping"/"add_inventory"/None (invalid). Deliberately
+    a fixed phrase set, never fuzzy matching or Gemini — same determinism as
+    detect_explicit_add_destination."""
+    if not isinstance(text, str):
+        return None
+    normalized = text.strip().lower()
+    if normalized in _DESTINATION_ANSWER_SHOPPING:
+        return "add_shopping"
+    if normalized in _DESTINATION_ANSWER_INVENTORY:
+        return "add_inventory"
+    return None
