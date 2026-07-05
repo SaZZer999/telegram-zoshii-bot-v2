@@ -1040,7 +1040,21 @@ def _merge_or_insert_inventory_in_tx(cur, household_id, user_db_id, name, qty_te
     """Merge into existing inventory item or insert new one (within open cursor).
 
     Matches on canonical_name; category must match exactly or either side be
-    DEFAULT_CATEGORY. Quantities are summed only via structured value/unit.
+    DEFAULT_CATEGORY. Quantities are summed only via structured value/unit
+    (merge_quantity_values decides — never a broader unit-group conversion
+    here).
+
+    Inventory Representation Guard v1: candidate rows are locked FOR UPDATE
+    and tried in id order, merging into the FIRST one merge_quantity_values
+    actually accepts — not just the first category-compatible row overall.
+    If a caller's preview predicted a merge into a specific existing row
+    (see bot.py's resolve_inventory_representation), that row's snapshot
+    should already have been passed as an inventory_targets entry and
+    verified via _verify_targets_in_tx before this function runs, so by the
+    time we get here it is guaranteed unchanged and this loop reaches the
+    exact same row. If none of the candidates can merge, a new row is
+    inserted — this is the deliberate "separate record" outcome the guard's
+    preview already warned the user about, never a silent duplicate.
     """
     if canonical_name is None:
         normalized = normalize_quantity_fields(name, qty_text, allow_default_unit=True)
@@ -1052,27 +1066,27 @@ def _merge_or_insert_inventory_in_tx(cur, household_id, user_db_id, name, qty_te
 
     cur.execute(
         "SELECT id, category, quantity_value, quantity_unit, quantity_inferred FROM inventory_items "
-        "WHERE household_id=%s AND canonical_name=%s ORDER BY id ASC",
+        "WHERE household_id=%s AND canonical_name=%s ORDER BY id ASC FOR UPDATE",
         (household_id, canonical_name)
     )
-    existing = None
-    for cand_id, cand_category, cand_value, cand_unit, cand_inferred in cur.fetchall():
-        if cand_category == category or cand_category == DEFAULT_CATEGORY or category == DEFAULT_CATEGORY:
-            existing = (cand_id, float(cand_value) if cand_value is not None else None, cand_unit, cand_inferred)
-            break
+    candidates = [
+        (cand_id, float(cand_value) if cand_value is not None else None, cand_unit, cand_inferred)
+        for cand_id, cand_category, cand_value, cand_unit, cand_inferred in cur.fetchall()
+        if cand_category == category or cand_category == DEFAULT_CATEGORY or category == DEFAULT_CATEGORY
+    ]
 
-    if existing is not None and quantity_value is not None:
-        ex_id, ex_value, ex_unit, ex_inferred = existing
-        merged = merge_quantity_values(ex_value, ex_unit, quantity_value, quantity_unit)
-        if merged is not None:
-            merged_value, merged_unit = merged
-            cur.execute(
-                "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
-                "quantity_inferred=%s, updated_at=NOW() WHERE id=%s",
-                (format_quantity_display(merged_value, merged_unit), merged_value, merged_unit,
-                 bool(ex_inferred) and bool(quantity_inferred), ex_id)
-            )
-            return
+    if quantity_value is not None:
+        for ex_id, ex_value, ex_unit, ex_inferred in candidates:
+            merged = merge_quantity_values(ex_value, ex_unit, quantity_value, quantity_unit)
+            if merged is not None:
+                merged_value, merged_unit = merged
+                cur.execute(
+                    "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
+                    "quantity_inferred=%s, updated_at=NOW() WHERE id=%s",
+                    (format_quantity_display(merged_value, merged_unit), merged_value, merged_unit,
+                     bool(ex_inferred) and bool(quantity_inferred), ex_id)
+                )
+                return
 
     cur.execute(
         "INSERT INTO inventory_items (household_id, name, quantity_text, category, created_by_user_id, "
@@ -1194,10 +1208,20 @@ def add_shopping_items_batch(household_id, created_by_user_id, items):
         conn.commit()
     return len(items)
 
-def add_inventory_items_batch(household_id, created_by_user_id, items):
-    """Add multiple inventory items, merging duplicates with compatible quantities."""
+def add_inventory_items_batch(household_id, created_by_user_id, items, targets=None):
+    """Add multiple inventory items, merging duplicates with compatible quantities.
+
+    targets (optional): Inventory Representation Guard v1 merge-target
+    snapshots ({item_id, quantity_value, quantity_unit}) for every item the
+    caller's preview predicted would merge into a specific existing row —
+    verified for staleness inside this same transaction (same guard every
+    other confirm-flow uses) before anything is written. Raises
+    StaleSnapshotError (nothing applied) if a target row changed or vanished
+    since the preview was built.
+    """
     with get_connection() as conn:
         with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, targets)
             for item in items:
                 _merge_or_insert_inventory_in_tx(
                     cur, household_id, created_by_user_id,

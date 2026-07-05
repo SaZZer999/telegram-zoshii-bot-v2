@@ -1429,6 +1429,117 @@ def merge_quantity_values(value_a, unit_a, value_b, unit_b):
     return dec_a + dec_b, unit_a
 
 
+# =========================
+# INVENTORY REPRESENTATION GUARD v1
+#
+# Shared classification (single copy, used directly here for the normal/
+# legacy inventory add flow and via the injected `_bot` reference from
+# household_router.py for the Global Household Router) that decides what an
+# incoming inventory item should do against EVERY existing row sharing its
+# canonical_name — not just the first one _merge_or_insert_inventory_in_tx
+# happens to find. Never reimplements unit conversion or Decimal arithmetic:
+# the actual "can this merge" answer always comes from merge_quantity_values
+# itself, so the preview-time prediction and the confirm-time write (which
+# also calls merge_quantity_values, see database.py's updated
+# _merge_or_insert_inventory_in_tx) can never disagree.
+# =========================
+def find_inventory_representation_matches(inventory_items, canonical_name, category):
+    """All existing inventory_items rows (already-fetched snapshot for this
+    household) a new item with this canonical_name/category would compete
+    with for merge/insert — mirrors _merge_or_insert_inventory_in_tx's exact
+    category-compatibility rule and ORDER BY id ASC candidate order. Returns
+    a list (possibly empty), sorted by id."""
+    matches = [
+        item for item in inventory_items
+        if item.get("canonical_name") == canonical_name
+        and (item.get("category") == category or item.get("category") == DEFAULT_CATEGORY or category == DEFAULT_CATEGORY)
+    ]
+    matches.sort(key=lambda it: it["id"])
+    return matches
+
+
+def classify_inventory_representation(existing_value, existing_unit, incoming_value, incoming_unit, incoming_inferred):
+    """Decide how an incoming quantity relates to ONE existing row's
+    quantity/unit. Returns:
+      "merge"    — merge_quantity_values actually succeeds against this row.
+      "clarify"  — incoming is an inferred guess (quantity_inferred=True)
+                   that can't merge here — the whole preview/operation must
+                   be blocked and the user asked for an explicit quantity,
+                   never silently guessed or written.
+      "separate" — incoming is an explicit (non-inferred) quantity that
+                   still can't merge — safe to add as its own row, but the
+                   preview must say so explicitly, never silently.
+    """
+    if merge_quantity_values(existing_value, existing_unit, incoming_value, incoming_unit) is not None:
+        return "merge"
+    return "clarify" if incoming_inferred else "separate"
+
+
+def resolve_inventory_representation(inventory_items, canonical_name, category,
+                                      quantity_value, quantity_unit, quantity_inferred):
+    """Full v1 guard decision for one incoming inventory item against ALL
+    existing rows sharing canonical_name (not just the first). Returns
+    (outcome, existing_item):
+      ("none", None)            — no existing row at all; plain add.
+      ("merge", existing_item)  — merges into this specific existing row
+          (first candidate, in id order, merge_quantity_values actually
+          succeeds against — same order the write path uses).
+      ("clarify", existing_item) — blocks the whole preview/operation.
+      ("separate", existing_item) — safe to add as its own row; existing_item
+          (first candidate by id) is only used to build the warning message.
+    """
+    candidates = find_inventory_representation_matches(inventory_items, canonical_name, category)
+    if not candidates:
+        return "none", None
+    for existing in candidates:
+        outcome = classify_inventory_representation(
+            existing.get("quantity_value"), existing.get("quantity_unit"),
+            quantity_value, quantity_unit, quantity_inferred,
+        )
+        if outcome == "merge":
+            return "merge", existing
+    first = candidates[0]
+    return ("clarify" if quantity_inferred else "separate"), first
+
+
+def format_representation_clarify_message(name, existing_display):
+    """The blocking clarification message for the "clarify" outcome — no
+    preview is built and nothing is written; the user must restate an
+    explicit quantity/unit or container count."""
+    return (
+        f"У запасах уже є «{name} — {existing_display}».\n\n"
+        f"Скільки {name} ти купив?\n"
+        f"Напиши явну кількість і одиницю (наприклад «1 л») або кількість тари (наприклад «дві пачки»)."
+    )
+
+
+def format_representation_separate_warning(name, existing_display, incoming_display):
+    """The non-blocking warning paragraph for the "separate" outcome —
+    incoming item is still added, just never silently merged."""
+    existing_text = (existing_display or "").rstrip(".")
+    incoming_text = (incoming_display or "").rstrip(".")
+    return (
+        f"⚠️ {name} вже є у запасах: {existing_text}.\n"
+        f"Нове надходження: {incoming_text}.\n"
+        f"Його буде збережено окремою позицією, без об'єднання."
+    )
+
+
+def format_representation_merge_line(name, existing_display, incoming_display, merged_display):
+    """The honest "X + Y -> буде Z" line for the "merge" outcome, replacing
+    the plain "Додати ..." line for that one item — bullet-list style, used
+    by household_router.py's own preview formatter."""
+    return f"• {name} — {existing_display} + {incoming_display} → буде {merged_display}"
+
+
+def format_representation_merge_quantity_fragment(existing_display, incoming_display, merged_display):
+    """Same "X + Y -> буде Z" honesty as format_representation_merge_line,
+    but just the quantity fragment (no name/bullet) — composes with
+    format_grouped_list's own "{n}. {name} — {qty}" numbered-list template,
+    used by the normal/legacy inventory add flow's preview."""
+    return f"{existing_display} + {incoming_display} → буде {merged_display}"
+
+
 def _effective_quantity(item):
     """Return (value, unit, display_text) for an item, preferring structured fields."""
     value = item.get("quantity_value")
@@ -2980,8 +3091,15 @@ def _try_global_household_router(chat_id, user_id, display_name, text):
         if kind == "invalid":
             send_message(chat_id, household_router.format_invalid_message(payload), reply_markup=keyboard)
             return True
+        if kind == "clarify":
+            # Inventory Representation Guard: an inferred incoming quantity
+            # conflicts with an existing row's representation — block the
+            # whole compound preview, nothing is written, ask for an
+            # explicit quantity instead of guessing.
+            send_message(chat_id, payload, reply_markup=keyboard)
+            return True
         # kind == "ok"
-        inventory_targets = _snapshot_targets(payload["consume_changes"])
+        inventory_targets = _snapshot_targets(payload["consume_changes"]) + payload["inventory_merge_targets"]
         pending_global_household[chat_id] = {
             "add_shopping_items": payload["add_shopping_items"],
             "add_inventory_items": payload["add_inventory_items"],
@@ -3127,9 +3245,12 @@ def webhook():
                 count = add_inventory_items_batch(
                     batch["household_id"],
                     batch["user_db_id"],
-                    batch["items"]
+                    batch["items"],
+                    targets=batch.get("inventory_targets"),
                 )
                 send_message(chat_id, f"✅ Додано до запасів: {count}", reply_markup=INVENTORY_KEYBOARD)
+            except StaleSnapshotError:
+                send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=INVENTORY_KEYBOARD)
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         elif chat_id in pending_batch:
@@ -3906,13 +4027,58 @@ def webhook():
             return "ok"
         items = _auto_merge_in_place(items)
         try:
+            existing_inventory = get_inventory_items(household_id)
+            inventory_targets = []
+            representation_notes = []
+            display_items = []
+            for item in items:
+                outcome, existing = resolve_inventory_representation(
+                    existing_inventory, item.get("canonical_name"), item.get("category"),
+                    item.get("quantity_value"), item.get("quantity_unit"), item.get("quantity_inferred", False),
+                )
+                if outcome == "clarify":
+                    inventory_mode[chat_id] = "adding"
+                    send_message(chat_id, format_representation_clarify_message(item["name"], existing["quantity_text"]))
+                    return "ok"
+                if outcome == "merge":
+                    # `items` (the write path, stored in pending_inventory_batch below)
+                    # keeps the raw incoming quantity untouched — the actual merge
+                    # arithmetic happens fresh at confirm time in
+                    # _merge_or_insert_inventory_in_tx. `display_items` is a
+                    # preview-only copy so the honest "X + Y -> буде Z" line can
+                    # replace the plain quantity without touching what gets written.
+                    merged_value, merged_unit = merge_quantity_values(
+                        existing["quantity_value"], existing["quantity_unit"],
+                        item["quantity_value"], item["quantity_unit"],
+                    )
+                    display_item = dict(item)
+                    display_item["quantity_value"] = None
+                    display_item["quantity_text"] = format_representation_merge_quantity_fragment(
+                        existing["quantity_text"], item["quantity_text"],
+                        format_quantity_display(merged_value, merged_unit),
+                    )
+                    display_items.append(display_item)
+                    inventory_targets.append({
+                        "item_id": existing["id"], "quantity_value": existing["quantity_value"],
+                        "quantity_unit": existing["quantity_unit"],
+                    })
+                    continue
+                if outcome == "separate":
+                    representation_notes.append(format_representation_separate_warning(
+                        item["name"], existing["quantity_text"], item["quantity_text"],
+                    ))
+                display_items.append(item)
+
             pending_inventory_batch[chat_id] = {
                 "items": items,
                 "ignored_items": result["ignored_items"],
                 "household_id": household_id,
                 "user_db_id": user_db_id,
+                "inventory_targets": inventory_targets,
             }
-            preview = format_inventory_preview(items, result["ignored_items"])
+            preview = format_inventory_preview(display_items, result["ignored_items"])
+            if representation_notes:
+                preview = "\n\n".join(representation_notes) + "\n\n" + preview
             send_message(chat_id, preview, reply_markup=ADD_INVENTORY_PREVIEW_KEYBOARD)
         except Exception:
             send_message(chat_id, INVENTORY_ERROR_MSG)

@@ -325,12 +325,22 @@ def _validate_operations(router_result, inventory_items, recent_expenses, now, a
     """Validate the global household router's JSON against live snapshots.
 
     Returns one of:
-      ("ok", payload) — payload has add_shopping_items, add_inventory_items,
+      ("ok", payload) — payload has add_shopping_items, add_inventory_items
+          (each add_inventory item may carry "_representation_outcome"
+          "merge"/"separate" plus a "_representation_note" preview line —
+          see the Inventory Representation Guard v1 pass below),
+          inventory_merge_targets ([{item_id, quantity_value, quantity_unit}]
+          snapshots for every "merge" outcome, to be folded into the
+          caller's inventory_targets so confirm-time re-verifies them),
           consume_changes (resolved dicts, see _resolve_consumption shape),
           new_expense (dict or None), delete_expense (dict or None: id +
           snapshot + display label).
       ("unresolved", [fragment_str, ...]) — blocks the entire result.
       ("invalid", [reason_str, ...]) — blocks the entire result.
+      ("clarify", message_str) — an inferred incoming inventory quantity
+          conflicts with an existing row's representation; blocks the
+          entire result (never a partial apply) and asks the user to state
+          an explicit quantity instead of guessing.
       ("none", None)
     """
     fragments = router_result.get("unresolved_fragments")
@@ -482,6 +492,43 @@ def _validate_operations(router_result, inventory_items, recent_expenses, now, a
     add_shopping_items = _bot._auto_merge_in_place(add_shopping_raw) if add_shopping_raw else []
     add_inventory_items = _bot._auto_merge_in_place(add_inventory_raw) if add_inventory_raw else []
 
+    # Inventory Representation Guard v1 — runs on the FINAL (already
+    # RAM-deduplicated) add_inventory_items, once per distinct product, so a
+    # message mentioning the same product twice is checked against the live
+    # inventory exactly once, using its combined quantity. Checks every
+    # existing row sharing canonical_name (not just the first) via
+    # _bot.resolve_inventory_representation — never a silent merge/duplicate
+    # on a unit mismatch.
+    inventory_merge_targets = []
+    for item in add_inventory_items:
+        outcome, existing = _bot.resolve_inventory_representation(
+            inventory_items, item.get("canonical_name"), item.get("category"),
+            item.get("quantity_value"), item.get("quantity_unit"), item.get("quantity_inferred", False),
+        )
+        if outcome == "clarify":
+            # Blocks the WHOLE compound preview — never apply the rest of
+            # the operations partially just because one item is ambiguous.
+            return "clarify", _bot.format_representation_clarify_message(item["name"], existing["quantity_text"])
+        if outcome == "merge":
+            merged_value, merged_unit = _bot.merge_quantity_values(
+                existing["quantity_value"], existing["quantity_unit"],
+                item["quantity_value"], item["quantity_unit"],
+            )
+            item["_representation_outcome"] = "merge"
+            item["_representation_note"] = _bot.format_representation_merge_line(
+                item["name"], existing["quantity_text"], item["quantity_text"],
+                _bot.format_quantity_display(merged_value, merged_unit),
+            )
+            inventory_merge_targets.append({
+                "item_id": existing["id"], "quantity_value": existing["quantity_value"],
+                "quantity_unit": existing["quantity_unit"],
+            })
+        elif outcome == "separate":
+            item["_representation_outcome"] = "separate"
+            item["_representation_note"] = _bot.format_representation_separate_warning(
+                item["name"], existing["quantity_text"], item["quantity_text"],
+            )
+
     if not add_shopping_items and not add_inventory_items and not consume_changes and not new_expense and not delete_expense:
         return "invalid", ["Не знайшов жодної дії для виконання."]
 
@@ -491,6 +538,7 @@ def _validate_operations(router_result, inventory_items, recent_expenses, now, a
         "consume_changes": consume_changes,
         "new_expense": new_expense,
         "delete_expense": delete_expense,
+        "inventory_merge_targets": inventory_merge_targets,
     }
 
 
@@ -517,10 +565,20 @@ def format_preview(payload):
             lines.append(_format_new_item_line(item))
 
     if payload["add_inventory_items"] or payload["consume_changes"]:
+        separate_warnings = [
+            item["_representation_note"] for item in payload["add_inventory_items"]
+            if item.get("_representation_outcome") == "separate"
+        ]
+        for warning in separate_warnings:
+            lines.append("")
+            lines.append(warning)
         lines.append("")
         lines.append("🧊 Запаси")
         for item in payload["add_inventory_items"]:
-            lines.append(_format_new_item_line(item))
+            if item.get("_representation_outcome") == "merge":
+                lines.append(item["_representation_note"])
+            else:
+                lines.append(_format_new_item_line(item))
         for c in payload["consume_changes"]:
             label = c["name"]
             if c["old_display"]:
