@@ -723,6 +723,7 @@ SHOPPING_KEYBOARD = {
     "keyboard": [
         ["➕ Додати товар", "📋 Показати список"],
         ["✅ Позначити купленим", "🗑️ Видалити товар"],
+        [action_history.UNDO_BUTTON_TEXT],
         ["⬅️ Головне меню"]
     ],
     "resize_keyboard": True,
@@ -741,6 +742,7 @@ ADD_PREVIEW_KEYBOARD = {
 INVENTORY_KEYBOARD = {
     "keyboard": [
         ["➕ Додати продукти", "📋 Показати запаси"],
+        [action_history.UNDO_BUTTON_TEXT],
         ["➖ Використати / прибрати", "⬅️ Головне меню"],
     ],
     "resize_keyboard": True,
@@ -874,6 +876,7 @@ RECONCILIATION_PREVIEW_KEYBOARD = {
 ALIASES_KEYBOARD = {
     "keyboard": [
         ["📋 Показати назви"],
+        [action_history.UNDO_BUTTON_TEXT],
         ["⬅️ Головне меню"],
     ],
     "resize_keyboard": True,
@@ -907,7 +910,13 @@ ALIAS_DELETE_CONFIRM_KEYBOARD = {
     "one_time_keyboard": True,
 }
 
-# Expense keyboards now live in expenses.py — re-exported here.
+# Expense keyboards now live in expenses.py — re-exported here. The undo
+# button row is inserted into the SAME dict object expenses.py owns (not a
+# copy), right before its trailing "⬅️ Головне меню" row, so
+# expenses._expense_origin_keyboard("expenses_menu") — which returns its own
+# module-level EXPENSES_KEYBOARD — shows the button too, without editing
+# expenses.py itself.
+expenses.EXPENSES_KEYBOARD["keyboard"].insert(-1, [action_history.UNDO_BUTTON_TEXT])
 EXPENSES_KEYBOARD = expenses.EXPENSES_KEYBOARD
 EXPENSE_PREVIEW_KEYBOARD = expenses.EXPENSE_PREVIEW_KEYBOARD
 EXPENSE_DELETE_PREVIEW_KEYBOARD = expenses.EXPENSE_DELETE_PREVIEW_KEYBOARD

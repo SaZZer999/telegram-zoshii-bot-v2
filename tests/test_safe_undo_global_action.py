@@ -456,7 +456,10 @@ os.environ.setdefault('GEMINI_API_KEY', 'test_gemini_key')
 os.environ.setdefault('ALLOWED_USER_IDS', '')
 
 import bot  # noqa: E402
-from bot import pending_undo_action, MAIN_KEYBOARD  # noqa: E402
+from bot import (  # noqa: E402
+    pending_undo_action, MAIN_KEYBOARD, SHOPPING_KEYBOARD, INVENTORY_KEYBOARD,
+    ALIASES_KEYBOARD, EXPENSES_KEYBOARD,
+)
 
 
 def _make_update(update_id, chat_id, text, user_id=555):
@@ -548,6 +551,110 @@ class TestNavigationClearsPendingUndo(unittest.TestCase):
         self.assertNotIn(chat_id, pending_undo_action)
         sent_texts = [call.args[1] for call in self.mock_send.call_args_list]
         self.assertIn(action_history.UNDO_CANCELLED_MSG, sent_texts)
+
+
+def _keyboard_buttons(keyboard):
+    return [b for row in keyboard["keyboard"] for b in row]
+
+
+class TestUndoButtonPresentInEverySubmenu(unittest.TestCase):
+    """#1-4 (UX fix): the same undo button shown on the main menu is also
+    present on every submenu keyboard — shopping, inventory, expenses,
+    aliases — none of the existing buttons on those keyboards were removed."""
+
+    def test_present_in_shopping_keyboard(self):
+        self.assertIn(action_history.UNDO_BUTTON_TEXT, _keyboard_buttons(SHOPPING_KEYBOARD))
+        self.assertIn("➕ Додати товар", _keyboard_buttons(SHOPPING_KEYBOARD))
+        self.assertIn("⬅️ Головне меню", _keyboard_buttons(SHOPPING_KEYBOARD))
+
+    def test_present_in_inventory_keyboard(self):
+        self.assertIn(action_history.UNDO_BUTTON_TEXT, _keyboard_buttons(INVENTORY_KEYBOARD))
+        self.assertIn("➕ Додати продукти", _keyboard_buttons(INVENTORY_KEYBOARD))
+        self.assertIn("⬅️ Головне меню", _keyboard_buttons(INVENTORY_KEYBOARD))
+
+    def test_present_in_expenses_keyboard(self):
+        self.assertIn(action_history.UNDO_BUTTON_TEXT, _keyboard_buttons(EXPENSES_KEYBOARD))
+        self.assertIn("🗑️ Видалити витрату", _keyboard_buttons(EXPENSES_KEYBOARD))
+        self.assertIn("⬅️ Головне меню", _keyboard_buttons(EXPENSES_KEYBOARD))
+
+    def test_present_in_aliases_keyboard(self):
+        self.assertIn(action_history.UNDO_BUTTON_TEXT, _keyboard_buttons(ALIASES_KEYBOARD))
+        self.assertIn("📋 Показати назви", _keyboard_buttons(ALIASES_KEYBOARD))
+        self.assertIn("⬅️ Головне меню", _keyboard_buttons(ALIASES_KEYBOARD))
+
+
+class TestUndoButtonFromSubmenuTriggersSameFlow(unittest.TestCase):
+    """#5: pressing the undo button from a submenu (not just the main menu)
+    goes through the exact same _start_undo_flow as the main-menu button —
+    no separate handler, no new pending state."""
+
+    def setUp(self):
+        pending_undo_action.clear()
+        patcher_send = patch.object(bot, "send_message")
+        self.mock_send = patcher_send.start()
+        self.addCleanup(patcher_send.stop)
+        patcher_get_user = patch.object(bot, "get_household_and_user", return_value=(1, 10))
+        self.mock_get_user = patcher_get_user.start()
+        self.addCleanup(patcher_get_user.stop)
+
+    def tearDown(self):
+        pending_undo_action.clear()
+        bot.active_list_context.clear()
+
+    def test_button_from_inventory_submenu_starts_undo_preview(self):
+        chat_id = 8901
+        bot.active_list_context[chat_id] = "inventory"
+        with patch.object(bot, "get_latest_undoable_action", return_value=None) as mock_get_action:
+            _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
+        mock_get_action.assert_called_once_with(1, 10)
+        sent_texts = [call.args[1] for call in self.mock_send.call_args_list]
+        self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, sent_texts)
+        self.assertNotIn(chat_id, pending_undo_action)
+
+    def test_button_from_expenses_submenu_starts_undo_preview_with_action(self):
+        chat_id = 8902
+        bot.active_list_context[chat_id] = "expenses"
+        action = {"id": 321, "summary": {"inventory": [], "shopping": [], "expense_added": None, "expense_deleted": None}}
+        with patch.object(bot, "get_latest_undoable_action", return_value=action):
+            _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
+        self.assertIn(chat_id, pending_undo_action)
+        self.assertEqual(pending_undo_action[chat_id], {"action_id": 321, "household_id": 1, "user_db_id": 10})
+
+    def test_button_from_aliases_submenu_starts_undo_preview(self):
+        chat_id = 8903
+        bot.active_list_context[chat_id] = "aliases"
+        with patch.object(bot, "get_latest_undoable_action", return_value=None) as mock_get_action:
+            _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
+        mock_get_action.assert_called_once_with(1, 10)
+
+
+class TestTextUndoCommandsStillWork(unittest.TestCase):
+    """#6: the three existing natural-language undo phrasings still resolve
+    to the same flow, unaffected by the submenu keyboard change."""
+
+    def setUp(self):
+        pending_undo_action.clear()
+        patcher_send = patch.object(bot, "send_message")
+        self.mock_send = patcher_send.start()
+        self.addCleanup(patcher_send.stop)
+        patcher_get_user = patch.object(bot, "get_household_and_user", return_value=(1, 10))
+        self.mock_get_user = patcher_get_user.start()
+        self.addCleanup(patcher_get_user.stop)
+
+    def tearDown(self):
+        pending_undo_action.clear()
+        bot.active_list_context.clear()
+
+    def test_each_phrasing_still_triggers_undo_lookup(self):
+        for i, phrase in enumerate((
+            "Скасувати останню дію", "Повернути останню дію", "Верни зміни назад",
+        )):
+            chat_id = 8910 + i
+            with patch.object(bot, "get_latest_undoable_action", return_value=None) as mock_get_action:
+                _call_webhook(_make_update(chat_id, chat_id, phrase))
+            mock_get_action.assert_called_once_with(1, 10)
+            sent_texts = [call.args[1] for call in self.mock_send.call_args_list]
+            self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, sent_texts)
 
 
 if __name__ == "__main__":
