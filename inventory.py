@@ -1,0 +1,316 @@
+"""Pure inventory-domain helpers: the Inventory Representation Guard v1
+(does an incoming quantity merge into an existing row, need clarification,
+or become a separate row?) and inventory consumption math/validation.
+
+Single source of truth extracted from bot.py — bot.py re-exports every name
+here as the SAME object (`from inventory import ...`), so
+`bot.resolve_inventory_representation is inventory.resolve_inventory_representation`
+holds, and household_router.py's existing `_bot.resolve_inventory_representation`
+indirection (bot.py IS the `_bot` it was configured with) keeps working
+unchanged.
+
+No Telegram, Flask, psycopg, database connection, or Gemini — this module
+imports only the standard library and quantities.py (the shared quantity/
+unit math). Deliberately excluded (stays in bot.py, out of this module's
+scope): webhook routes, keyboards, send_message, pending_* dicts,
+_continue_inventory_quantity_clarification, parse_inventory_list_with_gemini,
+the numbered-delete cluster (needs bot.py's shared _effective_quantity),
+_validate_compound_operations/_format_compound_preview and the whole
+reconciliation cluster (both need bot.py's alias/name normalization),
+_effective_quantity, format_grouped_list, and every database call.
+"""
+from decimal import Decimal
+
+from quantities import STRUCTURED_UNITS, format_quantity_display, merge_quantity_values
+
+# Mirrors bot.py's/database.py's own DEFAULT_CATEGORY literal — a tiny,
+# self-contained constant (not business logic), duplicated on purpose so
+# this module never needs to import bot.py just for one category string.
+DEFAULT_CATEGORY = "Інше їстівне"
+
+
+# =========================
+# INVENTORY REPRESENTATION GUARD v1
+# =========================
+
+def find_inventory_representation_matches(inventory_items, canonical_name, category):
+    """All existing inventory_items rows (already-fetched snapshot for this
+    household) a new item with this canonical_name/category would compete
+    with for merge/insert — mirrors _merge_or_insert_inventory_in_tx's exact
+    category-compatibility rule and ORDER BY id ASC candidate order. Returns
+    a list (possibly empty), sorted by id."""
+    matches = [
+        item for item in inventory_items
+        if item.get("canonical_name") == canonical_name
+        and (item.get("category") == category or item.get("category") == DEFAULT_CATEGORY or category == DEFAULT_CATEGORY)
+    ]
+    matches.sort(key=lambda it: it["id"])
+    return matches
+
+
+def classify_inventory_representation(existing_value, existing_unit, incoming_value, incoming_unit, incoming_inferred):
+    """Decide how an incoming quantity relates to ONE existing row's
+    quantity/unit. Returns:
+      "merge"    — merge_quantity_values actually succeeds against this row.
+      "clarify"  — incoming is an inferred guess (quantity_inferred=True)
+                   that can't merge here — the whole preview/operation must
+                   be blocked and the user asked for an explicit quantity,
+                   never silently guessed or written.
+      "separate" — incoming is an explicit (non-inferred) quantity that
+                   still can't merge — safe to add as its own row, but the
+                   preview must say so explicitly, never silently.
+    """
+    if merge_quantity_values(existing_value, existing_unit, incoming_value, incoming_unit) is not None:
+        return "merge"
+    return "clarify" if incoming_inferred else "separate"
+
+
+def resolve_inventory_representation(inventory_items, canonical_name, category,
+                                      quantity_value, quantity_unit, quantity_inferred):
+    """Full v1 guard decision for one incoming inventory item against ALL
+    existing rows sharing canonical_name (not just the first, and not just
+    the first one that happens to be mergeable). Returns (outcome, existing):
+      ("none", None)             — no existing row at all; plain add.
+      ("merge", existing_item)   — a single existing row (dict) to merge
+          into (first candidate, in id order, merge_quantity_values actually
+          succeeds against — same order the write path uses).
+      ("clarify", existing_items) — a LIST of every existing row sharing
+          canonical_name (not just the conflicting one), for the "which
+          record did you mean" message. Blocks the whole preview/operation.
+      ("separate", existing_item) — a single existing row (dict, first
+          candidate by id); safe to add as its own row, existing_item is
+          only used to build the warning message.
+
+    Critical rule: an INFERRED incoming quantity (quantity_inferred=True)
+    must never merge into one compatible row while silently ignoring an
+    INCOMPATIBLE sibling row of the same canonical_name — e.g. existing
+    "Молоко — 1 шт." and "Молоко — 6 л" both present, incoming inferred
+    "1 шт.": even though it merges cleanly with the "1 шт." row, the "6 л"
+    row makes it genuinely ambiguous which record the guess belongs to, so
+    this is "clarify", not "merge". This check only applies when
+    quantity_inferred is True — an EXPLICIT incoming quantity (e.g. "1 л")
+    is unambiguous about the user's intent and may still merge with
+    whichever single candidate is compatible, ignoring incompatible
+    siblings exactly as before.
+    """
+    candidates = find_inventory_representation_matches(inventory_items, canonical_name, category)
+    if not candidates:
+        return "none", None
+
+    outcomes = [
+        classify_inventory_representation(
+            existing.get("quantity_value"), existing.get("quantity_unit"),
+            quantity_value, quantity_unit, quantity_inferred,
+        )
+        for existing in candidates
+    ]
+
+    if quantity_inferred:
+        if any(outcome != "merge" for outcome in outcomes):
+            return "clarify", candidates
+        return "merge", candidates[0]
+
+    for existing, outcome in zip(candidates, outcomes):
+        if outcome == "merge":
+            return "merge", existing
+    return "separate", candidates[0]
+
+
+def format_representation_clarify_message(name, existing_items):
+    """The blocking clarification message for the "clarify" outcome — no
+    preview is built and nothing is written; the user must restate an
+    explicit quantity/unit or container count. existing_items is the full
+    list of every existing row sharing this canonical_name the guard found
+    (never just the one that conflicts) — with 2+ rows, ALL of them are
+    listed so the user understands there's genuine ambiguity, not just a
+    single mismatch."""
+    if len(existing_items) == 1:
+        existing_display = existing_items[0]["quantity_text"]
+        return (
+            f"У запасах уже є «{name} — {existing_display}».\n\n"
+            f"Скільки {name} ти купив?\n"
+            f"Напиши явну кількість і одиницю (наприклад «1 л») або кількість тари (наприклад «дві пачки»)."
+        )
+    lines = [f"У запасах уже є кілька записів «{name}»:", ""]
+    for item in existing_items:
+        lines.append(f"• {item['quantity_text']}")
+    lines.append("")
+    lines.append("Не хочу вгадувати, до якого запису додати нову покупку.")
+    lines.append(f"Напиши точну кількість, наприклад: «Купив 1 л {name.lower()}».")
+    return "\n".join(lines)
+
+
+def format_global_quantity_clarification_message(name, existing_items):
+    """Clarification message for the Global Household Router's Inventory
+    Quantity Clarification v1 continuation flow (pending_inventory_
+    quantity_clarification) — deliberately separate wording from
+    format_representation_clarify_message (which stays used, unchanged, by
+    the normal/legacy "➕ Додати продукти" add flow): since the next reply
+    here continues the ORIGINAL command instead of restating it in full,
+    the example shows a bare quantity, not "Купив 1 л X"."""
+    if len(existing_items) == 1:
+        lines = [f"У запасах уже є «{name} — {existing_items[0]['quantity_text']}».", ""]
+    else:
+        lines = [f"У запасах уже є кілька записів «{name}»:", ""]
+        for item in existing_items:
+            lines.append(f"• {item['quantity_text']}")
+        lines.append("")
+    lines.append("Не хочу вгадувати, до якого запису додати нову покупку.")
+    lines.append("Напиши точну кількість, наприклад: «1 л» або «500 мл».")
+    return "\n".join(lines)
+
+
+def format_representation_separate_warning(name, existing_display, incoming_display):
+    """The non-blocking warning paragraph for the "separate" outcome —
+    incoming item is still added, just never silently merged."""
+    existing_text = (existing_display or "").rstrip(".")
+    incoming_text = (incoming_display or "").rstrip(".")
+    return (
+        f"⚠️ {name} вже є у запасах: {existing_text}.\n"
+        f"Нове надходження: {incoming_text}.\n"
+        f"Його буде збережено окремою позицією, без об'єднання."
+    )
+
+
+def format_representation_merge_line(name, existing_display, incoming_display, merged_display):
+    """The honest "X + Y -> буде Z" line for the "merge" outcome, replacing
+    the plain "Додати ..." line for that one item — bullet-list style, used
+    by household_router.py's own preview formatter."""
+    return f"• {name} — {existing_display} + {incoming_display} → буде {merged_display}"
+
+
+def format_representation_merge_quantity_fragment(existing_display, incoming_display, merged_display):
+    """Same "X + Y -> буде Z" honesty as format_representation_merge_line,
+    but just the quantity fragment (no name/bullet) — composes with
+    format_grouped_list's own "{n}. {name} — {qty}" numbered-list template,
+    used by the normal/legacy inventory add flow's preview."""
+    return f"{existing_display} + {incoming_display} → буде {merged_display}"
+
+
+# =========================
+# INVENTORY CONSUMPTION
+# =========================
+
+_UNIT_GROUP = {"л": "volume", "мл": "volume", "кг": "mass", "г": "mass", "шт.": "count"}
+_UNIT_TO_CANONICAL_FACTOR = {
+    "л": Decimal("1"), "мл": Decimal("0.001"),
+    "кг": Decimal("1000"), "г": Decimal("1"),
+    "шт.": Decimal("1"),
+}
+_CANONICAL_UNIT_FOR_GROUP = {"volume": "л", "mass": "г", "count": "шт."}
+
+
+def _resolve_consumption(current_value, current_unit, consume_value, consume_unit):
+    """Compute the remaining quantity after consuming part of an inventory item.
+
+    Uses Decimal throughout (never float) for the subtraction/conversion. The
+    remainder is always expressed in the group's canonical display unit (л for
+    volume, г for mass, шт. for count), not necessarily current_unit — e.g.
+    1 кг - 200 г is shown as 800 г, not 0,8 кг.
+
+    Returns ("ok", remaining_decimal, remaining_unit), ("incompatible_units", None, None)
+    if the two units aren't from the same group, or ("insufficient", None, None) if
+    consume_value exceeds what's available.
+    """
+    current_group = _UNIT_GROUP.get(current_unit)
+    consume_group = _UNIT_GROUP.get(consume_unit)
+    if current_group is None or consume_group is None or current_group != consume_group:
+        return "incompatible_units", None, None
+    current_canonical = Decimal(str(current_value)) * _UNIT_TO_CANONICAL_FACTOR[current_unit]
+    consume_canonical = Decimal(str(consume_value)) * _UNIT_TO_CANONICAL_FACTOR[consume_unit]
+    if consume_canonical > current_canonical:
+        return "insufficient", None, None
+    remaining = current_canonical - consume_canonical
+    return "ok", remaining, _CANONICAL_UNIT_FOR_GROUP[current_group]
+
+
+def _validate_consumptions(consumptions, items):
+    """Validate Gemini consume_inventory_quantity output against current inventory items.
+
+    Returns one of:
+      ("ok", [resolved...]) — each resolved dict has item_number, item_id, name,
+          old_value, old_unit, old_display, new_value, new_unit, new_display,
+          will_remove (True when the remainder is exactly zero).
+      ("missing_quantity", item_name) — item has no structured quantity to subtract from.
+      ("insufficient", (item_name, available_display, requested_display)) — not enough left.
+      ("invalid", None) — malformed input, out-of-range/duplicate item_number, bad unit,
+          non-positive quantity, or incompatible units.
+
+    Callers must check for unresolved_fragments (see _check_unresolved_fragments)
+    before calling this — this function is unchanged from before that check existed.
+    """
+    if not isinstance(consumptions, list) or not consumptions:
+        return "invalid", None
+    total = len(items)
+    used_numbers = set()
+    resolved = []
+    for entry in consumptions:
+        if not isinstance(entry, dict):
+            return "invalid", None
+        num = entry.get("item_number")
+        if not isinstance(num, int) or num < 1 or num > total:
+            return "invalid", None
+        if num in used_numbers:
+            return "invalid", None
+        used_numbers.add(num)
+        value = entry.get("quantity_value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            return "invalid", None
+        unit = entry.get("quantity_unit")
+        if unit not in STRUCTURED_UNITS:
+            return "invalid", None
+        item = items[num - 1]
+        cur_value = item.get("quantity_value")
+        cur_unit = item.get("quantity_unit")
+        if cur_value is None or cur_unit is None:
+            return "missing_quantity", item["name"]
+        kind, remaining, remaining_unit = _resolve_consumption(cur_value, cur_unit, value, unit)
+        if kind == "incompatible_units":
+            return "invalid", None
+        if kind == "insufficient":
+            available_display = format_quantity_display(cur_value, cur_unit)
+            requested_display = format_quantity_display(value, unit)
+            return "insufficient", (item["name"], available_display, requested_display)
+        will_remove = remaining == 0
+        new_value = None if will_remove else float(remaining)
+        new_unit = None if will_remove else remaining_unit
+        resolved.append({
+            "item_number": num,
+            "item_id": item["id"],
+            "name": item["name"],
+            "old_value": cur_value,
+            "old_unit": cur_unit,
+            "old_display": format_quantity_display(cur_value, cur_unit),
+            "new_value": new_value,
+            "new_unit": new_unit,
+            "new_display": None if will_remove else format_quantity_display(new_value, new_unit),
+            "will_remove": will_remove,
+        })
+    return "ok", resolved
+
+
+def _format_consumption_preview(resolved):
+    lines = [f"🧊 Буде використано: {len(resolved)}", ""]
+    for r in resolved:
+        lines.append(f"{r['item_number']}. {r['name']} — {r['old_display']}")
+        if r["will_remove"]:
+            lines.append("   → буде прибрано із запасів")
+        else:
+            lines.append(f"   → {r['name']} — {r['new_display']}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+# =========================
+# STALE SNAPSHOT CHECK
+# =========================
+
+def _compound_snapshot_is_stale(inventory_changes, current_items):
+    """True if any inventory_changes item no longer exists, or its quantity_value/unit
+    changed since the compound preview was built (detects edits from another device)."""
+    current_by_id = {it["id"]: it for it in current_items}
+    for c in inventory_changes:
+        cur = current_by_id.get(c["item_id"])
+        if cur is None or cur.get("quantity_value") != c["old_value"] or cur.get("quantity_unit") != c["old_unit"]:
+            return True
+    return False
