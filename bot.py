@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from collections import deque
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -1187,6 +1188,14 @@ def _parse_qty(qty_text):
 
 _NAME_SYNONYMS = {
     "сливки": "вершки",
+    "mleko": "молоко",
+    "ser": "сир",
+    "maslo": "масло",
+    "masło": "масло",
+    "smietanka": "вершки",
+    "śmietanka": "вершки",
+    "smietana": "сметана",
+    "śmietana": "сметана",
 }
 
 _UNIT_ALIASES = {
@@ -1199,10 +1208,69 @@ _UNIT_ALIASES = {
 
 STRUCTURED_UNITS = {"шт.", "л", "мл", "г", "кг"}
 
+# Word-numbers that resolve to an exact count — deliberately a tiny, exact
+# whitelist (never fuzzy/NLP); always flagged quantity_inferred=True by
+# normalize_item_quantity since the whole quantity (not just the unit) is an
+# assumption here, unlike an explicit digit.
+_WORD_NUMBER_QUANTITIES = {
+    "пара": Decimal("2"),
+    "пару": Decimal("2"),
+}
+
+# Narrow, deterministic Latin/Cyrillic homoglyph whitelist — mirrors
+# database.py's identical copy. Only the classic ASCII-lookalike Cyrillic
+# letters; never used to transliterate real Ukrainian/Polish words (see
+# _repair_mixed_script_token below).
+_CYRILLIC_HOMOGLYPH_TO_LATIN = {
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "і": "i",
+    "А": "A", "Е": "E", "О": "O", "Р": "P", "С": "C", "Х": "X", "І": "I",
+}
+
+
+def _clean_unicode_whitespace(text):
+    """Step 2 of name normalization: Unicode NFKC normalization + whitespace
+    collapse. Pure cleanup — never translates or transliterates anything.
+    Mirrors database.py's identical copy."""
+    normalized = unicodedata.normalize("NFKC", text or "")
+    return re.sub(r"\s+", " ", normalized.strip())
+
+
+def _char_script(c):
+    """Classify one character for _repair_mixed_script_token — see
+    database.py's identical copy for the authoritative docstring."""
+    if c in _CYRILLIC_HOMOGLYPH_TO_LATIN:
+        return "homoglyph"
+    if "CYRILLIC" in unicodedata.name(c, ""):
+        return "cyrillic_only"
+    if c.isascii() and c.isalpha():
+        return "latin"
+    return "other"
+
+
+def _repair_mixed_script_token(token):
+    """Step 3 of name normalization: repair ONE otherwise-pure-Latin word
+    with Cyrillic look-alike letters mixed in (e.g. "mlekо" -> "mleko").
+    Never touches a token with any genuine Cyrillic-only letter — see
+    database.py's identical copy for the authoritative docstring."""
+    scripts = [_char_script(c) for c in token]
+    if "latin" in scripts and "homoglyph" in scripts and "cyrillic_only" not in scripts:
+        return "".join(_CYRILLIC_HOMOGLYPH_TO_LATIN.get(c, c) for c in token)
+    return token
+
+
+def _repair_mixed_script(text):
+    """Apply _repair_mixed_script_token to each word of `text` independently."""
+    if not text:
+        return text
+    return " ".join(_repair_mixed_script_token(tok) for tok in text.split(" "))
+
 
 def canonicalize_name(name):
-    """Lowercase/trim a name and map known synonyms to one canonical form."""
-    base = (name or "").strip().lower()
+    """Lowercase/trim a name, repair narrow Latin/Cyrillic mixed-script
+    homoglyphs, and map known synonyms to one canonical form. Household
+    alias resolution lives in resolve_item_name, checked before this."""
+    cleaned = _repair_mixed_script(_clean_unicode_whitespace(name or ""))
+    base = cleaned.strip().lower()
     return _NAME_SYNONYMS.get(base, base)
 
 
@@ -1230,29 +1298,48 @@ def normalize_alias_text(text):
 
 
 def resolve_item_name(name, alias_map):
-    """THE shared resolver (bot.py-local mirror of database.py's copy): household
-    alias (highest priority) -> built-in generic synonym via canonicalize_name()
-    -> plain lowercasing. Returns (display_name, canonical_name). Never raises."""
-    key = normalize_alias_text(name)
-    if alias_map and key is not None and key in alias_map:
-        entry = alias_map[key]
+    """THE shared resolver (bot.py-local mirror of database.py's copy).
+    Resolution order — see database.py's identical copy for the
+    authoritative docstring: (1) household alias lookup using the name
+    as-is; (2-3) Unicode cleanup + narrow mixed-script repair; (4) household
+    alias lookup again against the cleaned name; (5-6) built-in generic
+    synonym via canonicalize_name(), else plain lowercasing. Household
+    aliases always win over the built-in dictionary. Returns
+    (display_name, canonical_name). Never raises."""
+    old_key = normalize_alias_text(name)
+    if alias_map and old_key is not None and old_key in alias_map:
+        entry = alias_map[old_key]
         return entry["target_display_name"], entry["target_canonical_name"]
+
+    cleaned = _repair_mixed_script(_clean_unicode_whitespace(name or ""))
+    new_key = normalize_alias_text(cleaned)
+    if alias_map and new_key is not None and new_key != old_key and new_key in alias_map:
+        entry = alias_map[new_key]
+        return entry["target_display_name"], entry["target_canonical_name"]
+
     return name, canonicalize_name(name)
 
 
 def _parse_structured_quantity(quantity_text):
     """Parse an unambiguous 'value unit' or bare-number quantity_text.
 
-    Returns (value: float|None, unit: str|None). Never raises.
+    Returns (value, unit). Never raises. See database.py's identical copy
+    (parse_structured_quantity) for the full docstring: a bare number with
+    no unit word, or an exact word-number from _WORD_NUMBER_QUANTITIES
+    ("пара"/"пару"), returns (Decimal, "шт.") — new code, never round-tripped
+    through float. The existing "value unit" branch is unchanged (float).
     """
     if not quantity_text or not quantity_text.strip():
         return None, None
     normalized = quantity_text.strip().replace(",", ".")
     parts = normalized.split()
     if len(parts) == 1:
+        word = parts[0].lower()
+        if word in _WORD_NUMBER_QUANTITIES:
+            return _WORD_NUMBER_QUANTITIES[word], "шт."
         try:
-            return float(parts[0]), None
-        except ValueError:
+            return Decimal(parts[0]), "шт."
+        except InvalidOperation:
             return None, None
     if len(parts) == 2:
         try:
@@ -1304,6 +1391,11 @@ def normalize_item_quantity(name, quantity_text, quantity_value=None, quantity_u
         value, unit = _parse_structured_quantity(quantity_text)
         if value is None and not (quantity_text or "").strip() and allow_default_unit:
             value, unit, inferred = 1.0, "шт.", True
+        elif value is not None and not any(ch.isdigit() for ch in (quantity_text or "")):
+            # Resolved from a non-digit word (e.g. "пара"/"пару") rather than
+            # an explicit number — the whole quantity is an assumption here,
+            # not just the unit (mirrors database.py's normalize_quantity_fields).
+            inferred = True
     display = format_quantity_display(value, unit) if value is not None else (quantity_text or "").strip()
     return {
         "name": resolved_name,

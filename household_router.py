@@ -148,6 +148,19 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "вказана), category — одна з фіксованих категорій нижче.\n"
     "2. «add_inventory» — товар, який людина ВЖЕ купила і він зараз є вдома (напр. «Купив масло», «Купила "
     "хліб»), БЕЗ суми. Ті самі поля, що й add_shopping.\n"
+    "Правила відокремлення кількості від назви (для add_shopping/add_inventory): name — ЛИШЕ сама назва "
+    "товару, БЕЗ жодних слів про кількість; quantity_text — уся кількість, як у тексті. Якщо кількість — "
+    "просто число без одиниці («3 банани») — quantity_text рівно «3», name — «Банани» (без числа). Якщо "
+    "кількість — слово «пара»/«пару» («пару сосисок») — quantity_text рівно «пара» чи «пару» (як у тексті), "
+    "name — «Сосиски» (без слова «пара»). Якщо кількість описана через тару («дві пачки сосисок», «упаковка "
+    "яєць») — усю фразу кількості («дві пачки») клади в quantity_text, а name — лише сам товар («Сосиски»); "
+    "НІКОЛИ не залишай слова «пачка»/«упаковка»/числівники всередині name. Якщо безпечно відокремити "
+    "кількість від назви не вдається — постав quantity_text порожнім рядком і опиши весь фрагмент у "
+    "unresolved_fragments, а не вигадуй назву.\n"
+    "Приклад (для «Купив пару сосисок»): {\"type\": \"add_inventory\", \"name\": \"Сосиски\", "
+    "\"quantity_text\": \"пару\", \"category\": \"М'ясо та риба\"}\n"
+    "Приклад (для «Купив дві пачки сосисок»): {\"type\": \"add_inventory\", \"name\": \"Сосиски\", "
+    "\"quantity_text\": \"дві пачки\", \"category\": \"М'ясо та риба\"}\n"
     "3. Якщо повідомлення означає «купив X ЗА Y zł» — це ОДНА покупка з ціною: додай ОБИДВІ операції — "
     "add_inventory (сам товар) І add_expense (сума) в одному масиві operations.\n"
     "4. «consume_inventory» — людина з'їла/використала частину запасів (напр. «З'їв 2 ковбаски», "
@@ -186,12 +199,25 @@ HOUSEHOLD_ROUTER_PROMPT = (
 )
 
 
-def _numbered_item_lines(items):
+def _numbered_item_lines(items, alias_map=None, with_normalization_hint=False):
     """Shared formatter for both the shopping and inventory numbered
-    snapshots — same shape (name + quantity_text) for both."""
+    snapshots — same shape (name + quantity_text) for both.
+
+    with_normalization_hint=True (used only for the inventory snapshot, so
+    consume_inventory has a chance to match an old untranslated raw name
+    like "ser" against a message like "З'їв сиру") appends a hidden
+    "[normalized: ...]" hint built from resolve_item_name's canonical form —
+    shown to Gemini only, never part of the actual inventory list text the
+    user sees (that stays format_inventory_list's job, untouched here).
+    """
     lines = []
     for i, item in enumerate(items, start=1):
-        label = f"{i}. {item['name']}"
+        raw_name = item["name"]
+        label = f"{i}. {raw_name}"
+        if with_normalization_hint:
+            _, normalized = _bot.resolve_item_name(raw_name, alias_map or {})
+            if normalized and normalized != raw_name.strip().lower():
+                label += f" [normalized: {normalized}]"
         qty = item.get("quantity_text")
         if qty:
             label += f" — {qty}"
@@ -213,12 +239,14 @@ def _numbered_expense_lines(recent_expenses):
 _HOUSEHOLD_ROUTER_FALLBACK = {"intent": "none", "operations": [], "unresolved_fragments": []}
 
 
-def _ask_gemini_household_router(text, now_context, shopping_items, inventory_items, recent_expenses):
+def _ask_gemini_household_router(text, now_context, shopping_items, inventory_items, recent_expenses, alias_map=None):
     """ONE Gemini call for the global household router. Snapshots are numbered
     lists built from live DB data (never raw ids) — Gemini only ever refers
-    back to them by 1-based number."""
+    back to them by 1-based number. Only the inventory snapshot carries the
+    hidden normalization hint (consume_inventory matching); the shopping
+    snapshot is unaffected."""
     shopping_lines = _numbered_item_lines(shopping_items)
-    inventory_lines = _numbered_item_lines(inventory_items)
+    inventory_lines = _numbered_item_lines(inventory_items, alias_map=alias_map, with_normalization_hint=True)
     expense_lines = _numbered_expense_lines(recent_expenses)
     prompt_parts = [
         now_context,
@@ -252,6 +280,27 @@ def _ask_gemini_household_router(text, now_context, shopping_items, inventory_it
 # =========================
 # VALIDATION (pure)
 # =========================
+
+# Detects a quantity/container phrase leaking into the front of `name` —
+# a sign that Gemini failed to separate the quantity from the product name
+# (e.g. "дві пачки сосисок" as the whole name, quantity_text left empty).
+# Deliberately narrow: only blocks on these exact leading words, never a
+# broader NLP guess.
+_LEAKED_QUANTITY_PREFIX_RE = re.compile(
+    r"^(пара|пару|два|дві|три|чотири|п['’]?ять|пачка|пачки|пачок|упаковка|упаковки|упаковок)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_leaked_quantity_phrase(name):
+    """True if `name` still starts with a quantity/container word that
+    should have been separated into quantity_text instead. Never guessed at
+    beyond this exact whitelist — blocks the whole compound preview and asks
+    for clarification instead of storing a broken canonical name like
+    "дві пачки сосисок"."""
+    return bool(_LEAKED_QUANTITY_PREFIX_RE.match((name or "").strip()))
+
+
 def _validate_new_item_op(op, alias_map):
     """Shared add_shopping/add_inventory validation. Returns a normalized
     item dict (name/canonical_name/quantity_value/quantity_unit/
@@ -316,6 +365,10 @@ def _validate_operations(router_result, inventory_items, recent_expenses, now, a
         op_type = op["type"]
 
         if op_type == "add_shopping":
+            leaked_name = op.get("name")
+            if isinstance(leaked_name, str) and _looks_like_leaked_quantity_phrase(leaked_name):
+                reasons.append(f"«{leaked_name.strip()}» — не можу безпечно відокремити кількість від назви товару.")
+                continue
             item = _validate_new_item_op(op, alias_map)
             if item is None:
                 reasons.append("Товар для покупок без назви.")
@@ -323,6 +376,10 @@ def _validate_operations(router_result, inventory_items, recent_expenses, now, a
             add_shopping_raw.append(item)
 
         elif op_type == "add_inventory":
+            leaked_name = op.get("name")
+            if isinstance(leaked_name, str) and _looks_like_leaked_quantity_phrase(leaked_name):
+                reasons.append(f"«{leaked_name.strip()}» — не можу безпечно відокремити кількість від назви товару.")
+                continue
             item = _validate_new_item_op(op, alias_map)
             if item is None:
                 reasons.append("Товар для запасів без назви.")
@@ -519,5 +576,7 @@ def build_household_operations_preview(text, shopping_items, inventory_items, re
     """
     now = datetime.now(ZoneInfo("Europe/Warsaw"))
     now_context = _bot.get_warsaw_datetime_context(now)
-    router_result = _ask_gemini_household_router(text, now_context, shopping_items, inventory_items, recent_expenses)
+    router_result = _ask_gemini_household_router(
+        text, now_context, shopping_items, inventory_items, recent_expenses, alias_map=alias_map,
+    )
     return _validate_operations(router_result, inventory_items, recent_expenses, now, alias_map=alias_map)

@@ -1,7 +1,8 @@
 import os
 import re
+import unicodedata
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import psycopg
 
 HOUSEHOLD_NAME = "Спільний дім"
@@ -19,6 +20,14 @@ VALID_LIST_CONTEXTS = {"shopping_saved", "inventory_saved"}
 
 _NAME_SYNONYMS = {
     "сливки": "вершки",
+    "mleko": "молоко",
+    "ser": "сир",
+    "maslo": "масло",
+    "masło": "масло",
+    "smietanka": "вершки",
+    "śmietanka": "вершки",
+    "smietana": "сметана",
+    "śmietana": "сметана",
 }
 
 _UNIT_ALIASES = {
@@ -31,26 +40,108 @@ _UNIT_ALIASES = {
 
 STRUCTURED_UNITS = {"шт.", "л", "мл", "г", "кг"}
 
+# Word-numbers that resolve to an exact count — deliberately a tiny, exact
+# whitelist (never fuzzy/NLP), and always flagged quantity_inferred=True by
+# normalize_quantity_fields/normalize_item_quantity's callers since the whole
+# quantity (not just the unit) is an assumption here, unlike an explicit digit.
+_WORD_NUMBER_QUANTITIES = {
+    "пара": Decimal("2"),
+    "пару": Decimal("2"),
+}
+
+# Narrow, deterministic Latin/Cyrillic homoglyph whitelist — only the classic
+# ASCII-lookalike Cyrillic letters (visually identical to a Latin letter in
+# most fonts). Never used to transliterate real Ukrainian/Polish words (see
+# _repair_mixed_script_token: it only fires for a token that is otherwise
+# pure Latin, i.e. contains zero genuine Cyrillic-only letters).
+_CYRILLIC_HOMOGLYPH_TO_LATIN = {
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "і": "i",
+    "А": "A", "Е": "E", "О": "O", "Р": "P", "С": "C", "Х": "X", "І": "I",
+}
+
+
+def _clean_unicode_whitespace(text):
+    """Step 2 of name normalization: Unicode NFKC normalization (folds
+    compatibility characters, e.g. full-width forms) + whitespace collapse.
+    Pure cleanup — never translates or transliterates anything."""
+    normalized = unicodedata.normalize("NFKC", text or "")
+    return re.sub(r"\s+", " ", normalized.strip())
+
+
+def _char_script(c):
+    """Classify one character for _repair_mixed_script_token: "homoglyph"
+    (a Cyrillic letter that is visually identical to a Latin one),
+    "cyrillic_only" (any other Cyrillic letter — no Latin lookalike),
+    "latin" (a-z/A-Z), or "other" (digits, punctuation, etc.)."""
+    if c in _CYRILLIC_HOMOGLYPH_TO_LATIN:
+        return "homoglyph"
+    if "CYRILLIC" in unicodedata.name(c, ""):
+        return "cyrillic_only"
+    if c.isascii() and c.isalpha():
+        return "latin"
+    return "other"
+
+
+def _repair_mixed_script_token(token):
+    """Step 3 of name normalization: repair ONE whitespace-delimited word
+    that is otherwise pure Latin but has one or more Cyrillic look-alike
+    letters mixed in (e.g. "mlekо" with a Cyrillic "о" -> "mleko"). Never
+    touches a token containing any genuine Cyrillic-only letter — so real
+    Ukrainian/Polish words like "молоко" or "сир" are always left untouched,
+    and "сосиски"/"сосисок" are never rewritten into each other (no
+    stemming/lemmatization here, only a homoglyph fix)."""
+    scripts = [_char_script(c) for c in token]
+    if "latin" in scripts and "homoglyph" in scripts and "cyrillic_only" not in scripts:
+        return "".join(_CYRILLIC_HOMOGLYPH_TO_LATIN.get(c, c) for c in token)
+    return token
+
+
+def _repair_mixed_script(text):
+    """Apply _repair_mixed_script_token to each word of `text` independently."""
+    if not text:
+        return text
+    return " ".join(_repair_mixed_script_token(tok) for tok in text.split(" "))
+
 
 def canonicalize_name(name):
-    """Lowercase/trim a name and map known synonyms to one canonical form."""
-    base = (name or "").strip().lower()
+    """Lowercase/trim a name, repair narrow Latin/Cyrillic mixed-script
+    homoglyphs (steps 2-3 of the pipeline; see _clean_unicode_whitespace/
+    _repair_mixed_script), and map known synonyms to one canonical form
+    (steps 5-6). Household alias resolution (steps 1/4) lives in
+    resolve_item_name, which is checked before this function is reached."""
+    cleaned = _repair_mixed_script(_clean_unicode_whitespace(name or ""))
+    base = cleaned.strip().lower()
     return _NAME_SYNONYMS.get(base, base)
 
 
 def parse_structured_quantity(quantity_text):
     """Parse an unambiguous 'value unit' or bare-number quantity_text.
 
-    Returns (value: float|None, unit: str|None). Never raises.
+    Returns (value, unit). Never raises. Three cases:
+    - "value unit" (e.g. "6 штук") -> (float, unit) — unchanged from before.
+    - a bare number with no unit word (e.g. "3") -> (Decimal, "шт.") — an
+      explicit count needs an obvious unit attached, not a guessed quantity;
+      returns Decimal (not float) since this is new code and the caller
+      (normalize_quantity_fields/normalize_item_quantity) must not round-trip
+      it through float.
+    - an exact word-number from _WORD_NUMBER_QUANTITIES (e.g. "пара"/"пару")
+      -> (Decimal, "шт.") — same Decimal contract; the caller detects "no
+      digit in the original text" to flag quantity_inferred=True for this
+      case (the whole quantity is an assumption here, not just the unit).
+    Anything else (containers like "пачка"/"упаковка", other words) stays
+    unparseable -> (None, None), same as before.
     """
     if not quantity_text or not quantity_text.strip():
         return None, None
     normalized = quantity_text.strip().replace(",", ".")
     parts = normalized.split()
     if len(parts) == 1:
+        word = parts[0].lower()
+        if word in _WORD_NUMBER_QUANTITIES:
+            return _WORD_NUMBER_QUANTITIES[word], "шт."
         try:
-            return float(parts[0]), None
-        except ValueError:
+            return Decimal(parts[0]), "шт."
+        except InvalidOperation:
             return None, None
     if len(parts) == 2:
         try:
@@ -94,6 +185,12 @@ def normalize_quantity_fields(name, quantity_text, allow_default_unit=False):
     inferred = False
     if value is None and not (quantity_text or "").strip() and allow_default_unit:
         value, unit, inferred = 1.0, "шт.", True
+    elif value is not None and not any(ch.isdigit() for ch in (quantity_text or "")):
+        # Resolved from a non-digit word (e.g. "пара"/"пару" via
+        # _WORD_NUMBER_QUANTITIES) rather than an explicit number — the
+        # whole quantity is an assumption here, not just the unit, so it
+        # gets the same quantity_inferred=True flag as the blank-text default.
+        inferred = True
     display = format_quantity_display(value, unit) if value is not None else (quantity_text or "").strip()
     return {
         "canonical_name": canonical_name,
@@ -155,18 +252,36 @@ def normalize_alias_text(text):
 def resolve_item_name(name, alias_map):
     """THE single shared resolver for product-name resolution, used by both
     database.py's own chokepoints and bot.py (via import). Resolution order:
-    household alias (highest priority) -> built-in generic synonym via
-    canonicalize_name() -> plain lowercasing. No alias-to-alias chaining: a
-    match returns the alias row's stored target directly, one hop only.
+
+    1. household alias lookup using the name as-is (compatible with aliases
+       created before Unicode/mixed-script cleanup existed);
+    2. Unicode/whitespace cleanup + narrow mixed-script token repair;
+    3. household alias lookup again, against the cleaned name (covers an
+       alias created/typed with the same cleanup already applied);
+    4. built-in generic synonym, else plain lowercasing (canonicalize_name(),
+       which applies the same cleanup+repair internally).
+
+    Household aliases always win over the built-in synonym dictionary — a
+    match at step 1 or 3 returns immediately, before canonicalize_name() (and
+    therefore the built-in dictionary) is ever consulted. No alias-to-alias
+    chaining: a match returns the alias row's stored target directly, one
+    hop only.
 
     alias_map: {alias_normalized: {"target_display_name":.., "target_canonical_name":..}},
     e.g. from get_household_alias_map(). Pass {} or None when there is no
     household context. Returns (display_name, canonical_name). Never raises.
     """
-    key = normalize_alias_text(name)
-    if alias_map and key is not None and key in alias_map:
-        entry = alias_map[key]
+    old_key = normalize_alias_text(name)
+    if alias_map and old_key is not None and old_key in alias_map:
+        entry = alias_map[old_key]
         return entry["target_display_name"], entry["target_canonical_name"]
+
+    cleaned = _repair_mixed_script(_clean_unicode_whitespace(name or ""))
+    new_key = normalize_alias_text(cleaned)
+    if alias_map and new_key is not None and new_key != old_key and new_key in alias_map:
+        entry = alias_map[new_key]
+        return entry["target_display_name"], entry["target_canonical_name"]
+
     return name, canonicalize_name(name)
 
 
