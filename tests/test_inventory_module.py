@@ -311,8 +311,191 @@ class TestNumberedDeleteSelectionBehavior(unittest.TestCase):
             inventory._format_numbered_delete_mismatch_message(5, True),
             "Не можу безпечно підтвердити вибір.\n\n"
             "Номер 5 зараз відповідає іншій позиції у запасах.\n"
-            "Покажи список запасів ще раз і вибери актуальний номер.",
+            "Покажи список запасів ще раз і вибери актуальний номер."
         )
+
+
+# =========================
+# Compound inventory planning (V1.2)
+# =========================
+def _compound_items():
+    return [
+        {"id": 401, "name": "Вершки", "category": "Молочне та яйця",
+         "quantity_value": None, "quantity_unit": None, "quantity_text": ""},
+        {"id": 402, "name": "Приправа до курки", "category": "Соуси, спеції та бакалія",
+         "quantity_value": 2.0, "quantity_unit": "шт.", "quantity_text": "2 шт."},
+        {"id": 403, "name": "Сосиски", "category": "М'ясо та риба",
+         "quantity_value": 14.0, "quantity_unit": "шт.", "quantity_text": "14 шт."},
+    ]
+
+
+def _mixed_compound_operations():
+    return [
+        {"type": "remove_inventory", "item_number": 1},
+        {"type": "consume_inventory_quantity", "item_number": 2, "quantity_value": 0.5, "quantity_unit": "шт."},
+        {"type": "add_to_shopping", "name": "Приправа до курки", "quantity_value": 1, "quantity_unit": "шт.",
+         "quantity_inferred": False, "category": "Соуси, спеції та бакалія", "is_consumable": True},
+    ]
+
+
+class TestCompoundPlanningModuleBoundaryIdentity(unittest.TestCase):
+    """#1/#2: bot.py's compound-planning wrappers return exactly what the
+    pure inventory.py functions return when given bot.py's own
+    dependencies directly — no independent duplicate implementation."""
+
+    def test_validate_wrapper_matches_pure_function_with_injected_deps(self):
+        items = _compound_items()
+        operations = _mixed_compound_operations()
+
+        bot_result = bot._validate_compound_operations(operations, [], items)
+        pure_result = inventory.validate_compound_operations(
+            operations, [], items,
+            bot.normalize_item_quantity, bot._auto_merge_in_place,
+            bot.VALID_CATEGORIES, bot.DEFAULT_CATEGORY,
+        )
+        self.assertEqual(bot_result, pure_result)
+
+    def test_preview_wrapper_matches_pure_function_with_injected_deps(self):
+        items = _compound_items()
+        operations = _mixed_compound_operations()
+        _, payload = bot._validate_compound_operations(operations, [], items)
+
+        bot_preview = bot._format_compound_preview(payload)
+        pure_preview = inventory.format_compound_preview(payload, bot._effective_quantity)
+        self.assertEqual(bot_preview, pure_preview)
+
+
+class TestCompoundPlanningBehaviorUnchanged(unittest.TestCase):
+    """#3/#4: a valid add+consume(+remove) plan produces the same preview as
+    before, and an invalid part blocks the entire plan (all-or-nothing)."""
+
+    def _validate(self, operations, items, unresolved_fragments=None):
+        return inventory.validate_compound_operations(
+            operations, unresolved_fragments or [], items,
+            bot.normalize_item_quantity, bot._auto_merge_in_place,
+            bot.VALID_CATEGORIES, bot.DEFAULT_CATEGORY,
+        )
+
+    def test_valid_add_and_consume_produce_expected_preview(self):
+        items = _compound_items()
+        operations = _mixed_compound_operations()
+        kind, payload = self._validate(operations, items)
+        self.assertEqual(kind, "ok")
+        self.assertEqual(len(payload["inventory_changes"]), 2)
+        self.assertTrue(payload["inventory_changes"][0]["will_remove"])
+        self.assertEqual(len(payload["add_to_shopping"]), 1)
+
+        preview = inventory.format_compound_preview(payload, bot._effective_quantity)
+        self.assertIn("🧊 Буде змінено в запасах:", preview)
+        self.assertIn("1. Вершки", preview)
+        self.assertIn("буде прибрано із запасів", preview)
+        self.assertIn("🛒 Буде додано до покупок:", preview)
+        self.assertIn("• Приправа до курки — 1 шт.", preview)
+
+    def test_invalid_part_blocks_the_whole_plan(self):
+        items = _compound_items()
+        operations = [
+            {"type": "remove_inventory", "item_number": 1},
+            # item_number 99 doesn't exist -> the whole plan is invalid,
+            # including the otherwise-valid removal above.
+            {"type": "consume_inventory_quantity", "item_number": 99, "quantity_value": 1, "quantity_unit": "шт."},
+        ]
+        kind, reasons = self._validate(operations, items)
+        self.assertEqual(kind, "invalid")
+        self.assertIn("Невідома позиція запасів.", reasons)
+
+
+class TestCompoundPlanningDependencyInjection(unittest.TestCase):
+    """#5/#6: the injected callbacks are actually used, and only where the
+    original logic used them."""
+
+    def test_normalize_item_quantity_callback_is_used_for_shopping_item(self):
+        items = _compound_items()
+        operations = [
+            {"type": "add_to_shopping", "name": "Молоко", "quantity_value": None, "quantity_unit": None,
+             "category": "Молочне та яйця", "is_consumable": True},
+        ]
+        calls = []
+
+        def spy_normalize(name, quantity_text, quantity_value=None, quantity_unit=None,
+                           allow_default_unit=False, alias_map=None):
+            calls.append(name)
+            return bot.normalize_item_quantity(
+                name, quantity_text, quantity_value=quantity_value, quantity_unit=quantity_unit,
+                allow_default_unit=allow_default_unit, alias_map=alias_map,
+            )
+
+        kind, payload = inventory.validate_compound_operations(
+            operations, [], items,
+            spy_normalize, bot._auto_merge_in_place,
+            bot.VALID_CATEGORIES, bot.DEFAULT_CATEGORY,
+        )
+        self.assertEqual(kind, "ok")
+        self.assertEqual(calls, ["Молоко"])
+
+    def test_merge_callback_is_not_called_when_nothing_goes_to_shopping(self):
+        items = _compound_items()
+        operations = [{"type": "remove_inventory", "item_number": 1}]
+        merge_calls = []
+
+        def spy_merge(shopping_raw):
+            merge_calls.append(shopping_raw)
+            return bot._auto_merge_in_place(shopping_raw)
+
+        kind, payload = inventory.validate_compound_operations(
+            operations, [], items,
+            bot.normalize_item_quantity, spy_merge,
+            bot.VALID_CATEGORIES, bot.DEFAULT_CATEGORY,
+        )
+        self.assertEqual(kind, "ok")
+        self.assertEqual(payload["add_to_shopping"], [])
+        self.assertEqual(merge_calls, [])
+
+    def test_merge_callback_is_called_when_shopping_items_exist(self):
+        items = _compound_items()
+        operations = [
+            {"type": "add_to_shopping", "name": "Молоко", "quantity_value": None, "quantity_unit": None,
+             "category": "Молочне та яйця", "is_consumable": True},
+        ]
+        merge_calls = []
+
+        def spy_merge(shopping_raw):
+            merge_calls.append(len(shopping_raw))
+            return bot._auto_merge_in_place(shopping_raw)
+
+        inventory.validate_compound_operations(
+            operations, [], items,
+            bot.normalize_item_quantity, spy_merge,
+            bot.VALID_CATEGORIES, bot.DEFAULT_CATEGORY,
+        )
+        self.assertEqual(merge_calls, [1])
+
+
+class TestCompoundSnapshotStalenessForPlanningOutput(unittest.TestCase):
+    """#7/#8: _compound_snapshot_is_stale, fed the exact inventory_changes
+    shape validate_compound_operations produces, is unaffected by the
+    extraction — unchanged state is not stale, a changed item is."""
+
+    def test_unchanged_snapshot_from_a_real_plan_is_not_stale(self):
+        items = _compound_items()
+        _, payload = inventory.validate_compound_operations(
+            [{"type": "remove_inventory", "item_number": 1}], [], items,
+            bot.normalize_item_quantity, bot._auto_merge_in_place,
+            bot.VALID_CATEGORIES, bot.DEFAULT_CATEGORY,
+        )
+        self.assertFalse(inventory._compound_snapshot_is_stale(payload["inventory_changes"], items))
+
+    def test_changed_relevant_item_from_a_real_plan_is_stale(self):
+        items = _compound_items()
+        _, payload = inventory.validate_compound_operations(
+            [{"type": "remove_inventory", "item_number": 1}], [], items,
+            bot.normalize_item_quantity, bot._auto_merge_in_place,
+            bot.VALID_CATEGORIES, bot.DEFAULT_CATEGORY,
+        )
+        changed_items = [dict(it) for it in items]
+        changed_items[0]["quantity_value"] = 5.0
+        changed_items[0]["quantity_unit"] = "шт."
+        self.assertTrue(inventory._compound_snapshot_is_stale(payload["inventory_changes"], changed_items))
 
 
 if __name__ == "__main__":

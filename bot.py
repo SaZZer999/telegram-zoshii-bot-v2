@@ -2298,172 +2298,23 @@ def _check_unresolved_fragments(router_result):
 
 
 # _resolve_consumption/_validate_consumptions/_format_consumption_preview and
-# their unit-group constants now live in inventory.py — imported above.
-_COMPOUND_OP_TYPES = {"remove_inventory", "consume_inventory_quantity", "add_to_shopping"}
-
-
+# their unit-group constants, plus compound inventory planning
+# (validate_compound_operations/format_compound_preview) and
+# _compound_snapshot_is_stale, now live in inventory.py — imported above.
+# These two thin wrappers keep the old names/signatures, injecting bot.py's
+# own normalize_item_quantity/_auto_merge_in_place/_effective_quantity/
+# VALID_CATEGORIES/DEFAULT_CATEGORY — no business logic duplicated here.
 def _validate_compound_operations(operations, unresolved_fragments, items, alias_map=None):
-    """Validate a compound_inventory_operations router result against current inventory items.
-
-    Returns one of:
-      ("unresolved", [fragment_str, ...]) — the router flagged part of the message as
-          unclear; nothing should be applied.
-      ("invalid", [reason_str, ...]) — one or more operations are malformed, conflicting,
-          or unsafe; nothing should be applied (no partial preview, no partial apply).
-      ("ok", {"inventory_changes": [...], "add_to_shopping": [...]}) — inventory_changes
-          preserves the order operations were given in (remove_inventory and
-          consume_inventory_quantity entries interleaved as given), each with
-          item_number, item_id, name, old_value, old_unit, old_display, new_value,
-          new_unit, new_display, will_remove, op_type ("remove"|"consume").
-          add_to_shopping is a list of normalized+merged item dicts ready for
-          add_shopping_items_batch-style insertion.
-    """
-    if unresolved_fragments:
-        if not isinstance(unresolved_fragments, list):
-            return "unresolved", ["(не вдалося розібрати частину повідомлення)"]
-        fragments = [str(f).strip() for f in unresolved_fragments if str(f).strip()]
-        return "unresolved", fragments or ["(не вдалося розібрати частину повідомлення)"]
-
-    if not isinstance(operations, list) or not operations:
-        return "invalid", ["Не знайшов жодної дії для виконання."]
-
-    total = len(items)
-    reasons = []
-    used_item_numbers = set()
-    inventory_changes = []
-    shopping_raw = []
-
-    for op in operations:
-        if not isinstance(op, dict) or op.get("type") not in _COMPOUND_OP_TYPES:
-            reasons.append("Незрозуміла дія.")
-            continue
-        op_type = op["type"]
-
-        if op_type in ("remove_inventory", "consume_inventory_quantity"):
-            num = op.get("item_number")
-            if not isinstance(num, int) or num < 1 or num > total:
-                reasons.append("Невідома позиція запасів.")
-                continue
-            item = items[num - 1]
-            if num in used_item_numbers:
-                reasons.append(f"«{item['name']}» — позиція задіяна в кількох операціях одночасно.")
-                continue
-
-            if op_type == "remove_inventory":
-                used_item_numbers.add(num)
-                inventory_changes.append({
-                    "item_number": num, "item_id": item["id"], "name": item["name"],
-                    "old_value": item.get("quantity_value"), "old_unit": item.get("quantity_unit"),
-                    "old_display": format_quantity_display(item.get("quantity_value"), item.get("quantity_unit")),
-                    "new_value": None, "new_unit": None, "new_display": None,
-                    "will_remove": True, "op_type": "remove",
-                })
-                continue
-
-            # consume_inventory_quantity
-            value = op.get("quantity_value")
-            unit = op.get("quantity_unit")
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-                reasons.append(f"«{item['name']}» — не можу безпечно визначити кількість для списання. Уточни, будь ласка.")
-                continue
-            if unit not in STRUCTURED_UNITS:
-                reasons.append(f"«{item['name']}» — невідома одиниця вимірювання.")
-                continue
-            cur_value = item.get("quantity_value")
-            cur_unit = item.get("quantity_unit")
-            if cur_value is None or cur_unit is None:
-                reasons.append(f"«{item['name']}» — не вказана точна кількість, не можна безпечно списати частину.")
-                continue
-            kind, remaining, remaining_unit = _resolve_consumption(cur_value, cur_unit, value, unit)
-            if kind == "incompatible_units":
-                reasons.append(f"«{item['name']}» — несумісні одиниці для списання.")
-                continue
-            if kind == "insufficient":
-                available_display = format_quantity_display(cur_value, cur_unit)
-                requested_display = format_quantity_display(value, unit)
-                reasons.append(f"«{item['name']}» — у запасах лише {available_display}, а вказано {requested_display}.")
-                continue
-            used_item_numbers.add(num)
-            will_remove = remaining == 0
-            new_value = None if will_remove else float(remaining)
-            new_unit = None if will_remove else remaining_unit
-            inventory_changes.append({
-                "item_number": num, "item_id": item["id"], "name": item["name"],
-                "old_value": cur_value, "old_unit": cur_unit,
-                "old_display": format_quantity_display(cur_value, cur_unit),
-                "new_value": new_value, "new_unit": new_unit,
-                "new_display": None if will_remove else format_quantity_display(new_value, new_unit),
-                "will_remove": will_remove, "op_type": "consume",
-            })
-            continue
-
-        # add_to_shopping
-        name = op.get("name")
-        if not isinstance(name, str) or not name.strip():
-            reasons.append("Товар для покупок без назви.")
-            continue
-        name = name.strip()
-        if not op.get("is_consumable", True):
-            reasons.append(f"«{name}» — не їстівний товар, не можу додати до покупок.")
-            continue
-        cat = op.get("category")
-        if not isinstance(cat, str) or cat not in VALID_CATEGORIES:
-            cat = DEFAULT_CATEGORY
-        qty_value = op.get("quantity_value")
-        qty_unit = op.get("quantity_unit")
-        if (
-            not isinstance(qty_value, (int, float)) or isinstance(qty_value, bool)
-            or qty_value <= 0
-            or not isinstance(qty_unit, str) or qty_unit not in STRUCTURED_UNITS
-        ):
-            qty_value, qty_unit = None, None
-        normalized = normalize_item_quantity(
-            name, "", quantity_value=qty_value, quantity_unit=qty_unit, allow_default_unit=(qty_value is None),
-            alias_map=alias_map,
-        )
-        shopping_item = {"name": name, "category": cat, "was_corrected": False}
-        shopping_item.update(normalized)
-        shopping_raw.append(shopping_item)
-
-    if reasons:
-        return "invalid", reasons
-    if not inventory_changes and not shopping_raw:
-        return "invalid", ["Не знайшов жодної безпечної дії."]
-
-    add_to_shopping = _auto_merge_in_place(shopping_raw) if shopping_raw else []
-    return "ok", {"inventory_changes": inventory_changes, "add_to_shopping": add_to_shopping}
+    return inventory.validate_compound_operations(
+        operations, unresolved_fragments, items,
+        normalize_item_quantity, _auto_merge_in_place,
+        VALID_CATEGORIES, DEFAULT_CATEGORY,
+        alias_map=alias_map,
+    )
 
 
 def _format_compound_preview(resolved):
-    changes = resolved["inventory_changes"]
-    shopping = resolved["add_to_shopping"]
-    lines = ["🧊 Буде змінено в запасах:", ""]
-    for i, c in enumerate(changes, start=1):
-        label = c["name"]
-        if c["old_display"]:
-            label += f" — {c['old_display']}"
-        lines.append(f"{i}. {label}")
-        if c["will_remove"]:
-            lines.append("   → буде прибрано із запасів")
-        else:
-            new_label = c["name"]
-            if c["new_display"]:
-                new_label += f" — {c['new_display']}"
-            lines.append(f"   → {new_label}")
-        lines.append("")
-    if shopping:
-        lines.append("🛒 Буде додано до покупок:")
-        lines.append("")
-        for item in shopping:
-            _, _, qty_display = _effective_quantity(item)
-            label = item["name"]
-            if qty_display:
-                label += f" — {qty_display}"
-            lines.append(f"• {label}")
-    return "\n".join(lines).rstrip()
-
-
-# _compound_snapshot_is_stale now lives in inventory.py — imported above.
+    return inventory.format_compound_preview(resolved, _effective_quantity)
 
 
 # =========================
