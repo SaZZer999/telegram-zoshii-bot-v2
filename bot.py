@@ -3740,6 +3740,70 @@ def _try_global_household_router(chat_id, user_id, display_name, text):
         return True
 
 
+# =========================
+# AMBIGUOUS "ДОДАЙ ... ЗА СУМУ" GUARD — a message starting with the same bare
+# "Додай"/"Додайте" verb Global Explicit Add v1/Global Bare Add v1 both react
+# to, but that ALSO carries a recognized expense amount (zł/zl/pln/a bare
+# "z" — the exact same expenses._EXPENSE_AMOUNT_RE both of those routes
+# already use, never a second copy), is genuinely ambiguous: did the user
+# want a shopping/inventory item, or an expense record? Rather than silently
+# picking one (the old bug: it fell through to the plain expense-add gate and
+# created an expense-only preview for what was clearly meant as an item
+# add), this is intercepted BEFORE Explicit Add/Bare Add/the Global
+# Household Router/the expense gate — no Gemini call, no DB read, no
+# preview, no clarification — and the user is told to disambiguate with an
+# existing, already-supported phrasing instead.
+#
+# Deliberately excludes "Додай витрату ..." (the next word is a form of
+# "витрата") — that phrasing already unambiguously means "add an expense",
+# not "add an item", so it must keep working through the existing expense-add
+# flow untouched.
+# =========================
+_AMBIGUOUS_ADD_PREFIX_RE = re.compile(r"^додай(?:те)?\s+", re.IGNORECASE)
+_AMBIGUOUS_ADD_EXPENSE_WORD_RE = re.compile(r"^витрат\w*", re.IGNORECASE)
+
+AMBIGUOUS_ADD_WITH_PRICE_MSG = (
+    "Команда «Додай ... за суму» неоднозначна.\n\n"
+    "Щоб додати товар у запаси та записати витрату, напиши:\n"
+    "«Купив молоко за 10 zł».\n\n"
+    "Щоб додати лише витрату, напиши:\n"
+    "«Молоко 10 zł»."
+)
+
+
+def _is_ambiguous_add_with_price(text):
+    """True if `text` is a bare "Додай"/"Додайте" command (with or without
+    an explicit destination phrase — this fires before either route ever
+    inspects it) whose remainder carries a recognized expense amount, and
+    isn't the explicit "Додай витрату ..." expense-add phrasing. Pure/local,
+    no Gemini, no DB — same amount regex Global Explicit Add v1/Global Bare
+    Add v1 already use (expenses._EXPENSE_AMOUNT_RE), never duplicated.
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    match = _AMBIGUOUS_ADD_PREFIX_RE.match(stripped)
+    if not match:
+        return False
+    rest = stripped[match.end():].strip()
+    if not rest:
+        return False
+    if _AMBIGUOUS_ADD_EXPENSE_WORD_RE.match(rest):
+        return False
+    return bool(expenses._EXPENSE_AMOUNT_RE.search(rest))
+
+
+def _handle_ambiguous_add_with_price(chat_id):
+    """Sends the disambiguation message on the caller's current keyboard —
+    pure RAM lookups only (household_router.current_origin/origin_keyboard),
+    never a DB read."""
+    origin = household_router.current_origin(chat_id)
+    keyboard = household_router.origin_keyboard(origin)
+    send_message(chat_id, AMBIGUOUS_ADD_WITH_PRICE_MSG, reply_markup=keyboard)
+
+
 def _try_global_explicit_add(chat_id, user_id, display_name, text):
     """Global Explicit Add v1 — a message with an EXPLICIT destination
     phrase ("Додай до покупок ...", "Додай в запаси ...", see
@@ -5139,6 +5203,18 @@ def webhook():
         # AI-chat while this question is unanswered — an invalid reply just
         # re-asks the same question instead of falling through anywhere.
         _continue_add_destination_clarification(chat_id, text)
+        _preview_intercepted = True
+
+    elif _is_ambiguous_add_with_price(text):
+        # Ambiguous "Додай ... за суму" guard — checked after every active
+        # preview/selection/clarification state above (none of them are
+        # active here, or a higher elif would already have matched) and
+        # ahead of Explicit Add/Bare Add/the Global Household Router/the
+        # expense gate below, so a bare "Додай молоко за 10 zł" (or an
+        # explicit-destination "Додай в запаси/до покупок ... за суму") can
+        # never fall through into any of them — no preview, no
+        # clarification, no DB write, no Gemini call, no general AI-chat.
+        _handle_ambiguous_add_with_price(chat_id)
         _preview_intercepted = True
 
     elif (

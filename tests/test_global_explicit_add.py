@@ -250,7 +250,13 @@ class TestExplicitAddUnresolvedFragments(_BaseExplicitAddTestCase):
 
 class TestExplicitAddWithAmountIsBlocked(_BaseExplicitAddTestCase):
     # Case 9 — an amount in the message blocks it deterministically, before
-    # Gemini is even called, rather than creating an incomplete record.
+    # Gemini is even called, rather than creating an incomplete record. Since
+    # the Ambiguous "Додай ... за суму" guard (see
+    # tests/test_ambiguous_add_with_price.py) now intercepts every "Додай ..."
+    # command carrying a recognized amount BEFORE Global Explicit Add ever
+    # runs, these show the guard's unified disambiguation message rather than
+    # build_explicit_add_preview's own (now unreachable for this exact
+    # phrasing) "Для покупки з витратою..." message.
     def test_amount_in_explicit_inventory_command_is_blocked(self):
         chat_id = 997050
         _call_webhook(_make_update(997000050, chat_id, "Додай в запаси молоко за 10 zł"))
@@ -258,10 +264,7 @@ class TestExplicitAddWithAmountIsBlocked(_BaseExplicitAddTestCase):
         self.assertNotIn(chat_id, pending_global_household)
         self.mock_apply.assert_not_called()
         texts = self._sent_texts()
-        self.assertTrue(any(
-            "Для покупки з витратою напиши, наприклад:" in t and "«Купив молоко за 10 zł»" in t
-            for t in texts
-        ))
+        self.assertTrue(any("Команда «Додай ... за суму» неоднозначна." in t for t in texts))
 
     def test_amount_in_explicit_shopping_command_is_blocked(self):
         chat_id = 997051
@@ -278,10 +281,7 @@ class TestExplicitAddWithAmountIsBlocked(_BaseExplicitAddTestCase):
         self.assertNotIn(chat_id, pending_global_household)
         self.mock_apply.assert_not_called()
         texts = self._sent_texts()
-        self.assertTrue(any(
-            "Для покупки з витратою напиши, наприклад:" in t and "«Купив молоко за 10 zł»" in t
-            for t in texts
-        ))
+        self.assertTrue(any("Команда «Додай ... за суму» неоднозначна." in t for t in texts))
 
     def test_short_zloty_marker_with_decimal_in_explicit_shopping_command_is_blocked(self):
         chat_id = 997053
