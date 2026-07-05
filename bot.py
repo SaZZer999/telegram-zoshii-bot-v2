@@ -72,6 +72,8 @@ from inventory import (
     _CANONICAL_UNIT_FOR_GROUP,
     _compound_snapshot_is_stale,
 )
+import list_editing
+from list_editing import _compute_merged_quantity, _apply_pending_merge
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -1351,22 +1353,7 @@ def clear_interaction_state(chat_id):
     pending_add_destination_clarification.pop(chat_id, None)
     pending_undo_action.pop(chat_id, None)
 
-# =========================
-# QUANTITY HELPERS (local)
-# =========================
-_MERGEABLE_UNITS_BOT = {"л", "мл", "г", "кг", "шт."}
-
-def _parse_qty(qty_text):
-    if not qty_text:
-        return None, None
-    normalized = qty_text.strip().replace(",", ".")
-    parts = normalized.split()
-    if len(parts) != 2:
-        return None, None
-    try:
-        return float(parts[0]), parts[1]
-    except ValueError:
-        return None, None
+# _parse_qty/_MERGEABLE_UNITS_BOT now live in list_editing.py — imported above.
 
 # =========================
 # STRUCTURED QUANTITY HELPERS
@@ -1600,162 +1587,22 @@ def _effective_quantity(item):
     return None, None, (item.get("quantity_text") or "")
 
 
+# names_can_merge/_auto_merge_in_place need bot.py's own canonicalize_name/
+# _effective_quantity/DEFAULT_CATEGORY injected — thin wrappers over
+# list_editing.py, the single source of truth. _compute_merged_quantity/
+# _apply_pending_merge have no bot-specific dependency, so they're already
+# bound directly via the `from list_editing import ...` above — no
+# redefinition needed here.
 def names_can_merge(item_a, item_b):
-    """Same product (canonical_name) and compatible category (equal, or either default)."""
-    canon_a = item_a.get("canonical_name") or canonicalize_name(item_a["name"])
-    canon_b = item_b.get("canonical_name") or canonicalize_name(item_b["name"])
-    if canon_a != canon_b:
-        return False
-    cat_a = item_a.get("category") or DEFAULT_CATEGORY
-    cat_b = item_b.get("category") or DEFAULT_CATEGORY
-    return cat_a == cat_b or cat_a == DEFAULT_CATEGORY or cat_b == DEFAULT_CATEGORY
+    return list_editing.names_can_merge(item_a, item_b, canonicalize_name, DEFAULT_CATEGORY)
 
-
-def _compute_merged_quantity(merge_items):
-    """Compute safe merged quantity_text for a group.
-
-    both empty → ""; one empty → use non-empty; same mergeable unit → sum;
-    different units or unparseable → None (group blocked).
-    """
-    qtys = [item.get("quantity_text") or "" for item in merge_items]
-    non_empty = [q.strip() for q in qtys if q.strip()]
-
-    if not non_empty:
-        return ""
-    if len(non_empty) == 1:
-        return non_empty[0]
-
-    parsed = [_parse_qty(q) for q in non_empty]
-
-    if any(val is None for val, unit in parsed):
-        unique = set(non_empty)
-        return non_empty[0] if len(unique) == 1 else None
-
-    units = set(unit for val, unit in parsed)
-    if len(units) != 1:
-        return None
-
-    unit = next(iter(units))
-    if unit not in _MERGEABLE_UNITS_BOT:
-        unique = set(non_empty)
-        return non_empty[0] if len(unique) == 1 else None
-
-    total = round(sum(val for val, unit in parsed), 1)
-    if total == int(total):
-        return f"{int(total)} {unit}"
-    return str(total).replace(".", ",") + f" {unit}"
-
-# =========================
-# MERGE HELPERS
-# =========================
 
 def _auto_merge_in_place(items):
-    """Merge duplicate items within a pending list (pure Python, no Gemini).
-
-    Same canonical_name (+ compatible category) with mergeable structured
-    units (merge_quantity_values decides — same unit, or same mass/volume
-    conversion group) are summed. Incompatible items are left separate — no
-    guessed math.
-    """
-    result = []
-    for item in items:
-        target = None
-        merged_qty = None
-        for existing in result:
-            if not names_can_merge(existing, item):
-                continue
-            val_a, unit_a, _ = _effective_quantity(existing)
-            val_b, unit_b, _ = _effective_quantity(item)
-            candidate = merge_quantity_values(val_a, unit_a, val_b, unit_b)
-            if candidate is not None:
-                target = existing
-                merged_qty = candidate
-                break
-        if target is not None:
-            value, unit = merged_qty
-            target["quantity_value"] = value
-            target["quantity_unit"] = unit
-            target["quantity_text"] = format_quantity_display(value, unit)
-            target["quantity_inferred"] = bool(target.get("quantity_inferred")) and bool(item.get("quantity_inferred"))
-            if (target.get("category") or DEFAULT_CATEGORY) == DEFAULT_CATEGORY and item.get("category"):
-                target["category"] = item["category"]
-        else:
-            result.append(dict(item))
-    return result
-
-
-def _apply_pending_merge(items, validated_groups):
-    """Apply merge groups to a pending RAM list. Returns new filtered list."""
-    items = list(items)
-    for group in validated_groups:
-        indices = group["item_indices"]
-        main_idx = indices[0]
-        if main_idx >= len(items) or items[main_idx] is None:
-            continue
-        items[main_idx] = dict(items[main_idx])
-        items[main_idx]["name"] = group["merged_name"]
-        items[main_idx]["quantity_text"] = group["merged_quantity_text"]
-        items[main_idx]["category"] = group["merged_category"]
-        for idx in indices[1:]:
-            if idx < len(items):
-                items[idx] = None
-    return [it for it in items if it is not None]
+    return list_editing._auto_merge_in_place(items, _effective_quantity, canonicalize_name, DEFAULT_CATEGORY)
 
 
 def _validate_merge_groups(raw_groups, items_list, is_pending=False):
-    """Validate Gemini merge suggestions against an ordered item list.
-
-    raw_groups use sequential item_refs (#1, #2, ...).
-    is_pending=True  → store item_indices (0-based list indices).
-    is_pending=False → store item_ids (actual DB ids).
-    """
-    validated = []
-    used_refs = set()
-    items_by_ref = {i + 1: items_list[i] for i in range(len(items_list))}
-    for group in raw_groups:
-        refs = group.get("item_refs")
-        if not isinstance(refs, list) or len(refs) < 2:
-            continue
-        try:
-            refs = [int(r) for r in refs]
-        except (TypeError, ValueError):
-            continue
-        if any(r in used_refs for r in refs):
-            continue
-        merge_items = [items_by_ref.get(r) for r in refs]
-        if any(m is None for m in merge_items):
-            continue
-
-        categories = set(item.get("category") or DEFAULT_CATEGORY for item in merge_items)
-        non_default = categories - {DEFAULT_CATEGORY}
-        if len(non_default) > 1:
-            continue
-
-        merged_category = (group.get("merged_category") or "").strip()
-        if merged_category not in VALID_CATEGORIES:
-            merged_category = next(iter(non_default), DEFAULT_CATEGORY)
-
-        merged_name = (group.get("merged_name") or "").strip()
-        if not merged_name:
-            continue
-
-        merged_qty = _compute_merged_quantity(merge_items)
-        if merged_qty is None:
-            continue
-
-        used_refs.update(refs)
-        entry = {
-            "merged_name": merged_name,
-            "merged_quantity_text": merged_qty,
-            "merged_category": merged_category,
-            "items": merge_items,
-        }
-        if is_pending:
-            entry["item_indices"] = [r - 1 for r in refs]
-        else:
-            entry["item_ids"] = [item["id"] for item in merge_items]
-        validated.append(entry)
-    return validated
+    return list_editing._validate_merge_groups(raw_groups, items_list, VALID_CATEGORIES, DEFAULT_CATEGORY, is_pending=is_pending)
 
 
 def _ask_gemini_intent_router(user_text, items):
@@ -1822,56 +1669,11 @@ def _ask_gemini_preview_edit_router(user_text, items, context_type):
 
 
 def _validate_preview_updates(updates, items):
-    """Validate Gemini preview edit updates. Returns list of valid updates or None."""
-    if not isinstance(updates, list) or not updates:
-        return None
-    total = len(items)
-    used_numbers = set()
-    valid = []
-    for upd in updates:
-        if not isinstance(upd, dict):
-            return None
-        num = upd.get("item_number")
-        if not isinstance(num, int) or num < 1 or num > total:
-            return None
-        if num in used_numbers:
-            return None
-        used_numbers.add(num)
-        name = upd.get("name")
-        if name is not None and (not isinstance(name, str) or not name.strip()):
-            return None
-        qty = upd.get("quantity_text")
-        if qty is not None and (not isinstance(qty, str) or not qty.strip()):
-            return None
-        cat = upd.get("category")
-        if cat is not None and cat not in VALID_CATEGORIES:
-            return None
-        valid.append({
-            "item_number": num,
-            "name": name,
-            "quantity_text": qty,
-            "category": cat,
-        })
-    return valid
+    return list_editing._validate_preview_updates(updates, items, VALID_CATEGORIES)
 
 
 def _apply_preview_updates(items, valid_updates, alias_map=None):
-    """Apply validated updates to items list. Returns new list without mutating originals."""
-    result = [dict(item) for item in items]
-    for upd in valid_updates:
-        idx = upd["item_number"] - 1
-        name_changed = upd.get("name") is not None
-        qty_changed = upd.get("quantity_text") is not None
-        if name_changed:
-            result[idx]["name"] = str(upd["name"]).strip()
-        if qty_changed:
-            result[idx]["quantity_text"] = upd["quantity_text"].strip()
-        if upd.get("category") is not None:
-            result[idx]["category"] = upd["category"]
-        if name_changed or qty_changed:
-            normalized = normalize_item_quantity(result[idx]["name"], result[idx].get("quantity_text") or "", alias_map=alias_map)
-            result[idx].update(normalized)
-    return result
+    return list_editing._apply_preview_updates(items, valid_updates, normalize_item_quantity, alias_map=alias_map)
 
 
 # =========================
@@ -1879,94 +1681,13 @@ def _apply_preview_updates(items, valid_updates, alias_map=None):
 # =========================
 
 def _compute_saved_merged_quantity(group_items):
-    """Compute merged quantity for saved list merging.
-
-    All empty → count as 1 шт. each (e.g. Хліб + Хліб → 2 шт.).
-    empty + "N шт." → (N+1) шт. (empty treated as 1 шт.).
-    Same parseable non-шт. unit → sum (no empty items allowed for liquid/weight units).
-    Returns quantity string or None if incompatible.
-    """
-    qtys = [_effective_quantity(item)[2] for item in group_items]
-    non_empty = [q.strip() for q in qtys if q.strip()]
-    empty_count = len(qtys) - len(non_empty)
-
-    if not non_empty:
-        return f"{len(group_items)} шт."
-
-    parsed = []
-    for q in non_empty:
-        val, unit = _parse_qty(q)
-        if val is None:
-            return None
-        parsed.append((val, unit))
-
-    units = {u for _, u in parsed}
-    if len(units) != 1:
-        return None
-    unit = next(iter(units))
-    if unit not in _MERGEABLE_UNITS_BOT:
-        return None
-
-    if unit == "шт.":
-        total = round(sum(v for v, _ in parsed) + empty_count, 1)
-    else:
-        if empty_count > 0:
-            return None
-        total = round(sum(v for v, _ in parsed), 1)
-
-    if total == int(total):
-        return f"{int(total)} {unit}"
-    return str(total).replace(".", ",") + f" {unit}"
+    return list_editing._compute_saved_merged_quantity(group_items, _effective_quantity)
 
 
 def _compute_saved_merge_groups(merge_groups_raw, items):
-    """Convert Gemini [[2, 4], [1, 3]] merge_groups into validated groups for DB merge.
-
-    Validates: same normalized name, compatible categories, safe quantity merge.
-    Returns list of groups ready for execute_merge_shopping/inventory and _format_merge_preview.
-    """
-    if not isinstance(merge_groups_raw, list) or not merge_groups_raw:
-        return []
-    total = len(items)
-    items_by_num = {i + 1: items[i] for i in range(total)}
-    used_numbers = set()
-    validated = []
-    for group_raw in merge_groups_raw:
-        if not isinstance(group_raw, list) or len(group_raw) < 2:
-            continue
-        try:
-            nums = [int(n) for n in group_raw]
-        except (TypeError, ValueError):
-            continue
-        if any(n < 1 or n > total for n in nums):
-            continue
-        if any(n in used_numbers for n in nums):
-            continue
-        group_items = [items_by_num[n] for n in nums]
-        canonical_names = {it.get("canonical_name") or canonicalize_name(it["name"]) for it in group_items}
-        if len(canonical_names) > 1:
-            continue
-        categories = {it.get("category") or DEFAULT_CATEGORY for it in group_items}
-        non_default = categories - {DEFAULT_CATEGORY}
-        if len(non_default) > 1:
-            continue
-        merged_category = next(iter(non_default), DEFAULT_CATEGORY)
-        merged_qty = _compute_saved_merged_quantity(group_items)
-        if merged_qty is None:
-            continue
-        merged_value, merged_unit = _parse_structured_quantity(merged_qty)
-        used_numbers.update(nums)
-        validated.append({
-            "item_ids": [it["id"] for it in group_items],
-            "merged_name": group_items[0]["name"],
-            "merged_quantity_text": merged_qty,
-            "merged_category": merged_category,
-            "canonical_name": next(iter(canonical_names)),
-            "merged_quantity_value": merged_value,
-            "merged_quantity_unit": merged_unit,
-            "items": group_items,
-        })
-    return validated
+    return list_editing._compute_saved_merge_groups(
+        merge_groups_raw, items, canonicalize_name, _effective_quantity, DEFAULT_CATEGORY,
+    )
 
 
 def _validate_alias_action(alias_text, target_display_name):
@@ -2768,21 +2489,7 @@ def _format_saved_edit_preview(items_snapshot, validated_updates, context_type):
 
 
 def _format_merge_preview(validated_groups):
-    lines = [f"🧹 Буде об'єднано груп: {len(validated_groups)}", ""]
-    for i, group in enumerate(validated_groups):
-        parts = []
-        for item in group["items"]:
-            label = item["name"]
-            item_qty = _effective_quantity(item)[2]
-            if item_qty:
-                label += f" — {item_qty}"
-            parts.append(label)
-        result = group["merged_name"]
-        if group["merged_quantity_text"]:
-            result += f" — {group['merged_quantity_text']}"
-        lines.append(f"{i + 1}. {' + '.join(parts)}")
-        lines.append(f"   → {result}")
-    return "\n".join(lines)
+    return list_editing._format_merge_preview(validated_groups, _effective_quantity)
 
 # =========================
 # SELECTION / PREVIEW HELPERS
@@ -2840,26 +2547,7 @@ def _snapshot_targets(items):
 
 
 def _merge_snapshot_targets(validated_groups):
-    """Build {item_id, quantity_value, quantity_unit, canonical_name, category}
-    snapshot targets for every SOURCE item across a set of validated saved-list
-    merge groups (each group's "items" list, as built by _compute_saved_merge_groups)
-    — fed into database._verify_targets_in_tx's extra_fields check, the exact same
-    guard every other confirm-flow already uses, just extended to also cover the
-    two extra fields a merge's UPDATE actually changes. Blocks the manual merge
-    (StaleSnapshotError) if any target item's quantity, unit, canonical_name, or
-    category changed — or the item vanished — since the merge preview was built.
-    """
-    targets = []
-    for group in validated_groups:
-        for it in group["items"]:
-            targets.append({
-                "item_id": it["id"],
-                "quantity_value": it.get("quantity_value"),
-                "quantity_unit": it.get("quantity_unit"),
-                "canonical_name": it.get("canonical_name") or canonicalize_name(it["name"]),
-                "category": it.get("category") or DEFAULT_CATEGORY,
-            })
-    return targets
+    return list_editing._merge_snapshot_targets(validated_groups, canonicalize_name, DEFAULT_CATEGORY)
 
 
 def _should_restore_persisted_context(chat_id):
