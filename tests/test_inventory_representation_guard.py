@@ -508,7 +508,7 @@ def _call_webhook(update):
 
 
 def _parse_result(name, quantity_text, category):
-    # Mirrors what parse_shopping_list_with_gemini really builds per item —
+    # Mirrors what parse_inventory_list_with_gemini really builds per item —
     # runs the raw name/quantity_text through the real normalization
     # pipeline so quantity_value/unit/inferred/text are all correctly set
     # (critical here: a blank quantity_text must produce the real "1 шт."
@@ -562,7 +562,7 @@ class TestNormalInventoryAddFlowWebhook(unittest.TestCase):
         chat_id = 990001
         inventory_mode[chat_id] = "adding"
         with patch.object(bot, "get_inventory_items", return_value=[_milk_row()]):
-            with patch.object(bot, "parse_shopping_list_with_gemini",
+            with patch.object(bot, "parse_inventory_list_with_gemini",
                                return_value=_parse_result("Молоко", "", "Молочне та яйця")):
                 with patch.object(bot, "add_inventory_items_batch") as mock_add:
                     _call_webhook(_make_update(990000001, chat_id, "Купив молоко"))
@@ -576,7 +576,7 @@ class TestNormalInventoryAddFlowWebhook(unittest.TestCase):
         chat_id = 990005
         inventory_mode[chat_id] = "adding"
         with patch.object(bot, "get_inventory_items", return_value=[_milk_pieces_row(), _milk_row()]):
-            with patch.object(bot, "parse_shopping_list_with_gemini",
+            with patch.object(bot, "parse_inventory_list_with_gemini",
                                return_value=_parse_result("Молоко", "", "Молочне та яйця")):
                 with patch.object(bot, "add_inventory_items_batch") as mock_add:
                     _call_webhook(_make_update(990000005, chat_id, "Купив молоко"))
@@ -590,7 +590,7 @@ class TestNormalInventoryAddFlowWebhook(unittest.TestCase):
         chat_id = 990002
         inventory_mode[chat_id] = "adding"
         with patch.object(bot, "get_inventory_items", return_value=[_sausage_row()]):
-            with patch.object(bot, "parse_shopping_list_with_gemini",
+            with patch.object(bot, "parse_inventory_list_with_gemini",
                                return_value=_parse_result("Сосиски", "дві пачки", "М'ясо та риба")):
                 _call_webhook(_make_update(990000002, chat_id, "Купив дві пачки сосисок"))
         self.assertIn(chat_id, pending_inventory_batch)

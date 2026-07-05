@@ -366,6 +366,44 @@ SHOPPING_PARSE_PROMPT = (
     '],"ignored_items":["Навушники"]}'
 )
 
+# Inventory-only mirror of SHOPPING_PARSE_PROMPT (kept as a separate copy —
+# shopping's own prompt/flow is deliberately untouched). Adds one extra rule
+# (word-numbers and container/package words must stay verbatim in
+# quantity_text, never converted to a digit or left inside name) plus
+# matching examples, so a phrase like "дві пачки сосисок" is never silently
+# turned into "Сосиски — 2 шт." — see normalize_item_quantity/
+# _parse_structured_quantity for how quantity_text is turned into
+# quantity_value/quantity_unit/quantity_inferred afterward in Python.
+INVENTORY_PARSE_PROMPT = (
+    "Розбий текст на список продуктів для запасів удома. Правила:\n"
+    "- розділяй позиції за новими рядками, комами, крапками з комою або природними розділеннями;\n"
+    "- «Мисливські ковбаски 4» — це ОДИН товар із кількістю «4 шт.», не два;\n"
+    "- назва (name) НІКОЛИ не містить слів про кількість чи тару. Слово-числівник («дві», «три», «чотири», "
+    "«пара», «пару» тощо) або назву тари («пачка», «пачки», «пачок», «упаковка», «упаковки», «упаковок») "
+    "завжди лишай ТОЧНО як у тексті в quantity_text — ніколи не перетворюй на цифру і не вигадуй для них "
+    "одиницю виміру («шт.», «г» тощо): «дві пачки сосисок» → name «Сосиски», quantity_text «дві пачки»; "
+    "«пачка макаронів» → name «Макарони», quantity_text «пачка»; «три упаковки йогурту» → name «Йогурт», "
+    "quantity_text «три упаковки»; «пару сосисок» → name «Сосиски», quantity_text «пару» (НЕ «2»);\n"
+    "- is_consumable: true лише для їжі, напоїв, спецій та соусів; "
+    "навушники, батарейки, побутова хімія, засоби гігієни, посуд, інструменти, електроніка → false;\n"
+    "- виправляй лише очевидні орфографічні помилки; was_corrected: true якщо виправив, інакше false;\n"
+    "- не вигадуй товари, яких немає в тексті;\n"
+    "- нормалізуй одиниці: «500 грам» → «500 г», «2 штуки» → «2 шт.», «1.5 л» → «1,5 л», «півтора літри» → «1,5 л»;\n"
+    "- якщо вказано лише число (без слова-тари), додавай одиницю тільки коли це очевидно: "
+    "штучні товари (сосиски, яйця, ковбаски, банани) → «шт.», рідини (молоко, вершки, кефір) → «л»; "
+    "якщо неясно — лишай число без одиниці;\n"
+    "- category — одна з: М'ясо та риба, Молочне та яйця, Овочі та зелень, Фрукти та ягоди, "
+    "Хліб і випічка, Крупи макарони та борошно, Соуси спеції та бакалія, Солодке та снеки, "
+    "Напої, Заморожене, Інше їстівне;\n"
+    "- ignored_items — оригінальні назви позицій з тексту, де is_consumable=false.\n\n"
+    "Відповідай ТІЛЬКИ валідним JSON, без жодного додаткового тексту:\n"
+    '{"items":['
+    '{"name":"Сосиски","quantity_text":"дві пачки","category":"М\'ясо та риба","was_corrected":false,"is_consumable":true},'
+    '{"name":"Банани","quantity_text":"3","category":"Фрукти та ягоди","was_corrected":false,"is_consumable":true},'
+    '{"name":"Сосиски","quantity_text":"пару","category":"М\'ясо та риба","was_corrected":false,"is_consumable":true}'
+    '],"ignored_items":["Навушники"]}'
+)
+
 SELECTION_PROMPT = (
     "Визнач, які позиції зі списку користувач хоче вибрати.\n"
     "Правила інтерпретації:\n"
@@ -3218,6 +3256,84 @@ def parse_shopping_list_with_gemini(text, alias_map=None):
     except (json.JSONDecodeError, AttributeError, TypeError):
         return None
 
+
+# Narrow whitelist mirror of household_router.py's identical
+# _LEAKED_QUANTITY_PREFIX_RE/_looks_like_leaked_quantity_phrase — duplicated
+# on purpose (same reasoning as every other small pure helper already
+# duplicated across this codebase) rather than reaching into a private name
+# in another module. Detects a quantity/container word that leaked into the
+# front of `name` instead of being separated into quantity_text — a sign
+# Gemini failed to split the phrase safely, e.g. name="дві пачки сосисок".
+_LEAKED_QUANTITY_PREFIX_RE = re.compile(
+    r"^(пара|пару|два|дві|три|чотири|п['’]?ять|пачка|пачки|пачок|упаковка|упаковки|упаковок)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_leaked_quantity_phrase(name):
+    """True if `name` still starts with a quantity/container word that
+    should have been separated into quantity_text instead. Never guessed at
+    beyond this exact whitelist."""
+    return bool(_LEAKED_QUANTITY_PREFIX_RE.match((name or "").strip()))
+
+
+def parse_inventory_list_with_gemini(text, alias_map=None):
+    """Inventory-only mirror of parse_shopping_list_with_gemini — same
+    contract/return shape, but uses INVENTORY_PARSE_PROMPT (explicit rules
+    for word-numbers/container quantities like "дві пачки"/"пачка"/"пару"
+    staying verbatim in quantity_text, never converted to a digit or left
+    inside name) and additionally refuses to turn a leaked quantity/
+    container phrase in `name` into a broken canonical item — such an item
+    is treated exactly like a non-consumable one (excluded from the
+    returned items, listed under ignored_items) instead of creating a
+    preview with a garbage name.
+    """
+    history = [{"role": "user", "content": text}]
+    raw = call_gemini(history, INVENTORY_PARSE_PROMPT, temperature=0.1)
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        match = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
+        if match:
+            cleaned = match.group(1).strip()
+    try:
+        data = json.loads(cleaned)
+        raw_items = data.get("items")
+        if not isinstance(raw_items, list):
+            return None
+        ignored = list(data.get("ignored_items") or [])
+        consumable = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name", "").strip()
+            if not name:
+                continue
+            if not item.get("is_consumable", True):
+                ignored.append(name)
+                continue
+            if _looks_like_leaked_quantity_phrase(name):
+                ignored.append(name)
+                continue
+            cat = item.get("category", "").strip()
+            if cat not in VALID_CATEGORIES:
+                cat = DEFAULT_CATEGORY
+            normalized = normalize_item_quantity(name, item.get("quantity_text", "").strip(), allow_default_unit=True, alias_map=alias_map)
+            entry = {
+                "name": name,
+                "category": cat,
+                "was_corrected": bool(item.get("was_corrected", False)),
+            }
+            entry.update(normalized)
+            consumable.append(entry)
+        if not consumable and not ignored:
+            return None
+        return {"items": consumable, "ignored_items": ignored}
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+
+
 def format_batch_preview(items, ignored_items=None):
     header = f"🛒 Знайшов товарів: {len(items)}"
     text = format_grouped_list(items, header)
@@ -4174,7 +4290,7 @@ def webhook():
             inventory_mode[chat_id] = "adding"
             send_message(chat_id, INVENTORY_ERROR_MSG)
             return "ok"
-        result = parse_shopping_list_with_gemini(text, alias_map=alias_map)
+        result = parse_inventory_list_with_gemini(text, alias_map=alias_map)
         if result is None:
             inventory_mode[chat_id] = "adding"
             send_message(
