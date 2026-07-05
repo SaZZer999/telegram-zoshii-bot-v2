@@ -65,13 +65,21 @@ def parse_structured_quantity(quantity_text):
 
 
 def format_quantity_display(value, unit):
-    """Format a numeric value+unit for display: comma decimal, no trailing .0."""
+    """Format a numeric value+unit for display: comma decimal, no trailing
+    zeros, never scientific notation, never rounds/truncates the value
+    itself — a small nonzero value (e.g. 0.00001) must never be shown as
+    "0". Converts through Decimal(str(value)) rather than Decimal(value)
+    directly to avoid binary-float artifacts when value is a plain float.
+    """
     if value is None:
         return ""
-    if value == int(value):
-        value_str = str(int(value))
-    else:
-        value_str = ("%g" % value).replace(".", ",")
+    dec_value = value if isinstance(value, Decimal) else Decimal(str(value))
+    text = format(dec_value.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text.lstrip("-") in ("", "0"):
+        text = "0"
+    value_str = text.replace(".", ",")
     return f"{value_str} {unit}" if unit else value_str
 
 
@@ -98,14 +106,21 @@ def normalize_quantity_fields(name, quantity_text, allow_default_unit=False):
 
 def merge_quantity_values(value_a, unit_a, value_b, unit_b):
     """Return merged (value, unit) if two structured quantities can be safely
-    summed, else None. Units must match and be one of the known structured units."""
+    summed, else None. Units must match and be one of the known structured
+    units. Sums via exact Decimal arithmetic (never binary float directly,
+    each input safely converted through Decimal(str(value))) and never
+    rounds the result — full precision is preserved for NUMERIC storage;
+    only format_quantity_display decides how to show it.
+    """
     if value_a is None or value_b is None:
         return None
     if unit_a != unit_b:
         return None
     if unit_a not in STRUCTURED_UNITS:
         return None
-    return round(value_a + value_b, 2), unit_a
+    dec_a = value_a if isinstance(value_a, Decimal) else Decimal(str(value_a))
+    dec_b = value_b if isinstance(value_b, Decimal) else Decimal(str(value_b))
+    return float(dec_a + dec_b), unit_a
 
 
 # =========================
