@@ -180,7 +180,7 @@ class TestApplyGlobalHouseholdOperationsDbLayer(unittest.TestCase):
         self.assertIn("FOR UPDATE", cursor.queries[0][0])
 
     def test_stale_expense_delete_amount_mismatch_aborts(self):
-        cursor = FakeCursor(fetchone_results=[(Decimal("99.00"), "Продукти", date(2026, 7, 3), "Булочка")])
+        cursor = FakeCursor(fetchone_results=[(Decimal("99.00"), "PLN", "Продукти", date(2026, 7, 3), "Булочка", 10)])
         conn = FakeConnection(cursor)
         snapshot = {"amount": Decimal("4.00"), "category": "Продукти",
                     "expense_date": date(2026, 7, 3), "description": "Булочка"}
@@ -195,7 +195,7 @@ class TestApplyGlobalHouseholdOperationsDbLayer(unittest.TestCase):
         cursor = FakeCursor(
             fetchall_results=[[(501, 14.0, "шт."), (502, 1.0, "шт.")]],  # inventory targets verify
             fetchone_results=[
-                (Decimal("4.00"), "Продукти", date(2026, 7, 3), "Булочка"),  # expense verify
+                (Decimal("4.00"), "PLN", "Продукти", date(2026, 7, 3), "Булочка", 10),  # expense verify
                 (501,),  # consume UPDATE ... RETURNING id
             ],
         )

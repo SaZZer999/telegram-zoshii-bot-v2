@@ -46,9 +46,12 @@ from database import (
     get_recent_expenses_for_deletion,
     delete_expense,
     apply_global_household_operations,
+    get_latest_undoable_action,
+    apply_undo_action,
 )
 import expenses
 import household_router
+import action_history
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -135,6 +138,14 @@ pending_inventory_quantity_clarification = {}  # chat_id -> {household_id, user_
 # next reply ("До покупок"/"У запаси") can build the preview via
 # household_router.build_add_preview_from_items without a second Gemini call.
 pending_add_destination_clarification = {}  # chat_id -> {household_id, user_db_id, origin, validated_items}
+
+# Action History + Safe Undo v1 — awaiting confirm/cancel on an "↩️ Скасувати
+# останню дію" preview. Holds only the journal row id and the identity
+# needed to re-verify it belongs to this same user/household at confirm
+# time — the actual restore plan lives in the journal row itself
+# (before_snapshot/post_action_snapshot), re-read fresh inside
+# apply_undo_action's own transaction, never trusted from this dict.
+pending_undo_action = {}  # chat_id -> {action_id, household_id, user_db_id}
 
 # Every OTHER flow's pending preview/confirm state — deliberately excludes
 # pending_alias_action itself (a new global alias command is allowed to
@@ -701,7 +712,8 @@ MAIN_KEYBOARD = {
     "keyboard": [
         ["🛒 Покупки", "🧊 Запаси"],
         ["🍽️ Що приготувати", "ℹ️ Допомога"],
-        ["🧠 Назви товарів", "💸 Витрати"]
+        ["🧠 Назви товарів", "💸 Витрати"],
+        [action_history.UNDO_BUTTON_TEXT],
     ],
     "resize_keyboard": True,
     "is_persistent": True
@@ -819,6 +831,15 @@ GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG = (
     "У тебе є незавершений план змін.\n\n"
     "Підтвердь його або скасуй перед новою командою."
 )
+
+UNDO_PREVIEW_KEYBOARD = {
+    "keyboard": [
+        ["✅ Так, скасувати"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
 
 ADD_DESTINATION_CLARIFICATION_KEYBOARD = {
     "keyboard": [
@@ -3960,6 +3981,44 @@ def _apply_global_household_confirm(chat_id):
         send_message(chat_id, "Не вдалося застосувати зміни. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
 
 
+def _start_undo_flow(chat_id, user_id, display_name):
+    """"↩️ Скасувати останню дію" button or one of the recognized natural
+    phrasings. Looks up ONLY this user's own latest active Global Household
+    Operation in their household (never a partner's) and shows a preview —
+    no database write happens here."""
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        action = get_latest_undoable_action(household_id, user_db_id)
+    except Exception:
+        send_message(chat_id, "Не вдалося перевірити дії для скасування. Спробуй ще раз трохи пізніше.")
+        return
+    if action is None:
+        send_message(chat_id, action_history.NO_UNDOABLE_ACTION_MSG)
+        return
+    pending_undo_action[chat_id] = {
+        "action_id": action["id"], "household_id": household_id, "user_db_id": user_db_id,
+    }
+    send_message(chat_id, action_history.format_undo_preview(action["summary"]), reply_markup=UNDO_PREVIEW_KEYBOARD)
+
+
+def _apply_undo_confirm(chat_id):
+    """"✅ Так, скасувати" button. Pops pending_undo_action BEFORE the
+    database call, so a duplicate/late button press can never apply the
+    inverse twice — apply_undo_action itself also re-verifies status='active'
+    inside its own transaction as a second, authoritative guard."""
+    if chat_id not in pending_undo_action:
+        send_message(chat_id, "Немає активної дії для підтвердження.")
+        return
+    data = pending_undo_action.pop(chat_id)
+    try:
+        apply_undo_action(data["action_id"], data["household_id"], data["user_db_id"])
+        send_message(chat_id, action_history.UNDO_APPLIED_MSG, reply_markup=MAIN_KEYBOARD)
+    except StaleSnapshotError:
+        send_message(chat_id, action_history.UNDO_STALE_MSG, reply_markup=MAIN_KEYBOARD)
+    except Exception:
+        send_message(chat_id, "Не вдалося скасувати дію. Спробуй ще раз трохи пізніше.", reply_markup=MAIN_KEYBOARD)
+
+
 def _continue_inventory_quantity_clarification(chat_id, text):
     """Handle a plain-text reply while pending_inventory_quantity_
     clarification is active for this chat (Inventory Quantity Clarification
@@ -4249,6 +4308,9 @@ def webhook():
             data = pending_add_destination_clarification.pop(chat_id, None)
             origin = (data or {}).get("origin", "global")
             send_message(chat_id, "Вибір місця додавання скасовано.", reply_markup=household_router.origin_keyboard(origin))
+        elif chat_id in pending_undo_action:
+            pending_undo_action.pop(chat_id, None)
+            send_message(chat_id, action_history.UNDO_CANCELLED_MSG, reply_markup=MAIN_KEYBOARD)
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -4381,6 +4443,10 @@ def webhook():
 
     if text == "✅ Так, застосувати":
         _apply_global_household_confirm(chat_id)
+        return "ok"
+
+    if text == "✅ Так, скасувати":
+        _apply_undo_confirm(chat_id)
         return "ok"
 
     if text == "✅ Так, прибрати":
@@ -4580,6 +4646,7 @@ def webhook():
         clear_list_context(chat_id)
         pending_inventory_quantity_clarification.pop(chat_id, None)
         pending_add_destination_clarification.pop(chat_id, None)
+        pending_undo_action.pop(chat_id, None)
         send_message(
             chat_id,
             "Привіт! Я твій домашній помічник 🏠\n\n"
@@ -4596,6 +4663,7 @@ def webhook():
         clear_list_context(chat_id)
         pending_inventory_quantity_clarification.pop(chat_id, None)
         pending_add_destination_clarification.pop(chat_id, None)
+        pending_undo_action.pop(chat_id, None)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -4684,6 +4752,7 @@ def webhook():
         clear_list_context(chat_id)
         pending_inventory_quantity_clarification.pop(chat_id, None)
         pending_add_destination_clarification.pop(chat_id, None)
+        pending_undo_action.pop(chat_id, None)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -5203,6 +5272,24 @@ def webhook():
         # AI-chat while this question is unanswered — an invalid reply just
         # re-asks the same question instead of falling through anywhere.
         _continue_add_destination_clarification(chat_id, text)
+        _preview_intercepted = True
+
+    elif chat_id in pending_undo_action or action_history.is_undo_command(text):
+        # Action History + Safe Undo v1 — checked after every other active
+        # preview/selection/clarification state above (none of them are
+        # active here, or a higher elif would already have matched) and
+        # ahead of the ambiguous-add guard/Global Household Router/every
+        # legacy gate/general AI-chat below, so "Скасувати останню дію"
+        # (or the matching button) never reaches Gemini, the household
+        # router, or general AI-chat. While pending_undo_action is already
+        # set, ANY other text here is intercepted too (never replaces the
+        # pending undo, never touches the database, never calls Gemini) —
+        # only the confirm/cancel button texts (handled earlier, before
+        # this chain) can resolve it.
+        if chat_id in pending_undo_action:
+            send_message(chat_id, action_history.PENDING_UNDO_MSG)
+        else:
+            _start_undo_flow(chat_id, user_id, display_name)
         _preview_intercepted = True
 
     elif _is_ambiguous_add_with_price(text):

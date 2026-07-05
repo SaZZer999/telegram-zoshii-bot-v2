@@ -4,6 +4,9 @@ import unicodedata
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 import psycopg
+from psycopg.types.json import Jsonb
+
+import action_history
 
 HOUSEHOLD_NAME = "Спільний дім"
 DEFAULT_CATEGORY = "Інше їстівне"
@@ -482,6 +485,32 @@ def init_db():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_expenses_household
                 ON expenses (household_id, expense_date)
+            """)
+            # Action History + Safe Undo v1 — one row per confirmed Global
+            # Household Operation. Additive only: never touches shopping_items/
+            # inventory_items/expenses schema. See action_history.py for the
+            # JSONB payload shapes (forward_payload/inverse_payload/
+            # before_snapshot/post_action_snapshot/summary).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS household_action_journal (
+                    id                    SERIAL PRIMARY KEY,
+                    household_id          INTEGER NOT NULL REFERENCES households(id),
+                    actor_user_id         INTEGER REFERENCES users(id),
+                    operation_type        TEXT NOT NULL,
+                    forward_payload       JSONB NOT NULL,
+                    inverse_payload       JSONB,
+                    before_snapshot       JSONB NOT NULL,
+                    post_action_snapshot  JSONB NOT NULL,
+                    summary               JSONB NOT NULL,
+                    status                TEXT NOT NULL DEFAULT 'active',
+                    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    undone_by_user_id     INTEGER REFERENCES users(id),
+                    undone_at             TIMESTAMPTZ
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_household_action_journal_latest
+                ON household_action_journal (household_id, actor_user_id, status, created_at DESC)
             """)
         conn.commit()
     _backfill_structured_quantities()
@@ -1518,6 +1547,91 @@ def apply_inventory_reconciliation(household_id, user_db_id, updates, insert_ite
         conn.commit()
     return updated, deleted, len(insert_items)
 
+def _resolve_canonical_name(name, quantity_text, canonical_name=None):
+    """Same resolution _merge_or_insert_shopping_in_tx/_merge_or_insert_
+    inventory_in_tx fall back to when an item dict has no canonical_name of
+    its own — used here (pure, no DB) so the journal snapshot can know which
+    canonical-name bucket an add_shopping/add_inventory item belongs to
+    BEFORE the merge helper runs."""
+    if canonical_name is not None:
+        return canonical_name
+    normalized = normalize_quantity_fields(name, quantity_text or "", allow_default_unit=True)
+    return normalized["canonical_name"]
+
+
+def _fetch_bucket_rows_in_tx(cur, table, household_id, canonical_name, active_only=False, lock=True):
+    """Full snapshot of every row in `table` for this household sharing
+    `canonical_name` — never just the first/merge-target row (see
+    action_history.py module docstring for why: duplicate representations,
+    consume-to-zero, and multiple operations touching the same product in one
+    compound action all need the WHOLE bucket, not one row). Returns a list
+    of JSON-safe row dicts (quantity_value already a string)."""
+    query = (
+        f"SELECT id, name, canonical_name, quantity_text, quantity_value, quantity_unit, "
+        f"quantity_inferred, category FROM {table} WHERE household_id=%s AND canonical_name=%s"
+    )
+    params = [household_id, canonical_name]
+    if active_only:
+        query += " AND is_completed=FALSE"
+    query += " ORDER BY id ASC"
+    if lock:
+        query += " FOR UPDATE"
+    cur.execute(query, params)
+    rows = []
+    for r in cur.fetchall():
+        rows.append({
+            "id": r[0], "household_id": household_id, "name": r[1], "canonical_name": r[2],
+            "quantity_text": r[3], "quantity_value": str(r[4]) if r[4] is not None else None,
+            "quantity_unit": r[5], "quantity_inferred": r[6], "category": r[7],
+        })
+    return rows
+
+
+def _restore_bucket_in_tx(cur, table, household_id, actor_user_id, current_rows, before_rows, is_shopping=False):
+    """Apply one canonical-name bucket's restore: delete rows the forward
+    action inserted (present now, absent from `before_rows`), update rows
+    the forward action changed back to their before values, and reinsert
+    rows the forward action deleted (present in `before_rows`, absent now —
+    gets a new id, per spec, since ids are SERIAL). Caller has already
+    verified `current_rows` matches the post-action snapshot."""
+    current_by_id = {r["id"]: r for r in current_rows}
+    before_by_id = {r["id"]: r for r in before_rows}
+
+    for row_id in current_by_id:
+        if row_id not in before_by_id:
+            cur.execute(f"DELETE FROM {table} WHERE id=%s AND household_id=%s", (row_id, household_id))
+
+    for row_id, brow in before_by_id.items():
+        value = Decimal(brow["quantity_value"]) if brow["quantity_value"] is not None else None
+        if row_id in current_by_id:
+            crow = current_by_id[row_id]
+            if action_history.row_signature(crow) != action_history.row_signature(brow):
+                cur.execute(
+                    f"UPDATE {table} SET name=%s, canonical_name=%s, quantity_text=%s, quantity_value=%s, "
+                    f"quantity_unit=%s, quantity_inferred=%s, category=%s, updated_at=NOW() "
+                    f"WHERE id=%s AND household_id=%s",
+                    (brow["name"], brow["canonical_name"], brow["quantity_text"], value,
+                     brow["quantity_unit"], brow["quantity_inferred"], brow["category"], row_id, household_id)
+                )
+        else:
+            if is_shopping:
+                cur.execute(
+                    "INSERT INTO shopping_items (household_id, name, quantity_text, category, created_by_user_id, "
+                    "canonical_name, quantity_value, quantity_unit, quantity_inferred, is_completed) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)",
+                    (household_id, brow["name"], brow["quantity_text"], brow["category"], actor_user_id,
+                     brow["canonical_name"], value, brow["quantity_unit"], brow["quantity_inferred"])
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO inventory_items (household_id, name, quantity_text, category, created_by_user_id, "
+                    "canonical_name, quantity_value, quantity_unit, quantity_inferred) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (household_id, brow["name"], brow["quantity_text"], brow["category"], actor_user_id,
+                     brow["canonical_name"], value, brow["quantity_unit"], brow["quantity_inferred"])
+                )
+
+
 def apply_global_household_operations(household_id, user_db_id, add_shopping_items=None,
                                        add_inventory_items=None, consume_updates=None,
                                        consume_delete_ids=None, inventory_targets=None,
@@ -1525,7 +1639,9 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
                                        delete_expense_snapshot=None):
     """Apply the Global Household Router's combined preview (up to five kinds
     of operations: add_shopping, add_inventory, consume_inventory,
-    add_expense, delete_expense) in ONE transaction.
+    add_expense, delete_expense) in ONE transaction, and record an Action
+    History journal row for it in the SAME transaction (Action History +
+    Safe Undo v1) — user_db_id is the actor for that journal row.
 
     add_shopping_items / add_inventory_items: item dicts merged/inserted via
     the same _merge_or_insert_*_in_tx helpers add_shopping_items_batch/
@@ -1550,7 +1666,10 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
     Both staleness checks run BEFORE any write, so a stale inventory target
     or a stale expense-delete target aborts the whole transaction (rolled
     back automatically since the exception propagates out of the `with
-    get_connection()` block) — never a partial apply.
+    get_connection()` block) — never a partial apply. The journal INSERT
+    happens after every write but still before commit, so a rollback from
+    either staleness check or any later error removes the journal row too —
+    never data without a journal entry, never a journal entry without data.
 
     Returns a dict: {"shopping_added": n, "inventory_added": n,
     "inventory_updated": n, "inventory_removed": n, "expense_added_id":
@@ -1566,20 +1685,41 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
     expense_added_id = None
     expense_deleted = False
 
+    shopping_canonical_names = {
+        _resolve_canonical_name(item["name"], item.get("quantity_text"), item.get("canonical_name"))
+        for item in add_shopping_items
+    }
+    inventory_canonical_names = {
+        _resolve_canonical_name(item["name"], item.get("quantity_text"), item.get("canonical_name"))
+        for item in add_inventory_items
+    }
+    consume_ids = [upd["item_id"] for upd in consume_updates] + list(consume_delete_ids)
+
     with get_connection() as conn:
         with conn.cursor() as cur:
             _verify_targets_in_tx(cur, "inventory_items", household_id, inventory_targets)
 
+            if consume_ids:
+                placeholders = ",".join(["%s"] * len(consume_ids))
+                cur.execute(
+                    f"SELECT id, canonical_name FROM inventory_items WHERE id IN ({placeholders}) AND household_id=%s",
+                    list(consume_ids) + [household_id]
+                )
+                for _row_id, cname in cur.fetchall():
+                    if cname:
+                        inventory_canonical_names.add(cname)
+
+            delete_expense_before = None
             if delete_expense_id is not None:
                 cur.execute(
-                    "SELECT amount, category, expense_date, description FROM expenses "
-                    "WHERE id = %s AND household_id = %s FOR UPDATE",
+                    "SELECT amount, currency, category, expense_date, description, created_by_user_id "
+                    "FROM expenses WHERE id = %s AND household_id = %s FOR UPDATE",
                     (delete_expense_id, household_id)
                 )
                 row = cur.fetchone()
                 if row is None:
                     raise StaleSnapshotError()
-                amount, category, expense_date, description = row
+                amount, currency, category, expense_date, description, expense_creator_id = row
                 snapshot = delete_expense_snapshot or {}
                 if (
                     amount != snapshot.get("amount")
@@ -1588,6 +1728,22 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
                     or (description or None) != (snapshot.get("description") or None)
                 ):
                     raise StaleSnapshotError()
+                delete_expense_before = {
+                    "id": delete_expense_id, "household_id": household_id, "amount": str(amount),
+                    "currency": currency, "category": category, "description": description,
+                    "expense_date": expense_date.isoformat(), "created_by_user_id": expense_creator_id,
+                }
+
+            # Capture the BEFORE snapshot of every touched canonical-name
+            # bucket now, locked, before any write below can change them.
+            before_inventory_buckets = {
+                cname: _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, cname, lock=True)
+                for cname in inventory_canonical_names
+            }
+            before_shopping_buckets = {
+                cname: _fetch_bucket_rows_in_tx(cur, "shopping_items", household_id, cname, active_only=True, lock=True)
+                for cname in shopping_canonical_names
+            }
 
             for upd in consume_updates:
                 cur.execute(
@@ -1630,6 +1786,7 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
                     quantity_inferred=item.get("quantity_inferred", False),
                 )
 
+            new_expense_after = None
             if new_expense is not None:
                 cur.execute(
                     """
@@ -1642,6 +1799,13 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
                      new_expense.get("description") or None, new_expense["expense_date"], user_db_id)
                 )
                 expense_added_id = cur.fetchone()[0]
+                new_expense_after = {
+                    "id": expense_added_id, "household_id": household_id,
+                    "amount": str(new_expense["amount"]), "currency": new_expense["currency"],
+                    "category": new_expense["category"], "description": new_expense.get("description") or None,
+                    "expense_date": new_expense["expense_date"].isoformat(),
+                    "created_by_user_id": user_db_id,
+                }
 
             if delete_expense_id is not None:
                 cur.execute(
@@ -1649,6 +1813,55 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
                     (delete_expense_id, household_id)
                 )
                 expense_deleted = True
+
+            # Capture the AFTER snapshot of the SAME buckets — still inside
+            # this transaction, still holding the locks taken above, so this
+            # reflects exactly what was just written, nothing more.
+            after_inventory_buckets = {
+                cname: _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, cname, lock=False)
+                for cname in inventory_canonical_names
+            }
+            after_shopping_buckets = {
+                cname: _fetch_bucket_rows_in_tx(cur, "shopping_items", household_id, cname, active_only=True, lock=False)
+                for cname in shopping_canonical_names
+            }
+
+            before_snapshot = {
+                "inventory_buckets": before_inventory_buckets,
+                "shopping_buckets": before_shopping_buckets,
+                "expense_delete": delete_expense_before,
+            }
+            post_action_snapshot = {
+                "inventory_buckets": after_inventory_buckets,
+                "shopping_buckets": after_shopping_buckets,
+                "expense_add": new_expense_after,
+            }
+            forward_payload = action_history.json_safe({
+                "add_shopping_items": add_shopping_items,
+                "add_inventory_items": add_inventory_items,
+                "consume_updates": consume_updates,
+                "consume_delete_ids": list(consume_delete_ids),
+                "new_expense": new_expense,
+                "delete_expense_id": delete_expense_id,
+            })
+            inverse_payload = {
+                "restore_inventory_canonical_names": sorted(inventory_canonical_names),
+                "restore_shopping_canonical_names": sorted(shopping_canonical_names),
+                "delete_expense_id": expense_added_id,
+                "restore_expense": delete_expense_before,
+            }
+            summary = action_history.build_operation_summary(before_snapshot, post_action_snapshot)
+
+            cur.execute(
+                """
+                INSERT INTO household_action_journal
+                    (household_id, actor_user_id, operation_type, forward_payload, inverse_payload,
+                     before_snapshot, post_action_snapshot, summary, status, created_at)
+                VALUES (%s, %s, 'global_household', %s, %s, %s, %s, %s, 'active', NOW())
+                """,
+                (household_id, user_db_id, Jsonb(forward_payload), Jsonb(inverse_payload),
+                 Jsonb(before_snapshot), Jsonb(post_action_snapshot), Jsonb(summary))
+            )
 
         conn.commit()
 
@@ -1660,6 +1873,152 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
         "expense_added_id": expense_added_id,
         "expense_deleted": expense_deleted,
     }
+
+
+# =========================
+# ACTION HISTORY + SAFE UNDO v1
+# =========================
+
+def get_latest_undoable_action(household_id, actor_user_id):
+    """The most recent still-active global_household journal row for THIS
+    actor in THIS household, or None. Never returns another user's action —
+    undo defaults to "my last action", never "the household's last action"
+    (see docs discussion: undoing a partner's action silently is a real risk
+    for a two-person household). Read-only, no locking (locking happens
+    inside apply_undo_action's own transaction)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, summary FROM household_action_journal
+                WHERE household_id=%s AND actor_user_id=%s AND status='active'
+                    AND operation_type='global_household'
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (household_id, actor_user_id)
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return {"id": row[0], "summary": row[1]}
+
+
+def apply_undo_action(action_id, household_id, actor_user_id):
+    """Undo exactly one journal row, atomically. Re-verifies inside this
+    same transaction (every relevant row locked FOR UPDATE) that:
+    - the journal row still belongs to this household/actor and is still
+      'active' (raises StaleSnapshotError otherwise — also what a duplicate
+      confirm on an already-undone action hits, so a repeat confirm can
+      never apply the inverse twice);
+    - every canonical-name bucket the forward action touched still matches
+      its post_action_snapshot exactly (raises StaleSnapshotError, whole
+      transaction rolled back, if anything changed since);
+    - the added expense (if any) still exists and is unchanged, and the
+      deleted expense (if any) is still absent.
+
+    Only if every check passes does it restore shopping_items/inventory_items
+    rows to their before_snapshot values, delete the expense the forward
+    action added, and/or reinsert the expense the forward action deleted —
+    then mark the journal row 'undone'. Never calls Gemini. Never partial:
+    any failed check aborts the whole transaction before any write.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT household_id, actor_user_id, status, before_snapshot, post_action_snapshot "
+                "FROM household_action_journal WHERE id=%s FOR UPDATE",
+                (action_id,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise StaleSnapshotError()
+            journal_household_id, journal_actor_id, status, before_snapshot, post_action_snapshot = row
+            if journal_household_id != household_id or journal_actor_id != actor_user_id or status != "active":
+                raise StaleSnapshotError()
+
+            inventory_before = before_snapshot.get("inventory_buckets") or {}
+            inventory_post = post_action_snapshot.get("inventory_buckets") or {}
+            shopping_before = before_snapshot.get("shopping_buckets") or {}
+            shopping_post = post_action_snapshot.get("shopping_buckets") or {}
+
+            inventory_current = {}
+            for cname in set(inventory_before) | set(inventory_post):
+                rows = _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, cname, lock=True)
+                if not action_history.buckets_match(rows, inventory_post.get(cname, [])):
+                    raise StaleSnapshotError()
+                inventory_current[cname] = rows
+
+            shopping_current = {}
+            for cname in set(shopping_before) | set(shopping_post):
+                rows = _fetch_bucket_rows_in_tx(cur, "shopping_items", household_id, cname, active_only=True, lock=True)
+                if not action_history.buckets_match(rows, shopping_post.get(cname, [])):
+                    raise StaleSnapshotError()
+                shopping_current[cname] = rows
+
+            expense_add_snapshot = post_action_snapshot.get("expense_add")
+            if expense_add_snapshot is not None:
+                cur.execute(
+                    "SELECT amount, currency, category, description, expense_date "
+                    "FROM expenses WHERE id=%s AND household_id=%s FOR UPDATE",
+                    (expense_add_snapshot["id"], household_id)
+                )
+                exp_row = cur.fetchone()
+                if exp_row is None:
+                    raise StaleSnapshotError()
+                amount, currency, category, description, expense_date = exp_row
+                if (
+                    str(amount) != expense_add_snapshot["amount"]
+                    or currency != expense_add_snapshot["currency"]
+                    or category != expense_add_snapshot["category"]
+                    or (description or None) != (expense_add_snapshot.get("description") or None)
+                    or expense_date.isoformat() != expense_add_snapshot["expense_date"]
+                ):
+                    raise StaleSnapshotError()
+
+            expense_delete_snapshot = before_snapshot.get("expense_delete")
+            if expense_delete_snapshot is not None:
+                cur.execute(
+                    "SELECT id FROM expenses WHERE id=%s AND household_id=%s",
+                    (expense_delete_snapshot["id"], household_id)
+                )
+                if cur.fetchone() is not None:
+                    raise StaleSnapshotError()
+
+            # ---- every check passed: apply the restore ----
+            for cname, current_rows in inventory_current.items():
+                _restore_bucket_in_tx(
+                    cur, "inventory_items", household_id, actor_user_id,
+                    current_rows, inventory_before.get(cname, []),
+                )
+            for cname, current_rows in shopping_current.items():
+                _restore_bucket_in_tx(
+                    cur, "shopping_items", household_id, actor_user_id,
+                    current_rows, shopping_before.get(cname, []), is_shopping=True,
+                )
+
+            if expense_add_snapshot is not None:
+                cur.execute(
+                    "DELETE FROM expenses WHERE id=%s AND household_id=%s",
+                    (expense_add_snapshot["id"], household_id)
+                )
+
+            if expense_delete_snapshot is not None:
+                cur.execute(
+                    "INSERT INTO expenses (household_id, amount, currency, category, description, "
+                    "expense_date, created_by_user_id) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (household_id, Decimal(expense_delete_snapshot["amount"]), expense_delete_snapshot["currency"],
+                     expense_delete_snapshot["category"], expense_delete_snapshot.get("description"),
+                     expense_delete_snapshot["expense_date"], expense_delete_snapshot.get("created_by_user_id"))
+                )
+
+            cur.execute(
+                "UPDATE household_action_journal SET status='undone', undone_by_user_id=%s, undone_at=NOW() "
+                "WHERE id=%s AND status='active'",
+                (actor_user_id, action_id)
+            )
+        conn.commit()
+
 
 # =========================
 # MANUAL MERGE
