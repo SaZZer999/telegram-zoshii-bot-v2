@@ -1417,13 +1417,25 @@ _NAME_SYNONYMS = {
 
 _UNIT_ALIASES = {
     "шт": "шт.", "шт.": "шт.", "штук": "шт.", "штуки": "шт.", "штука": "шт.",
-    "л": "л", "літр": "л", "літри": "л", "літра": "л",
-    "мл": "мл", "мілілітр": "мл", "мілілітри": "мл", "мілілітрів": "мл",
+    "л": "л", "літр": "л", "літри": "л", "літра": "л", "l": "л",
+    "мл": "мл", "мілілітр": "мл", "мілілітри": "мл", "мілілітрів": "мл", "ml": "мл",
     "г": "г", "грам": "г", "грами": "г", "грама": "г", "грамів": "г",
     "кг": "кг", "кілограм": "кг", "кілограми": "кг", "кілограмів": "кг",
 }
 
 STRUCTURED_UNITS = {"шт.", "л", "мл", "г", "кг"}
+
+# Cross-unit merge groups: units within the same group ("mass"/"volume") are
+# safely interconvertible (both are exact powers of 10 apart, so Decimal
+# conversion is always exact — see merge_quantity_values). "шт." deliberately
+# has no group — it never merges with mass or volume, only with itself.
+# Mirrors database.py's identical copy.
+_UNIT_CONVERSION_GROUPS = {
+    "г": ("mass", Decimal("1")),
+    "кг": ("mass", Decimal("1000")),
+    "мл": ("volume", Decimal("1")),
+    "л": ("volume", Decimal("1000")),
+}
 
 # Word-numbers that resolve to an exact count — deliberately a tiny, exact
 # whitelist (never fuzzy/NLP); always flagged quantity_inferred=True by
@@ -1668,24 +1680,38 @@ def normalize_item_quantity(name, quantity_text, quantity_value=None, quantity_u
 
 def merge_quantity_values(value_a, unit_a, value_b, unit_b):
     """Return merged (value, unit) if two structured quantities can be safely
-    summed, else None. Units must match and be one of the known structured
-    units. Sums via exact Decimal arithmetic (never binary float directly,
-    each input safely converted through Decimal(str(value))) and never
-    rounds the result — full precision is preserved for NUMERIC storage;
-    only format_quantity_display decides how to show it. Returns the merged
-    value as an exact Decimal (never float) — callers must pass it straight
-    through to PostgreSQL's NUMERIC column without any float() round-trip,
-    which would reintroduce binary-float imprecision right before storage.
+    summed, else None. Both units must be known structured units; either the
+    same unit, or two units from the same conversion group (_UNIT_CONVERSION_
+    GROUPS — mass: г/кг, volume: мл/л). "шт." has no group, so it only merges
+    with itself, never with mass/volume — a count is never quantity-
+    convertible into a weight/volume. The merged result always keeps unit_a
+    (the FIRST/existing quantity's unit) as the display representation, per
+    every caller's convention of passing the existing row first.
+
+    Sums via exact Decimal arithmetic (never binary float directly, each
+    input safely converted through Decimal(str(value))) and never rounds the
+    result — full precision is preserved for NUMERIC storage; only
+    format_quantity_display decides how to show it. Cross-unit conversion is
+    likewise exact: every group factor is a power of 10, so the Decimal
+    division below never loses precision. Returns the merged value as an
+    exact Decimal (never float) — callers must pass it straight through to
+    PostgreSQL's NUMERIC column without any float() round-trip, which would
+    reintroduce binary-float imprecision right before storage.
     """
     if value_a is None or value_b is None:
         return None
-    if unit_a != unit_b:
-        return None
-    if unit_a not in STRUCTURED_UNITS:
+    if unit_a not in STRUCTURED_UNITS or unit_b not in STRUCTURED_UNITS:
         return None
     dec_a = value_a if isinstance(value_a, Decimal) else Decimal(str(value_a))
     dec_b = value_b if isinstance(value_b, Decimal) else Decimal(str(value_b))
-    return dec_a + dec_b, unit_a
+    if unit_a == unit_b:
+        return dec_a + dec_b, unit_a
+    group_a = _UNIT_CONVERSION_GROUPS.get(unit_a)
+    group_b = _UNIT_CONVERSION_GROUPS.get(unit_b)
+    if group_a is None or group_b is None or group_a[0] != group_b[0]:
+        return None
+    converted_b = (dec_b * group_b[1]) / group_a[1]
+    return dec_a + converted_b, unit_a
 
 
 # =========================
@@ -1923,8 +1949,10 @@ def _compute_merged_quantity(merge_items):
 def _auto_merge_in_place(items):
     """Merge duplicate items within a pending list (pure Python, no Gemini).
 
-    Same canonical_name (+ compatible category) with matching structured
-    units are summed. Incompatible items are left separate — no guessed math.
+    Same canonical_name (+ compatible category) with mergeable structured
+    units (merge_quantity_values decides — same unit, or same mass/volume
+    conversion group) are summed. Incompatible items are left separate — no
+    guessed math.
     """
     result = []
     for item in items:
