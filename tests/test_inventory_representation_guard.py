@@ -51,6 +51,11 @@ def _milk_row():
              "quantity_value": 6.0, "quantity_unit": "л", "quantity_text": "6 л", "quantity_inferred": False}
 
 
+def _milk_pieces_row():
+    return {"id": 106, "name": "Молоко", "category": "Молочне та яйця", "canonical_name": "молоко",
+             "quantity_value": 1.0, "quantity_unit": "шт.", "quantity_text": "1 шт.", "quantity_inferred": True}
+
+
 def _banana_row():
     return {"id": 102, "name": "Банани", "category": "Фрукти та ягоди", "canonical_name": "банани",
              "quantity_value": 3.0, "quantity_unit": "шт.", "quantity_text": "3 шт.", "quantity_inferred": False}
@@ -102,7 +107,9 @@ class TestResolveInventoryRepresentation(unittest.TestCase):
             [_milk_row()], "молоко", "Молочне та яйця", 1.0, "шт.", True,
         )
         self.assertEqual(outcome, "clarify")
-        self.assertEqual(existing["id"], 101)
+        # "clarify" now returns the full list of conflicting rows (not just
+        # one), so the message can enumerate every existing representation.
+        self.assertEqual([e["id"] for e in existing], [101])
 
     # Case 5 — explicit incompatible/text quantity is a safe separate record
     def test_sausage_pack_phrase_is_separate(self):
@@ -128,6 +135,45 @@ class TestResolveInventoryRepresentation(unittest.TestCase):
     def test_household_router_uses_the_same_shared_function(self):
         self.assertIs(household_router._bot.resolve_inventory_representation, bot.resolve_inventory_representation)
         self.assertIs(household_router._bot.merge_quantity_values, bot.merge_quantity_values)
+
+    # --- Fix for the confirmed critical bug: must check ALL rows, not just
+    # the first compatible one, for an inferred incoming quantity ---
+
+    # Bug 1, case 1 — inferred "1 шт." clarifies even though it WOULD merge
+    # cleanly with the "1 шт." row, because the "6 л" row is also present.
+    def test_inferred_milk_clarifies_even_with_one_compatible_sibling(self):
+        outcome, existing = bot.resolve_inventory_representation(
+            [_milk_pieces_row(), _milk_row()], "молоко", "Молочне та яйця", 1.0, "шт.", True,
+        )
+        self.assertEqual(outcome, "clarify")
+        self.assertEqual(sorted(e["quantity_text"] for e in existing), ["1 шт.", "6 л"])
+
+    def test_clarify_message_lists_every_existing_representation(self):
+        outcome, existing = bot.resolve_inventory_representation(
+            [_milk_pieces_row(), _milk_row()], "молоко", "Молочне та яйця", 1.0, "шт.", True,
+        )
+        message = bot.format_representation_clarify_message("Молоко", existing)
+        self.assertIn("кілька записів", message)
+        self.assertIn("1 шт.", message)
+        self.assertIn("6 л", message)
+
+    # Bug 1, case 3/4 — an EXPLICIT quantity ("1 л") is unambiguous about
+    # intent and may still merge with whichever single candidate is
+    # compatible, ignoring the incompatible "1 шт." sibling.
+    def test_explicit_liter_merges_only_with_liter_row(self):
+        outcome, existing = bot.resolve_inventory_representation(
+            [_milk_pieces_row(), _milk_row()], "молоко", "Молочне та яйця", 1.0, "л", False,
+        )
+        self.assertEqual(outcome, "merge")
+        self.assertEqual(existing["id"], 101)
+        self.assertEqual(existing["quantity_unit"], "л")
+
+    def test_explicit_liter_merge_preview_shows_seven_liters(self):
+        merged_value, merged_unit = bot.merge_quantity_values(6.0, "л", 1.0, "л")
+        line = bot.format_representation_merge_quantity_fragment(
+            "6 л", "1 л", bot.format_quantity_display(merged_value, merged_unit),
+        )
+        self.assertEqual(line, "6 л + 1 л → буде 7 л")
 
 
 # =========================
@@ -214,6 +260,36 @@ class TestHouseholdRouterRepresentationGuard(unittest.TestCase):
         text = household_router.format_preview(payload)
         self.assertIn("⚠️", text)
         self.assertIn("буде збережено окремою позицією", text)
+
+    # Bug 1 — inferred quantity blocks even with an existing compatible sibling
+    def test_inferred_milk_blocks_even_with_compatible_sibling_row(self):
+        router_result = {
+            "intent": "household_operations",
+            "operations": [{"type": "add_inventory", "name": "Молоко", "quantity_text": "", "category": "Молочне та яйця"}],
+            "unresolved_fragments": [],
+        }
+        kind, message = household_router._validate_operations(
+            router_result, [_milk_pieces_row(), _milk_row()], [], NOW,
+        )
+        self.assertEqual(kind, "clarify")
+        self.assertIn("кілька записів", message)
+        self.assertIn("1 шт.", message)
+        self.assertIn("6 л", message)
+
+    # Bug 1 — explicit "1 л" merges only with the liter row, preview honest
+    def test_explicit_liter_merges_only_with_liter_row_in_preview(self):
+        router_result = {
+            "intent": "household_operations",
+            "operations": [{"type": "add_inventory", "name": "Молоко", "quantity_text": "1 л", "category": "Молочне та яйця"}],
+            "unresolved_fragments": [],
+        }
+        kind, payload = household_router._validate_operations(
+            router_result, [_milk_pieces_row(), _milk_row()], [], NOW,
+        )
+        self.assertEqual(kind, "ok")
+        text = household_router.format_preview(payload)
+        self.assertIn("Молоко — 6 л + 1 л → буде 7 л", text)
+        self.assertEqual(payload["inventory_merge_targets"], [{"item_id": 101, "quantity_value": 6.0, "quantity_unit": "л"}])
 
 
 # =========================
@@ -315,20 +391,70 @@ class TestMergeOrInsertInventoryInTxWritePath(unittest.TestCase):
         self.assertTrue(any("INSERT INTO inventory_items" in q[0] for q in cursor.queries))
 
     # Case 8 — old records are never auto-corrected: no UPDATE fires against
-    # a legacy row just because a new item shares its canonical_name.
+    # a legacy row just because a new item shares its canonical_name. An
+    # inferred incoming quantity ("пару" -> 2 шт., quantity_inferred=True)
+    # that conflicts with the legacy unitless row is now blocked outright
+    # (StaleSnapshotError) rather than silently inserted as a duplicate —
+    # this is exactly the Bug 1 fix: the confirm-time write path re-checks
+    # the same "never guess with an inferred quantity" rule as the preview.
     def test_old_record_never_auto_corrected(self):
         cursor = FakeCursor(fetchall_results=[[(105, "Фрукти та ягоди", 3.0, None, False)]])
+        conn = FakeConnection(cursor)
+        with patch.object(real_database, "get_connection", return_value=conn):
+            with self.assertRaises(real_database.StaleSnapshotError):
+                with conn:
+                    with conn.cursor() as cur:
+                        real_database._merge_or_insert_inventory_in_tx(
+                            cur, household_id=1, user_db_id=10, name="Банани", qty_text="пару",
+                            category="Фрукти та ягоди", canonical_name="банани",
+                            quantity_value=Decimal("2"), quantity_unit="шт.", quantity_inferred=True,
+                        )
+        update_queries = [q for q in cursor.queries if "UPDATE inventory_items SET" in q[0]]
+        self.assertEqual(update_queries, [])
+        insert_queries = [q for q in cursor.queries if "INSERT INTO inventory_items" in q[0]]
+        self.assertEqual(insert_queries, [])
+
+    # Bug 1 (DB side) — a conflicting row that appears BETWEEN preview and
+    # confirm (fresh FOR UPDATE read sees both "1 шт." and "6 л") aborts an
+    # inferred merge attempt instead of guessing which row to update.
+    def test_inferred_merge_aborts_when_second_candidate_appeared_since_preview(self):
+        cursor = FakeCursor(fetchall_results=[[
+            (106, "Молочне та яйця", 1.0, "шт.", True),
+            (101, "Молочне та яйця", 6.0, "л", False),
+        ]])
+        conn = FakeConnection(cursor)
+        with patch.object(real_database, "get_connection", return_value=conn):
+            with self.assertRaises(real_database.StaleSnapshotError):
+                with conn:
+                    with conn.cursor() as cur:
+                        real_database._merge_or_insert_inventory_in_tx(
+                            cur, household_id=1, user_db_id=10, name="Молоко", qty_text="",
+                            category="Молочне та яйця", canonical_name="молоко",
+                            quantity_value=1.0, quantity_unit="шт.", quantity_inferred=True,
+                        )
+        self.assertFalse(any("UPDATE inventory_items SET" in q[0] for q in cursor.queries))
+        self.assertFalse(any("INSERT INTO inventory_items" in q[0] for q in cursor.queries))
+
+    # Bug 1 (DB side) — explicit "1 л" merges only into the liter row; the
+    # "1 шт." row is never touched (no UPDATE against its id).
+    def test_explicit_liter_updates_only_the_liter_row(self):
+        cursor = FakeCursor(fetchall_results=[[
+            (106, "Молочне та яйця", 1.0, "шт.", True),
+            (101, "Молочне та яйця", 6.0, "л", False),
+        ]])
         conn = FakeConnection(cursor)
         with patch.object(real_database, "get_connection", return_value=conn):
             with conn:
                 with conn.cursor() as cur:
                     real_database._merge_or_insert_inventory_in_tx(
-                        cur, household_id=1, user_db_id=10, name="Банани", qty_text="пару",
-                        category="Фрукти та ягоди", canonical_name="банани",
-                        quantity_value=Decimal("2"), quantity_unit="шт.", quantity_inferred=True,
+                        cur, household_id=1, user_db_id=10, name="Молоко", qty_text="1 л",
+                        category="Молочне та яйця", canonical_name="молоко",
+                        quantity_value=1.0, quantity_unit="л", quantity_inferred=False,
                     )
         update_queries = [q for q in cursor.queries if "UPDATE inventory_items SET" in q[0]]
-        self.assertEqual(update_queries, [])
+        self.assertEqual(len(update_queries), 1)
+        self.assertEqual(update_queries[0][1][0], "7 л")
+        self.assertEqual(update_queries[0][1][-1], 101)  # updated the liter row (id 101), not the "1 шт." row (id 106)
 
 
 class TestAddInventoryItemsBatchStaleGuard(unittest.TestCase):
@@ -443,6 +569,21 @@ class TestNormalInventoryAddFlowWebhook(unittest.TestCase):
                     mock_add.assert_not_called()
         self.assertNotIn(chat_id, pending_inventory_batch)
         self.assertTrue(any("У запасах уже є «Молоко — 6 л»" in t for t in self._sent_texts()))
+
+    # Bug 1, case 2 — same multi-row conflict blocks identically in the
+    # normal/legacy inventory add flow, not just the Global Router.
+    def test_multi_row_milk_conflict_blocks_in_normal_flow_too(self):
+        chat_id = 990005
+        inventory_mode[chat_id] = "adding"
+        with patch.object(bot, "get_inventory_items", return_value=[_milk_pieces_row(), _milk_row()]):
+            with patch.object(bot, "parse_shopping_list_with_gemini",
+                               return_value=_parse_result("Молоко", "", "Молочне та яйця")):
+                with patch.object(bot, "add_inventory_items_batch") as mock_add:
+                    _call_webhook(_make_update(990000005, chat_id, "Купив молоко"))
+                    mock_add.assert_not_called()
+        self.assertNotIn(chat_id, pending_inventory_batch)
+        texts = self._sent_texts()
+        self.assertTrue(any("кілька записів" in t and "1 шт." in t and "6 л" in t for t in texts))
 
     # Case 5 — sausage pack: preview created with a warning, item still added
     def test_sausage_pack_preview_shows_warning_and_stays_pending(self):

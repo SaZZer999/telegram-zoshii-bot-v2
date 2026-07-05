@@ -748,6 +748,11 @@ GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD = {
     "one_time_keyboard": True,
 }
 
+GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG = (
+    "У тебе є незавершений план змін.\n\n"
+    "Підтвердь його або скасуй перед новою командою."
+)
+
 RECONCILIATION_PREVIEW_KEYBOARD = {
     "keyboard": [
         ["✅ Підтвердити звіряння"],
@@ -1478,39 +1483,76 @@ def classify_inventory_representation(existing_value, existing_unit, incoming_va
 def resolve_inventory_representation(inventory_items, canonical_name, category,
                                       quantity_value, quantity_unit, quantity_inferred):
     """Full v1 guard decision for one incoming inventory item against ALL
-    existing rows sharing canonical_name (not just the first). Returns
-    (outcome, existing_item):
-      ("none", None)            — no existing row at all; plain add.
-      ("merge", existing_item)  — merges into this specific existing row
-          (first candidate, in id order, merge_quantity_values actually
+    existing rows sharing canonical_name (not just the first, and not just
+    the first one that happens to be mergeable). Returns (outcome, existing):
+      ("none", None)             — no existing row at all; plain add.
+      ("merge", existing_item)   — a single existing row (dict) to merge
+          into (first candidate, in id order, merge_quantity_values actually
           succeeds against — same order the write path uses).
-      ("clarify", existing_item) — blocks the whole preview/operation.
-      ("separate", existing_item) — safe to add as its own row; existing_item
-          (first candidate by id) is only used to build the warning message.
+      ("clarify", existing_items) — a LIST of every existing row sharing
+          canonical_name (not just the conflicting one), for the "which
+          record did you mean" message. Blocks the whole preview/operation.
+      ("separate", existing_item) — a single existing row (dict, first
+          candidate by id); safe to add as its own row, existing_item is
+          only used to build the warning message.
+
+    Critical rule: an INFERRED incoming quantity (quantity_inferred=True)
+    must never merge into one compatible row while silently ignoring an
+    INCOMPATIBLE sibling row of the same canonical_name — e.g. existing
+    "Молоко — 1 шт." and "Молоко — 6 л" both present, incoming inferred
+    "1 шт.": even though it merges cleanly with the "1 шт." row, the "6 л"
+    row makes it genuinely ambiguous which record the guess belongs to, so
+    this is "clarify", not "merge". This check only applies when
+    quantity_inferred is True — an EXPLICIT incoming quantity (e.g. "1 л")
+    is unambiguous about the user's intent and may still merge with
+    whichever single candidate is compatible, ignoring incompatible
+    siblings exactly as before.
     """
     candidates = find_inventory_representation_matches(inventory_items, canonical_name, category)
     if not candidates:
         return "none", None
-    for existing in candidates:
-        outcome = classify_inventory_representation(
+
+    outcomes = [
+        classify_inventory_representation(
             existing.get("quantity_value"), existing.get("quantity_unit"),
             quantity_value, quantity_unit, quantity_inferred,
         )
+        for existing in candidates
+    ]
+
+    if quantity_inferred:
+        if any(outcome != "merge" for outcome in outcomes):
+            return "clarify", candidates
+        return "merge", candidates[0]
+
+    for existing, outcome in zip(candidates, outcomes):
         if outcome == "merge":
             return "merge", existing
-    first = candidates[0]
-    return ("clarify" if quantity_inferred else "separate"), first
+    return "separate", candidates[0]
 
 
-def format_representation_clarify_message(name, existing_display):
+def format_representation_clarify_message(name, existing_items):
     """The blocking clarification message for the "clarify" outcome — no
     preview is built and nothing is written; the user must restate an
-    explicit quantity/unit or container count."""
-    return (
-        f"У запасах уже є «{name} — {existing_display}».\n\n"
-        f"Скільки {name} ти купив?\n"
-        f"Напиши явну кількість і одиницю (наприклад «1 л») або кількість тари (наприклад «дві пачки»)."
-    )
+    explicit quantity/unit or container count. existing_items is the full
+    list of every existing row sharing this canonical_name the guard found
+    (never just the one that conflicts) — with 2+ rows, ALL of them are
+    listed so the user understands there's genuine ambiguity, not just a
+    single mismatch."""
+    if len(existing_items) == 1:
+        existing_display = existing_items[0]["quantity_text"]
+        return (
+            f"У запасах уже є «{name} — {existing_display}».\n\n"
+            f"Скільки {name} ти купив?\n"
+            f"Напиши явну кількість і одиницю (наприклад «1 л») або кількість тари (наприклад «дві пачки»)."
+        )
+    lines = [f"У запасах уже є кілька записів «{name}»:", ""]
+    for item in existing_items:
+        lines.append(f"• {item['quantity_text']}")
+    lines.append("")
+    lines.append("Не хочу вгадувати, до якого запису додати нову покупку.")
+    lines.append(f"Напиши точну кількість, наприклад: «Купив 1 л {name.lower()}».")
+    return "\n".join(lines)
 
 
 def format_representation_separate_warning(name, existing_display, incoming_display):
@@ -4038,7 +4080,7 @@ def webhook():
                 )
                 if outcome == "clarify":
                     inventory_mode[chat_id] = "adding"
-                    send_message(chat_id, format_representation_clarify_message(item["name"], existing["quantity_text"]))
+                    send_message(chat_id, format_representation_clarify_message(item["name"], existing))
                     return "ok"
                 if outcome == "merge":
                     # `items` (the write path, stored in pending_inventory_batch below)
@@ -4233,6 +4275,19 @@ def webhook():
         # router, replace the pending preview, touch the database, or reach
         # general AI-chat — the preview must be confirmed or cancelled first.
         send_message(chat_id, EXPENSE_PREVIEW_GUARD_MSG)
+        _preview_intercepted = True
+
+    elif chat_id in pending_global_household:
+        # A combined Global Household Router preview is awaiting confirm/
+        # cancel (the matching "✅ Так, застосувати"/"❌ Скасувати" button
+        # texts are already handled earlier, before this router chain —
+        # reaching here means the text is something else). Checked ahead of
+        # the household_router gate below (and every other gate) so no new
+        # text — including one that would otherwise match household_router.
+        # gate(text) — can start a new global router pass, replace the
+        # pending preview, touch the database, or reach general AI-chat
+        # while a plan of changes is still awaiting confirmation.
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
         _preview_intercepted = True
 
     elif (

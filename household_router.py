@@ -508,7 +508,7 @@ def _validate_operations(router_result, inventory_items, recent_expenses, now, a
         if outcome == "clarify":
             # Blocks the WHOLE compound preview — never apply the rest of
             # the operations partially just because one item is ambiguous.
-            return "clarify", _bot.format_representation_clarify_message(item["name"], existing["quantity_text"])
+            return "clarify", _bot.format_representation_clarify_message(item["name"], existing)
         if outcome == "merge":
             merged_value, merged_unit = _bot.merge_quantity_values(
                 existing["quantity_value"], existing["quantity_unit"],

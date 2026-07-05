@@ -1055,6 +1055,18 @@ def _merge_or_insert_inventory_in_tx(cur, household_id, user_db_id, name, qty_te
     exact same row. If none of the candidates can merge, a new row is
     inserted — this is the deliberate "separate record" outcome the guard's
     preview already warned the user about, never a silent duplicate.
+
+    Critical re-check for an INFERRED incoming quantity (quantity_inferred=
+    True): even though the preview already refused to build a pending
+    "merge" op for an inferred quantity that conflicts with ANY sibling row
+    (see bot.py's resolve_inventory_representation), a NEW conflicting row
+    could have appeared for the SAME canonical_name between preview and
+    confirm. Re-verified here, fresh, against every FOR-UPDATE-locked
+    candidate: if the incoming quantity is inferred and at least one
+    candidate can merge but at least one other candidate cannot, this is
+    exactly the ambiguous "which record do you mean" situation the guard
+    exists to prevent — raise StaleSnapshotError (whole transaction rolled
+    back, nothing written) instead of guessing which row to merge into.
     """
     if canonical_name is None:
         normalized = normalize_quantity_fields(name, qty_text, allow_default_unit=True)
@@ -1076,17 +1088,22 @@ def _merge_or_insert_inventory_in_tx(cur, household_id, user_db_id, name, qty_te
     ]
 
     if quantity_value is not None:
-        for ex_id, ex_value, ex_unit, ex_inferred in candidates:
-            merged = merge_quantity_values(ex_value, ex_unit, quantity_value, quantity_unit)
-            if merged is not None:
-                merged_value, merged_unit = merged
-                cur.execute(
-                    "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
-                    "quantity_inferred=%s, updated_at=NOW() WHERE id=%s",
-                    (format_quantity_display(merged_value, merged_unit), merged_value, merged_unit,
-                     bool(ex_inferred) and bool(quantity_inferred), ex_id)
-                )
-                return
+        mergeable = [
+            (ex_id, ex_value, ex_unit, ex_inferred) for ex_id, ex_value, ex_unit, ex_inferred in candidates
+            if merge_quantity_values(ex_value, ex_unit, quantity_value, quantity_unit) is not None
+        ]
+        if quantity_inferred and candidates and len(mergeable) != len(candidates):
+            raise StaleSnapshotError()
+        if mergeable:
+            ex_id, ex_value, ex_unit, ex_inferred = mergeable[0]
+            merged_value, merged_unit = merge_quantity_values(ex_value, ex_unit, quantity_value, quantity_unit)
+            cur.execute(
+                "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
+                "quantity_inferred=%s, updated_at=NOW() WHERE id=%s",
+                (format_quantity_display(merged_value, merged_unit), merged_value, merged_unit,
+                 bool(ex_inferred) and bool(quantity_inferred), ex_id)
+            )
+            return
 
     cur.execute(
         "INSERT INTO inventory_items (household_id, name, quantity_text, category, created_by_user_id, "
