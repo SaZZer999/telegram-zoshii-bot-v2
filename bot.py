@@ -2230,6 +2230,104 @@ def _validate_saved_updates(updates, items):
     return valid
 
 
+def _quantity_values_equal(a, b):
+    """Decimal-exact comparison for two possibly-None, possibly-float/Decimal
+    quantity values. Never compares via bare float equality — converting
+    both through Decimal(str(...)) first avoids binary-float noise making a
+    genuinely-identical quantity look changed (e.g. 0.1 + 0.2 artifacts)."""
+    if a is None or b is None:
+        return a is None and b is None
+    dec_a = a if isinstance(a, Decimal) else Decimal(str(a))
+    dec_b = b if isinstance(b, Decimal) else Decimal(str(b))
+    return dec_a == dec_b
+
+
+def _saved_update_is_noop(old_item, upd, alias_map=None):
+    """True if applying a validated saved-list edit candidate `upd` to
+    `old_item` would leave every significant field unchanged: name/
+    canonical_name, quantity_value, quantity_unit, quantity_text,
+    quantity_inferred, category. Mirrors exactly what
+    update_inventory_items_batch/update_shopping_items_batch (database.py)
+    computes and writes per field at confirm time, so "no real change" here
+    means no real change in the database either — no DB call needed to
+    know this ahead of time. A field left as None in `upd` means "not being
+    changed" and is skipped, same as the DB layer's own
+    `if upd.get(...) is not None` gating for that field.
+    """
+    if upd.get("name") is not None:
+        new_name, new_canonical = resolve_item_name(upd["name"], alias_map or {})
+        old_canonical = old_item.get("canonical_name") or canonicalize_name(old_item.get("name", ""))
+        if new_name != old_item.get("name") or new_canonical != old_canonical:
+            return False
+    if upd.get("quantity_text") is not None:
+        new_value, new_unit = _parse_structured_quantity(upd["quantity_text"])
+        new_text = format_quantity_display(new_value, new_unit) if new_value is not None else (upd["quantity_text"] or None)
+        if not _quantity_values_equal(new_value, old_item.get("quantity_value")):
+            return False
+        if new_unit != old_item.get("quantity_unit"):
+            return False
+        if (new_text or None) != (old_item.get("quantity_text") or None):
+            return False
+        if old_item.get("quantity_inferred", False):
+            # The DB layer always sets quantity_inferred=FALSE whenever
+            # quantity_text is provided — if the existing row was inferred,
+            # confirming would still flip that flag, so it's a real change.
+            return False
+    if upd.get("category") is not None and upd["category"] != old_item.get("category"):
+        return False
+    return True
+
+
+def _split_noop_saved_updates(valid_updates, items_snapshot, alias_map=None):
+    """Partition validated saved-list edit updates into (real, noop).
+    No-op updates must never reach pending_saved_edit or the DB confirm
+    path — see _saved_update_is_noop for what "no-op" means field by
+    field."""
+    real, noop = [], []
+    for upd in valid_updates:
+        old_item = items_snapshot[upd["item_number"] - 1]
+        if _saved_update_is_noop(old_item, upd, alias_map):
+            noop.append(upd)
+        else:
+            real.append(upd)
+    return real, noop
+
+
+def _pluralize_positions_uk(n):
+    """Ukrainian plural for the word "позиція" for a given count n."""
+    n_mod_100 = n % 100
+    n_mod_10 = n % 10
+    if 11 <= n_mod_100 <= 14:
+        return "позицій"
+    if n_mod_10 == 1:
+        return "позиція"
+    if 2 <= n_mod_10 <= 4:
+        return "позиції"
+    return "позицій"
+
+
+def _format_noop_saved_edit_message(noop_updates, items_snapshot, context_type):
+    """Message shown when every recognized saved-list edit candidate turned
+    out to be a no-op after normalization (see _saved_update_is_noop) — the
+    user's command was understood, but the current data already matches
+    it, so no preview/pending state/DB call is created."""
+    lines = [
+        "Не бачу змін, які можна безпечно застосувати.",
+        "",
+        "Поточні дані вже відповідають розпізнаній команді. Сформулюй зміну точніше.",
+    ]
+    if context_type == "inventory_saved":
+        for upd in noop_updates:
+            old_item = items_snapshot[upd["item_number"] - 1]
+            label = old_item["name"]
+            qty = _effective_quantity(old_item)[2]
+            if qty:
+                label += f" — {qty}"
+            lines.append("")
+            lines.append(f"Поточний запис: {label}")
+    return "\n".join(lines)
+
+
 _ACTIONS_BY_CONTEXT = {
     "shopping_saved": {"mark_bought", "delete_shopping"},
     "inventory_saved": {"remove_inventory"},
@@ -4644,15 +4742,22 @@ def webhook():
                     if intent == "edit_saved_items":
                         valid_updates = _validate_saved_updates(router_result["updates"], list_items)
                         if valid_updates:
-                            pending_saved_edit[chat_id] = {
-                                "items_snapshot": list_items,
-                                "validated_updates": valid_updates,
-                                "household_id": household_id,
-                                "user_db_id": user_db_id,
-                                "context_type": ctx,
-                            }
-                            preview = _format_saved_edit_preview(list_items, valid_updates, ctx)
-                            send_message(chat_id, preview, reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD)
+                            real_updates, noop_updates = _split_noop_saved_updates(valid_updates, list_items, alias_map)
+                            if not real_updates:
+                                send_message(chat_id, _format_noop_saved_edit_message(noop_updates, list_items, ctx))
+                            else:
+                                pending_saved_edit[chat_id] = {
+                                    "items_snapshot": list_items,
+                                    "validated_updates": real_updates,
+                                    "household_id": household_id,
+                                    "user_db_id": user_db_id,
+                                    "context_type": ctx,
+                                }
+                                preview = _format_saved_edit_preview(list_items, real_updates, ctx)
+                                if noop_updates:
+                                    note = f"Без змін: {len(noop_updates)} {_pluralize_positions_uk(len(noop_updates))}."
+                                    preview = note + "\n\n" + preview
+                                send_message(chat_id, preview, reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD)
                         else:
                             send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
                         _preview_intercepted = True
