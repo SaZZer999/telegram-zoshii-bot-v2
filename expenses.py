@@ -616,30 +616,70 @@ def _handle_expense_command(chat_id, user_id, display_name, text):
         return True
 
 
+def _normalize_expense_match_text(s):
+    """Lower/trim/collapse whitespace and strip punctuation — used only for
+    exact-equality comparison, never substring/fuzzy matching."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^\w\s]", "", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _find_exact_expense_match(text, recent_expenses):
+    """Local (no-Gemini) exact-name match against the SAME label already
+    shown on screen by _format_expense_delete_list (description, falling
+    back to category). Returns the single matching expense dict, or None if
+    there is no match or more than one — deliberately never fuzzy, so a
+    phrase like "Видали Biedronka 86,40 zł" (which never equals a bare
+    label exactly) still falls through to the Gemini-based resolution below.
+    """
+    target = _normalize_expense_match_text(text)
+    if not target:
+        return None
+    matches = [
+        exp for exp in recent_expenses
+        if _normalize_expense_match_text(exp.get("description") or exp.get("category") or "") == target
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _build_delete_preview_from_match(chat_id, household_id, origin, expense):
+    """Shared final step once exactly one expense has been identified for
+    deletion, whether by the local exact-name match or by the Gemini router —
+    builds the pending_expense_delete preview and exits selection mode."""
+    pending_expense_delete[chat_id] = {
+        "expense_id": expense["id"], "household_id": household_id,
+        "snapshot": {
+            "amount": expense["amount"], "category": expense["category"],
+            "expense_date": expense["expense_date"], "description": expense["description"],
+        },
+        "origin": origin,
+    }
+    expense_delete_selection.pop(chat_id, None)
+    _bot.send_message(chat_id, _format_expense_delete_preview(expense), reply_markup=EXPENSE_DELETE_PREVIEW_KEYBOARD)
+
+
 def _resolve_expense_delete_selection(chat_id, household_id, user_db_id, origin, keyboard, text, recent_expenses):
     """Shared resolution step for both the global expense-delete gate and the
-    dedicated selection mode (chat_id in expense_delete_selection). Calls the
-    expense router with `recent_expenses` as context and either builds the
-    delete preview (exactly one match) or re-shows the numbered list and
-    stays in selection mode (zero matches, more than one match, or an
-    unresolved/invalid/none router result — never guesses). Always fully
-    handles the message; never falls through to AI-chat.
+    dedicated selection mode (chat_id in expense_delete_selection). First
+    tries a local exact-name match (no Gemini call) against the numbered
+    list already shown; only if that doesn't resolve to exactly one match
+    does it call the expense router with `recent_expenses` as context and
+    either build the delete preview (exactly one match) or re-show the
+    numbered list and stay in selection mode (zero matches, more than one
+    match, or an unresolved/invalid/none router result — never guesses).
+    Always fully handles the message; never falls through to AI-chat.
     """
+    local_match = _find_exact_expense_match(text, recent_expenses)
+    if local_match is not None:
+        _build_delete_preview_from_match(chat_id, household_id, origin, local_match)
+        return
+
     router_result = _bot._ask_gemini_expense_router(text, recent_expenses=recent_expenses)
     kind, payload = _validate_expense_router_result(router_result)
     matched = _bot._validate_selected_numbers(payload, recent_expenses) if kind == "delete" else None
     if matched is not None and len(matched) == 1:
-        expense = matched[0]
-        pending_expense_delete[chat_id] = {
-            "expense_id": expense["id"], "household_id": household_id,
-            "snapshot": {
-                "amount": expense["amount"], "category": expense["category"],
-                "expense_date": expense["expense_date"], "description": expense["description"],
-            },
-            "origin": origin,
-        }
-        expense_delete_selection.pop(chat_id, None)
-        _bot.send_message(chat_id, _format_expense_delete_preview(expense), reply_markup=EXPENSE_DELETE_PREVIEW_KEYBOARD)
+        _build_delete_preview_from_match(chat_id, household_id, origin, matched[0])
         return
     # Zero matches, more than one match, or the router didn't produce a
     # usable delete selection (unresolved/invalid/none) — never guess; stay

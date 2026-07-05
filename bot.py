@@ -44,8 +44,10 @@ from database import (
     get_expense_month_summary,
     get_recent_expenses_for_deletion,
     delete_expense,
+    apply_global_household_operations,
 )
 import expenses
+import household_router
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -106,6 +108,11 @@ pending_alias_action = {}     # chat_id -> {kind: "create"|"update"|"delete", ho
 pending_expense = expenses.pending_expense
 pending_expense_delete = expenses.pending_expense_delete
 expense_delete_selection = expenses.expense_delete_selection
+# Global Household Router v1 — pending state lives in bot.py (household_router.py
+# owns no Telegram/pending state of its own, see its module docstring).
+pending_global_household = {}  # chat_id -> {add_shopping_items, add_inventory_items,
+                                #             consume_changes, new_expense, delete_expense,
+                                #             inventory_targets, household_id, user_db_id, origin}
 
 # Every OTHER flow's pending preview/confirm state — deliberately excludes
 # pending_alias_action itself (a new global alias command is allowed to
@@ -120,6 +127,11 @@ _ALIAS_GATE_BLOCKING_PENDING_STATES = (
     pending_remove_batch, pending_merge, pending_saved_edit, pending_quick_purchase,
     pending_inventory_consumption, pending_compound_inventory,
     pending_inventory_reconciliation, pending_inventory_reconciliation_clarify,
+    # The Global Household Router's own combined preview — added here (rather
+    # than only to the report-gate tuple below) so every other gate's
+    # blocking tuple, all built by extending this one, also treats it as an
+    # active preview to defer to.
+    pending_global_household,
 )
 
 
@@ -720,6 +732,15 @@ QUICK_PURCHASE_KEYBOARD = {
 COMPOUND_PREVIEW_KEYBOARD = {
     "keyboard": [
         ["✅ Підтвердити всі зміни"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD = {
+    "keyboard": [
+        ["✅ Так, застосувати"],
         ["❌ Скасувати"],
     ],
     "resize_keyboard": True,
@@ -2817,6 +2838,101 @@ def format_batch_preview(items, ignored_items=None):
         text += "\n\nНе додано: " + ", ".join(ignored_items)
     return text
 
+# =========================
+# GLOBAL HOUSEHOLD ROUTER v1 — thin bot.py-side dispatch. household_router.py
+# does the actual Gemini call + validation (pure, no Telegram/pending state
+# of its own); this function only fetches the live snapshots it needs,
+# stores pending_global_household, and sends the resulting message.
+# =========================
+def _try_global_household_router(chat_id, user_id, display_name, text):
+    """Returns True if the message was fully handled (a preview, an
+    unresolved/invalid clarification, or an error message was sent) — the
+    caller must not fall through to the legacy gates in that case. Returns
+    False only for a genuine intent=="none" (nothing was sent), letting the
+    caller fall through to the existing legacy gates/AI-chat exactly as
+    before this router existed."""
+    origin = household_router.current_origin(chat_id)
+    keyboard = household_router.origin_keyboard(origin)
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        shopping_items = get_active_shopping_items(household_id)
+        inventory_items = get_inventory_items(household_id)
+        recent_expenses = get_recent_expenses_for_deletion(household_id, limit=20)
+        alias_map = get_household_alias_map(household_id)
+        kind, payload = household_router.build_household_operations_preview(
+            text, shopping_items, inventory_items, recent_expenses, alias_map=alias_map,
+        )
+        if kind == "none":
+            return False
+        if kind == "unresolved":
+            send_message(chat_id, household_router.format_unresolved_message(payload), reply_markup=keyboard)
+            return True
+        if kind == "invalid":
+            send_message(chat_id, household_router.format_invalid_message(payload), reply_markup=keyboard)
+            return True
+        # kind == "ok"
+        inventory_targets = _snapshot_targets(payload["consume_changes"])
+        pending_global_household[chat_id] = {
+            "add_shopping_items": payload["add_shopping_items"],
+            "add_inventory_items": payload["add_inventory_items"],
+            "consume_changes": payload["consume_changes"],
+            "inventory_targets": inventory_targets,
+            "new_expense": payload["new_expense"],
+            "delete_expense": payload["delete_expense"],
+            "household_id": household_id,
+            "user_db_id": user_db_id,
+            "origin": origin,
+        }
+        send_message(chat_id, household_router.format_preview(payload), reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+        return True
+    except Exception:
+        send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+        return True
+
+
+def _apply_global_household_confirm(chat_id):
+    """"✅ Так, застосувати" button. Pops the pending combined preview BEFORE
+    the database call, so a duplicate/late button press can never apply it
+    twice; performs every operation in exactly one transaction."""
+    if chat_id not in pending_global_household:
+        send_message(chat_id, "Немає активної дії для підтвердження.")
+        return
+    data = pending_global_household.pop(chat_id)
+    origin = data.get("origin", "global")
+    keyboard = household_router.origin_keyboard(origin)
+    consume_changes = data["consume_changes"]
+    consume_updates = [
+        {
+            "item_id": c["item_id"], "quantity_value": c["new_value"],
+            "quantity_unit": c["new_unit"], "quantity_text": c["new_display"],
+        }
+        for c in consume_changes if not c["will_remove"]
+    ]
+    consume_delete_ids = [c["item_id"] for c in consume_changes if c["will_remove"]]
+    new_expense = data["new_expense"]
+    delete_expense_data = data["delete_expense"]
+    try:
+        apply_global_household_operations(
+            data["household_id"], data["user_db_id"],
+            add_shopping_items=data["add_shopping_items"],
+            add_inventory_items=data["add_inventory_items"],
+            consume_updates=consume_updates,
+            consume_delete_ids=consume_delete_ids,
+            inventory_targets=data["inventory_targets"],
+            new_expense=(
+                {k: v for k, v in new_expense.items() if k != "category_was_defaulted"}
+                if new_expense else None
+            ),
+            delete_expense_id=delete_expense_data["expense_id"] if delete_expense_data else None,
+            delete_expense_snapshot=delete_expense_data["snapshot"] if delete_expense_data else None,
+        )
+        send_message(chat_id, "✅ Зміни застосовано.", reply_markup=keyboard)
+    except StaleSnapshotError:
+        send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=keyboard)
+    except Exception:
+        send_message(chat_id, "Не вдалося застосувати зміни. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+
+
 @app.route("/")
 def home():
     return "Bot is running"
@@ -2989,6 +3105,10 @@ def webhook():
             send_message(chat_id, "Дію з домашніми назвами скасовано.", reply_markup=_alias_origin_keyboard(origin))
         elif chat_id in pending_expense or chat_id in pending_expense_delete or chat_id in expense_delete_selection:
             expenses.handle_cancel(chat_id)
+        elif chat_id in pending_global_household:
+            data = pending_global_household.pop(chat_id, None)
+            origin = (data or {}).get("origin", "global")
+            send_message(chat_id, "Зміни скасовано.", reply_markup=household_router.origin_keyboard(origin))
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -3117,6 +3237,10 @@ def webhook():
 
     if text == "✅ Так, додати":
         expenses.handle_add_confirm(chat_id)
+        return "ok"
+
+    if text == "✅ Так, застосувати":
+        _apply_global_household_confirm(chat_id)
         return "ok"
 
     if text == "✅ Так, прибрати":
@@ -3835,6 +3959,23 @@ def webhook():
         send_message(chat_id, EXPENSE_PREVIEW_GUARD_MSG)
         _preview_intercepted = True
 
+    elif (
+        not _has_blocking_pending_state_for_reports(chat_id)
+        and household_router.gate(text)
+        and _try_global_household_router(chat_id, user_id, display_name, text)
+    ):
+        # Global Household Router v1 — narrow local gate (no Gemini) checked
+        # first, exactly like every other gate in this chain; only messages
+        # matching household_router.gate(text) even attempt a Gemini call, so
+        # a plain zł-amount or an imperative "видали/скасуй витрату" (already
+        # owned by the legacy gates below) never reaches this branch. If the
+        # gate matches but the router decides intent=="none",
+        # _try_global_household_router returns False and this elif's
+        # condition is False overall — falls through unchanged to the
+        # existing report/delete/alias/expense gates and saved_list_context
+        # router below (priority 5), exactly as before this router existed.
+        _preview_intercepted = True
+
     elif not _has_blocking_pending_state_for_reports(chat_id) and _expense_report_gate(text):
         # Expense report gate — narrow, local, no Gemini call here, checked
         # ahead of everything else in this chain (including the expenses
@@ -4152,6 +4293,16 @@ def webhook():
 # MAIN_KEYBOARD) is defined above. Must run before any webhook request is
 # handled; expenses.py itself never imports bot.py (see its module docstring).
 expenses.configure(sys.modules[__name__], active_list_context, MAIN_KEYBOARD)
+
+# Wire household_router.py's dependencies the same way — it never imports
+# bot.py either (see its module docstring); owns no pending state of its own.
+household_router.configure(
+    sys.modules[__name__], active_list_context, saved_list_context,
+    {
+        "main": MAIN_KEYBOARD, "shopping": SHOPPING_KEYBOARD, "inventory": INVENTORY_KEYBOARD,
+        "expenses": EXPENSES_KEYBOARD, "aliases": ALIASES_KEYBOARD,
+    },
+)
 
 
 if __name__ == "__main__":

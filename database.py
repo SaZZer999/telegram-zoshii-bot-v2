@@ -1318,6 +1318,149 @@ def apply_inventory_reconciliation(household_id, user_db_id, updates, insert_ite
         conn.commit()
     return updated, deleted, len(insert_items)
 
+def apply_global_household_operations(household_id, user_db_id, add_shopping_items=None,
+                                       add_inventory_items=None, consume_updates=None,
+                                       consume_delete_ids=None, inventory_targets=None,
+                                       new_expense=None, delete_expense_id=None,
+                                       delete_expense_snapshot=None):
+    """Apply the Global Household Router's combined preview (up to five kinds
+    of operations: add_shopping, add_inventory, consume_inventory,
+    add_expense, delete_expense) in ONE transaction.
+
+    add_shopping_items / add_inventory_items: item dicts merged/inserted via
+    the same _merge_or_insert_*_in_tx helpers add_shopping_items_batch/
+    add_inventory_items_batch already use.
+    consume_updates: list of {item_id, quantity_value, quantity_unit,
+    quantity_text} — partial consumption, structured fields set directly.
+    consume_delete_ids: inventory item ids consumed down to zero, deleted
+    entirely.
+    inventory_targets (optional): snapshot of {item_id, quantity_value,
+    quantity_unit} for every inventory item this batch touches (both
+    consume_updates and consume_delete_ids) — verified for staleness inside
+    this same transaction (same guard as apply_compound_inventory_operations)
+    before anything is written.
+    new_expense (optional): {amount, currency, category, description,
+    expense_date} — plain insert, needs no staleness check.
+    delete_expense_id / delete_expense_snapshot (optional): re-verified
+    inside this same transaction (row locked FOR UPDATE, same rule as
+    delete_expense()) before being deleted — raises StaleSnapshotError if the
+    row is gone or its amount/category/expense_date/description no longer
+    match the snapshot.
+
+    Both staleness checks run BEFORE any write, so a stale inventory target
+    or a stale expense-delete target aborts the whole transaction (rolled
+    back automatically since the exception propagates out of the `with
+    get_connection()` block) — never a partial apply.
+
+    Returns a dict: {"shopping_added": n, "inventory_added": n,
+    "inventory_updated": n, "inventory_removed": n, "expense_added_id":
+    id_or_None, "expense_deleted": bool}.
+    """
+    add_shopping_items = add_shopping_items or []
+    add_inventory_items = add_inventory_items or []
+    consume_updates = consume_updates or []
+    consume_delete_ids = consume_delete_ids or []
+
+    inventory_updated = 0
+    inventory_removed = 0
+    expense_added_id = None
+    expense_deleted = False
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, inventory_targets)
+
+            if delete_expense_id is not None:
+                cur.execute(
+                    "SELECT amount, category, expense_date, description FROM expenses "
+                    "WHERE id = %s AND household_id = %s FOR UPDATE",
+                    (delete_expense_id, household_id)
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise StaleSnapshotError()
+                amount, category, expense_date, description = row
+                snapshot = delete_expense_snapshot or {}
+                if (
+                    amount != snapshot.get("amount")
+                    or category != snapshot.get("category")
+                    or expense_date != snapshot.get("expense_date")
+                    or (description or None) != (snapshot.get("description") or None)
+                ):
+                    raise StaleSnapshotError()
+
+            for upd in consume_updates:
+                cur.execute(
+                    "UPDATE inventory_items SET quantity_text=%s, quantity_value=%s, quantity_unit=%s, "
+                    "quantity_inferred=FALSE, updated_at=NOW() WHERE id=%s AND household_id=%s RETURNING id",
+                    (upd["quantity_text"], upd["quantity_value"], upd["quantity_unit"], upd["item_id"], household_id)
+                )
+                if cur.fetchone():
+                    inventory_updated += 1
+
+            if consume_delete_ids:
+                placeholders = ",".join(["%s"] * len(consume_delete_ids))
+                cur.execute(
+                    f"DELETE FROM inventory_items WHERE id IN ({placeholders}) AND household_id=%s",
+                    list(consume_delete_ids) + [household_id]
+                )
+                inventory_removed = cur.rowcount
+
+            for item in add_shopping_items:
+                _merge_or_insert_shopping_in_tx(
+                    cur, household_id, user_db_id,
+                    item["name"],
+                    item.get("quantity_text") or "",
+                    item.get("category") or DEFAULT_CATEGORY,
+                    canonical_name=item.get("canonical_name"),
+                    quantity_value=item.get("quantity_value"),
+                    quantity_unit=item.get("quantity_unit"),
+                    quantity_inferred=item.get("quantity_inferred", False),
+                )
+
+            for item in add_inventory_items:
+                _merge_or_insert_inventory_in_tx(
+                    cur, household_id, user_db_id,
+                    item["name"],
+                    item.get("quantity_text") or "",
+                    item.get("category") or DEFAULT_CATEGORY,
+                    canonical_name=item.get("canonical_name"),
+                    quantity_value=item.get("quantity_value"),
+                    quantity_unit=item.get("quantity_unit"),
+                    quantity_inferred=item.get("quantity_inferred", False),
+                )
+
+            if new_expense is not None:
+                cur.execute(
+                    """
+                    INSERT INTO expenses
+                        (household_id, amount, currency, category, description, expense_date, created_by_user_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (household_id, new_expense["amount"], new_expense["currency"], new_expense["category"],
+                     new_expense.get("description") or None, new_expense["expense_date"], user_db_id)
+                )
+                expense_added_id = cur.fetchone()[0]
+
+            if delete_expense_id is not None:
+                cur.execute(
+                    "DELETE FROM expenses WHERE id = %s AND household_id = %s",
+                    (delete_expense_id, household_id)
+                )
+                expense_deleted = True
+
+        conn.commit()
+
+    return {
+        "shopping_added": len(add_shopping_items),
+        "inventory_added": len(add_inventory_items),
+        "inventory_updated": inventory_updated,
+        "inventory_removed": inventory_removed,
+        "expense_added_id": expense_added_id,
+        "expense_deleted": expense_deleted,
+    }
+
 # =========================
 # MANUAL MERGE
 # =========================
