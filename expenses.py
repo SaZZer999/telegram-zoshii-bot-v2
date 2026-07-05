@@ -207,7 +207,13 @@ def _expense_origin_keyboard(origin):
 # =========================
 # ROUTING GATES (pure, no Gemini)
 # =========================
-_EXPENSE_AMOUNT_RE = re.compile(r"\d[\d\s.,]*\s*(zł|zl|pln)\b")
+# The bare "z" alternative additionally requires that no other digit follows
+# it (even across whitespace) — this is what keeps "2 z 3" from matching as
+# an amount+currency pair while still accepting "10 z"/"10,50 z" at the end
+# of a message. The other markers (zł/zl/pln) already can't false-positive
+# on a longer word like "zebra"/"zloty" thanks to their own \b, so they keep
+# their original (shared, implicit) boundary behavior unchanged.
+_EXPENSE_AMOUNT_RE = re.compile(r"\d[\d\s.,]*\s*(zł\b|zl\b|pln\b|z\b(?!\s*\d))")
 
 
 def _expense_command_gate(text):
@@ -336,6 +342,9 @@ def _ask_gemini_expense_router(user_text, recent_expenses=None):
 # =========================
 # VALIDATORS (pure)
 # =========================
+_BARE_Z_CURRENCY_RE = re.compile(r"\s*\bz\b(?!\s*\d)")
+
+
 def _parse_expense_amount(raw_amount):
     """Parse a Gemini-provided amount into an exact Decimal — never float.
     Accepts comma or dot decimal separators and stray currency text/spaces.
@@ -352,6 +361,11 @@ def _parse_expense_amount(raw_amount):
         return None
     cleaned = raw_amount.strip().lower()
     cleaned = cleaned.replace("zł", "").replace("zl", "").replace("pln", "")
+    # Bare "z" marker (e.g. "10 z", "10,50 z") — same \b + "not followed by
+    # another digit" safeguard as _EXPENSE_AMOUNT_RE, so this never strips a
+    # "z" that's part of something else. Applied after the zł/zl/pln
+    # replacements above, on whatever text they left behind.
+    cleaned = _BARE_Z_CURRENCY_RE.sub("", cleaned)
     cleaned = cleaned.replace(" ", "").replace(",", ".").strip()
     if not cleaned:
         return None

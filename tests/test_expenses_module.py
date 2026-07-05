@@ -77,6 +77,23 @@ class TestExpensesPureHelpers(unittest.TestCase):
         self.assertTrue(self.expenses._expense_command_gate("86 zł"))
         self.assertFalse(self.expenses._expense_command_gate("Яка сьогодні погода?"))
 
+    def test_short_zloty_marker_z_recognized_like_zl_and_pln(self):
+        # Case 3/4 — "z" is recognized by the same shared gate/amount
+        # machinery as "zł"/"zl"/"pln", with the same resulting Decimal.
+        self.assertTrue(self.expenses._expense_command_gate("Купив молоко за 10 z"))
+        self.assertEqual(self.expenses._parse_expense_amount("10 zl"), Decimal("10.00"))
+        self.assertEqual(self.expenses._parse_expense_amount("10 PLN"), Decimal("10.00"))
+        self.assertEqual(self.expenses._parse_expense_amount("10 z"), Decimal("10.00"))
+        self.assertEqual(self.expenses._parse_expense_amount("10,50 z"), Decimal("10.50"))
+        self.assertEqual(self.expenses._parse_expense_amount("10.50 z"), Decimal("10.50"))
+
+        # Case 5 — a "z" immediately followed by another number is never an
+        # amount+currency pair (e.g. "2 z 3", some unrelated count).
+        self.assertFalse(self.expenses._EXPENSE_AMOUNT_RE.search("2 z 3"))
+
+        # Case 6 — "z" that's just the start of another word never matches.
+        self.assertFalse(self.expenses._EXPENSE_AMOUNT_RE.search("10 zebra"))
+
     def test_expense_delete_command_gate_requires_expense_word(self):
         self.assertTrue(self.expenses._expense_delete_command_gate("Видали витрату за булочку 4 zł"))
         self.assertFalse(self.expenses._expense_delete_command_gate("Видали булочку"))

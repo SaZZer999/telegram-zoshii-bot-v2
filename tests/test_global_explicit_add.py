@@ -269,6 +269,26 @@ class TestExplicitAddWithAmountIsBlocked(_BaseExplicitAddTestCase):
         self.mock_items.assert_not_called()
         self.assertNotIn(chat_id, pending_global_household)
 
+    # Short zloty marker "z" — cases 1/2 from the "z" recognition fix: the
+    # explicit-add guard must catch it exactly like "zł", before Gemini.
+    def test_short_zloty_marker_in_explicit_inventory_command_is_blocked(self):
+        chat_id = 997052
+        _call_webhook(_make_update(997000052, chat_id, "Додай в запаси молоко за 10 z"))
+        self.mock_items.assert_not_called()
+        self.assertNotIn(chat_id, pending_global_household)
+        self.mock_apply.assert_not_called()
+        texts = self._sent_texts()
+        self.assertTrue(any(
+            "Для покупки з витратою напиши, наприклад:" in t and "«Купив молоко за 10 zł»" in t
+            for t in texts
+        ))
+
+    def test_short_zloty_marker_with_decimal_in_explicit_shopping_command_is_blocked(self):
+        chat_id = 997053
+        _call_webhook(_make_update(997000053, chat_id, "Додай до покупок хліб за 10,50 z"))
+        self.mock_items.assert_not_called()
+        self.assertNotIn(chat_id, pending_global_household)
+
 
 class TestExplicitAddPriority(_BaseExplicitAddTestCase):
     # Case 10 — an active preview/clarification always wins over the
