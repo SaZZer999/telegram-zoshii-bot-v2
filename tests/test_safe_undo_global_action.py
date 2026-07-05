@@ -456,6 +456,7 @@ os.environ.setdefault('GEMINI_API_KEY', 'test_gemini_key')
 os.environ.setdefault('ALLOWED_USER_IDS', '')
 
 import bot  # noqa: E402
+import expenses  # noqa: E402
 from bot import (  # noqa: E402
     pending_undo_action, MAIN_KEYBOARD, SHOPPING_KEYBOARD, INVENTORY_KEYBOARD,
     ALIASES_KEYBOARD, EXPENSES_KEYBOARD,
@@ -581,6 +582,40 @@ class TestUndoButtonPresentInEverySubmenu(unittest.TestCase):
         self.assertIn(action_history.UNDO_BUTTON_TEXT, _keyboard_buttons(ALIASES_KEYBOARD))
         self.assertIn("📋 Показати назви", _keyboard_buttons(ALIASES_KEYBOARD))
         self.assertIn("⬅️ Головне меню", _keyboard_buttons(ALIASES_KEYBOARD))
+
+
+class TestExpenseKeyboardOwnedByExpensesModule(unittest.TestCase):
+    """Refactor guard: EXPENSES_KEYBOARD is a plain literal defined and
+    owned by expenses.py itself (no bot.py import-time mutation) — exactly
+    one undo button, positioned right before "⬅️ Головне меню", and stable
+    across a module reload (nothing appends onto a shared list anymore, so
+    there is nothing left to duplicate)."""
+
+    def test_exactly_one_undo_button(self):
+        buttons = _keyboard_buttons(expenses.EXPENSES_KEYBOARD)
+        self.assertEqual(buttons.count(action_history.UNDO_BUTTON_TEXT), 1)
+
+    def test_undo_button_immediately_precedes_main_menu_row(self):
+        rows = expenses.EXPENSES_KEYBOARD["keyboard"]
+        self.assertEqual(rows[-2], [action_history.UNDO_BUTTON_TEXT])
+        self.assertEqual(rows[-1], ["⬅️ Головне меню"])
+
+    def test_bot_and_expenses_share_the_same_keyboard_object(self):
+        self.assertIs(bot.EXPENSES_KEYBOARD, expenses.EXPENSES_KEYBOARD)
+
+    def test_reloading_expenses_module_does_not_duplicate_the_button(self):
+        import importlib
+        reloaded = importlib.reload(expenses)
+        try:
+            buttons = _keyboard_buttons(reloaded.EXPENSES_KEYBOARD)
+            self.assertEqual(buttons.count(action_history.UNDO_BUTTON_TEXT), 1)
+        finally:
+            # Restore bot.py's live wiring (configure() + shared dict
+            # identity) so later tests in this process aren't affected by
+            # the reload — reload() replaces expenses' module globals, which
+            # would otherwise leave _bot/MAIN_KEYBOARD unset for the rest of
+            # the suite.
+            reloaded.configure(bot, bot.active_list_context, bot.MAIN_KEYBOARD)
 
 
 class TestUndoButtonFromSubmenuTriggersSameFlow(unittest.TestCase):

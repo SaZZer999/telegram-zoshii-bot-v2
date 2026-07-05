@@ -26,6 +26,7 @@ from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 from database import StaleSnapshotError
+from action_history import UNDO_BUTTON_TEXT
 
 # =========================
 # INJECTED DEPENDENCIES (see configure())
@@ -158,6 +159,7 @@ EXPENSES_KEYBOARD = {
     "keyboard": [
         ["🧾 Останні витрати", "📊 Цей місяць"],
         ["🗑️ Видалити витрату"],
+        [UNDO_BUTTON_TEXT],
         ["⬅️ Головне меню"],
     ],
     "resize_keyboard": True,
