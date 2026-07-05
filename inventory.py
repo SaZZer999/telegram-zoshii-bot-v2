@@ -1,6 +1,7 @@
 """Pure inventory-domain helpers: the Inventory Representation Guard v1
 (does an incoming quantity merge into an existing row, need clarification,
-or become a separate row?) and inventory consumption math/validation.
+or become a separate row?), inventory consumption math/validation, and the
+numbered inventory-delete selection cluster.
 
 Single source of truth extracted from bot.py — bot.py re-exports every name
 here as the SAME object (`from inventory import ...`), so
@@ -9,16 +10,22 @@ holds, and household_router.py's existing `_bot.resolve_inventory_representation
 indirection (bot.py IS the `_bot` it was configured with) keeps working
 unchanged.
 
+The numbered-delete cluster needs a couple of pieces bot.py owns
+(_effective_quantity, CATEGORY_ORDER, DEFAULT_CATEGORY) — rather than
+duplicating or importing them, bot.py's thin wrappers pass them in as
+explicit arguments (effective_quantity/category_order/default_category),
+keeping this module fully self-contained.
+
 No Telegram, Flask, psycopg, database connection, or Gemini — this module
 imports only the standard library and quantities.py (the shared quantity/
 unit math). Deliberately excluded (stays in bot.py, out of this module's
 scope): webhook routes, keyboards, send_message, pending_* dicts,
 _continue_inventory_quantity_clarification, parse_inventory_list_with_gemini,
-the numbered-delete cluster (needs bot.py's shared _effective_quantity),
 _validate_compound_operations/_format_compound_preview and the whole
 reconciliation cluster (both need bot.py's alias/name normalization),
-_effective_quantity, format_grouped_list, and every database call.
+_effective_quantity itself, format_grouped_list, and every database call.
 """
+import re
 from decimal import Decimal
 
 from quantities import STRUCTURED_UNITS, format_quantity_display, merge_quantity_values
@@ -314,3 +321,136 @@ def _compound_snapshot_is_stale(inventory_changes, current_items):
         if cur is None or cur.get("quantity_value") != c["old_value"] or cur.get("quantity_unit") != c["old_unit"]:
             return True
     return False
+
+
+# =========================
+# NUMBERED INVENTORY DELETE SELECTION
+# =========================
+
+def _numbered_inventory_display_items(items, category_order, default_category):
+    """Rebuilds the exact same 1-based numbering format_grouped_list shows
+    the user for an inventory snapshot — category_order traversal (grouped
+    by category, in category_order's fixed sequence), never the raw
+    get_inventory_items() SQL order ("category, name ASC" — plain
+    alphabetical, which does NOT match category_order). This is the single
+    source of truth for what "number N" means to the user on screen, reused
+    by the deterministic numbered-reference delete-selection path so it can
+    never number items differently than what's actually displayed.
+    Returns an ordered list of (number, item) tuples.
+    """
+    numbered = []
+    counter = 1
+    for cat in category_order:
+        for item in items:
+            if (item.get("category") or default_category) != cat:
+                continue
+            numbered.append((counter, item))
+            counter += 1
+    return numbered
+
+
+def _render_inventory_item_label(item, effective_quantity):
+    """The exact per-item label text format_grouped_list renders after the
+    number (name + optional "(виправлено)" + optional " — quantity"),
+    without the leading "N. " — used to verify a user-typed description
+    against the actual current label at that position. `effective_quantity`
+    is bot.py's shared (value, unit, display_text) accessor, injected so
+    this module never needs to duplicate or import it."""
+    label = item["name"]
+    if item.get("was_corrected"):
+        label += " (виправлено)"
+    _, _, qty_display = effective_quantity(item)
+    if qty_display:
+        label += f" — {qty_display}"
+    return label
+
+
+def _normalize_delete_match_text(s):
+    """Lower/trim/collapse whitespace and strip punctuation — used only for
+    exact-equality comparison of a numbered delete reference's description
+    against the actual rendered label, never substring/fuzzy matching."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^\w\s]", "", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+_NUMBERED_DELETE_LINE_RE = re.compile(r"^\s*(\d+)[.)]\s*(.+?)\s*$")
+
+
+def _parse_numbered_delete_lines(text):
+    """Detect an EXPLICIT numbered-reference delete request — every
+    non-blank line of `text` must match "N. description" or "N) description".
+    Returns an ordered list of (number, description) tuples, or None if the
+    text isn't entirely composed of such lines — the caller then falls back
+    to the existing natural-language/Gemini selection path unchanged."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    parsed = []
+    for line in lines:
+        m = _NUMBERED_DELETE_LINE_RE.match(line)
+        if not m:
+            return None
+        parsed.append((int(m.group(1)), m.group(2)))
+    return parsed
+
+
+def _format_numbered_delete_mismatch_message(number, exists):
+    """Blocks the whole batch — never guess which item a stale/mismatched
+    numbered reference meant."""
+    if not exists:
+        reason = f"Номер {number} не існує в поточному списку запасів."
+    else:
+        reason = f"Номер {number} зараз відповідає іншій позиції у запасах."
+    return (
+        "Не можу безпечно підтвердити вибір.\n\n"
+        f"{reason}\n"
+        "Покажи список запасів ще раз і вибери актуальний номер."
+    )
+
+
+def _resolve_numbered_inventory_delete_selection(text, items, effective_quantity, category_order, default_category):
+    """Deterministic, non-Gemini resolution for an explicit numbered
+    inventory-delete request (every line shaped "N. description" / "N)
+    description"). Never fuzzy-matched, never stemmed/lemmatized, never
+    passed to Gemini — an exact match (after safe normalization) against the
+    CURRENT rendered label at that exact display position, or the whole
+    batch is blocked.
+
+    effective_quantity/category_order/default_category are injected from
+    bot.py (see module docstring) — this function itself stays pure.
+
+    Returns one of:
+      (None, None) — text isn't a purely-numbered request; caller should
+          fall back to the existing natural-language/Gemini selection path.
+      ("mismatch", (number_or_None, exists_bool)) — blocks the whole batch:
+          a referenced number doesn't exist in the current snapshot, or its
+          description doesn't match the item currently at that position.
+      ("ok", [item, ...]) — every referenced number exists and matches;
+          deduplicated (a repeated number is never selected twice), order
+          preserved as first referenced.
+    """
+    parsed = _parse_numbered_delete_lines(text)
+    if parsed is None:
+        return None, None
+
+    numbered = _numbered_inventory_display_items(items, category_order, default_category)
+    by_number = {n: item for n, item in numbered}
+
+    selected = []
+    seen_ids = set()
+    for number, description in parsed:
+        item = by_number.get(number)
+        if item is None:
+            return "mismatch", (number, False)
+        rendered = _render_inventory_item_label(item, effective_quantity)
+        if _normalize_delete_match_text(description) != _normalize_delete_match_text(rendered):
+            return "mismatch", (number, True)
+        if item["id"] not in seen_ids:
+            seen_ids.add(item["id"])
+            selected.append(item)
+
+    if not selected:
+        return "mismatch", (None, False)
+    return "ok", selected

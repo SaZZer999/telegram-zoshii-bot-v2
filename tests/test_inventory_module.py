@@ -186,5 +186,134 @@ class TestCompoundSnapshotStaleness(unittest.TestCase):
         self.assertTrue(inventory._compound_snapshot_is_stale(inventory_changes, []))
 
 
+# =========================
+# Numbered inventory delete selection (V1.1)
+# =========================
+def _item(item_id, name, category, quantity_text, quantity_value=None, quantity_unit=None):
+    return {
+        "id": item_id, "name": name, "category": category, "quantity_text": quantity_text,
+        "quantity_value": quantity_value, "quantity_unit": quantity_unit, "was_corrected": False,
+    }
+
+
+_TEST_CATEGORY_ORDER = ["М'ясо та риба", "Молочне та яйця", "Фрукти та ягоди"]
+_TEST_DEFAULT_CATEGORY = "Інше їстівне"
+
+
+def _sample_items():
+    return [
+        _item(1, "Курка", "М'ясо та риба", "1 шт.", 1.0, "шт."),
+        _item(2, "Ковбаски", "М'ясо та риба", "2 шт.", 2.0, "шт."),
+        _item(3, "Молоко", "Молочне та яйця", "1 л", 1.0, "л"),
+        _item(4, "Банани", "Фрукти та ягоди", "3 шт.", 3.0, "шт."),
+    ]
+
+
+class TestNumberedDeleteModuleBoundaryIdentity(unittest.TestCase):
+    """#1/#2/#8: bot.py's numbered-delete wrappers are the same object (or
+    return the same result) as the pure inventory.py helpers — no
+    independent duplicate implementation left behind."""
+
+    def test_bot_and_inventory_share_pure_zero_dependency_helpers(self):
+        self.assertIs(bot._normalize_delete_match_text, inventory._normalize_delete_match_text)
+        self.assertIs(bot._parse_numbered_delete_lines, inventory._parse_numbered_delete_lines)
+        self.assertIs(bot._format_numbered_delete_mismatch_message, inventory._format_numbered_delete_mismatch_message)
+
+    def test_pure_helper_needs_no_bot_import_and_wrapper_matches_it(self):
+        """#1: the pure inventory.py helper works from plain items + locally
+        supplied dependencies — no bot.py involved at all."""
+        items = _sample_items()
+
+        def local_effective_quantity(item):
+            value = item.get("quantity_value")
+            unit = item.get("quantity_unit")
+            if value is not None:
+                from quantities import format_quantity_display
+                return value, unit, format_quantity_display(value, unit)
+            return None, None, (item.get("quantity_text") or "")
+
+        pure_result = inventory._numbered_inventory_display_items(items, _TEST_CATEGORY_ORDER, _TEST_DEFAULT_CATEGORY)
+        self.assertEqual([n for n, _ in pure_result], [1, 2, 3, 4])
+
+        # #2: bot.py's wrapper (real CATEGORY_ORDER/DEFAULT_CATEGORY/_effective_quantity)
+        # returns the same shape/order as the pure helper called directly.
+        bot_result = bot._numbered_inventory_display_items(items)
+        wrapper_direct = inventory._numbered_inventory_display_items(items, bot.CATEGORY_ORDER, bot.DEFAULT_CATEGORY)
+        self.assertEqual(bot_result, wrapper_direct)
+        self.assertEqual([n for n, _ in bot_result], [1, 2, 3, 4])
+        self.assertEqual(local_effective_quantity(items[0])[2], bot._effective_quantity(items[0])[2])
+
+
+class TestNumberedDeleteCategoryOrderUnchanged(unittest.TestCase):
+    """#3: category ordering in the numbered display is unchanged."""
+
+    def test_items_are_numbered_in_category_order_not_input_order(self):
+        # Deliberately out-of-order input list — output must follow
+        # category_order, not the order items were passed in.
+        shuffled = [
+            _item(4, "Банани", "Фрукти та ягоди", "3 шт.", 3.0, "шт."),
+            _item(1, "Курка", "М'ясо та риба", "1 шт.", 1.0, "шт."),
+            _item(3, "Молоко", "Молочне та яйця", "1 л", 1.0, "л"),
+            _item(2, "Ковбаски", "М'ясо та риба", "2 шт.", 2.0, "шт."),
+        ]
+        numbered = inventory._numbered_inventory_display_items(shuffled, _TEST_CATEGORY_ORDER, _TEST_DEFAULT_CATEGORY)
+        self.assertEqual([item["id"] for _, item in numbered], [1, 2, 3, 4])
+
+
+class TestNumberedDeleteSelectionBehavior(unittest.TestCase):
+    """#4-#7: exact-match selection, whole-batch blocking on mismatch,
+    deduplication, and protection against deleting the wrong item — pure
+    inventory.py behavior, unchanged from before the extraction."""
+
+    def _resolve(self, text, items):
+        return inventory._resolve_numbered_inventory_delete_selection(
+            text, items, bot._effective_quantity, _TEST_CATEGORY_ORDER, _TEST_DEFAULT_CATEGORY,
+        )
+
+    def test_exact_name_selects_the_right_item(self):
+        items = _sample_items()
+        kind, selected = self._resolve("1. Курка — 1 шт.", items)
+        self.assertEqual(kind, "ok")
+        self.assertEqual([it["id"] for it in selected], [1])
+
+    def test_number_with_wrong_name_blocks_whole_batch(self):
+        items = _sample_items()
+        kind, payload = self._resolve("1. Курка — 1 шт.\n2. Молоко — 1 л", items)
+        self.assertEqual(kind, "mismatch")
+        # number 2 is actually "Ковбаски — 2 шт.", not "Молоко — 1 л" ->
+        # blocks everything, including the otherwise-valid line 1.
+        number, exists = payload
+        self.assertEqual(number, 2)
+        self.assertTrue(exists)
+
+    def test_repeated_number_does_not_duplicate_delete_target(self):
+        items = _sample_items()
+        kind, selected = self._resolve("1. Курка — 1 шт.\n1. Курка — 1 шт.", items)
+        self.assertEqual(kind, "ok")
+        self.assertEqual([it["id"] for it in selected], [1])
+
+    def test_invalid_number_cannot_delete_a_different_item(self):
+        items = _sample_items()
+        kind, payload = self._resolve("99. Курка", items)
+        self.assertEqual(kind, "mismatch")
+        number, exists = payload
+        self.assertEqual(number, 99)
+        self.assertFalse(exists)
+
+    def test_mismatch_message_text_unchanged(self):
+        self.assertEqual(
+            inventory._format_numbered_delete_mismatch_message(5, False),
+            "Не можу безпечно підтвердити вибір.\n\n"
+            "Номер 5 не існує в поточному списку запасів.\n"
+            "Покажи список запасів ще раз і вибери актуальний номер.",
+        )
+        self.assertEqual(
+            inventory._format_numbered_delete_mismatch_message(5, True),
+            "Не можу безпечно підтвердити вибір.\n\n"
+            "Номер 5 зараз відповідає іншій позиції у запасах.\n"
+            "Покажи список запасів ще раз і вибери актуальний номер.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
