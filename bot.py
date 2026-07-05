@@ -1407,6 +1407,31 @@ def clear_alias_state(chat_id):
 # Expense state clearing now lives in expenses.py — re-exported here.
 clear_expense_state = expenses.clear_expense_state
 
+def clear_interaction_state(chat_id):
+    """Routing Contract v1: the single place that decides what "start over"
+    means for navigation (/start, /menu, "⬅️ Головне меню") — replaces the
+    3 copy-pasted cleanup blocks that used to live in those handlers.
+    Clears every pending preview/confirm/clarification state across every
+    flow, so the next command is always treated as new, never a
+    continuation of whatever was open before navigation. Composes the
+    existing clear_shopping_state/clear_inventory_state (which already
+    cover shopping_mode, inventory_mode, every legacy pending_* batch/merge/
+    consumption/reconciliation state, aliases, and expenses) and adds the
+    Global Household Router/Action History states that predate this helper
+    and were missing from at least one of the 3 old blocks —
+    pending_global_household in particular was never cleared by navigation
+    at all before this.
+    """
+    waiting_for_ingredients.pop(chat_id, None)
+    active_list_context.pop(chat_id, None)
+    clear_shopping_state(chat_id)
+    clear_inventory_state(chat_id)
+    clear_list_context(chat_id)
+    pending_global_household.pop(chat_id, None)
+    pending_inventory_quantity_clarification.pop(chat_id, None)
+    pending_add_destination_clarification.pop(chat_id, None)
+    pending_undo_action.pop(chat_id, None)
+
 # =========================
 # QUANTITY HELPERS (local)
 # =========================
@@ -4643,14 +4668,7 @@ def webhook():
     # =========================
 
     if text == "/start":
-        waiting_for_ingredients.pop(chat_id, None)
-        active_list_context.pop(chat_id, None)
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        clear_list_context(chat_id)
-        pending_inventory_quantity_clarification.pop(chat_id, None)
-        pending_add_destination_clarification.pop(chat_id, None)
-        pending_undo_action.pop(chat_id, None)
+        clear_interaction_state(chat_id)
         send_message(
             chat_id,
             "Привіт! Я твій домашній помічник 🏠\n\n"
@@ -4660,14 +4678,7 @@ def webhook():
         return "ok"
 
     if text == "/menu":
-        waiting_for_ingredients.pop(chat_id, None)
-        active_list_context.pop(chat_id, None)
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        clear_list_context(chat_id)
-        pending_inventory_quantity_clarification.pop(chat_id, None)
-        pending_add_destination_clarification.pop(chat_id, None)
-        pending_undo_action.pop(chat_id, None)
+        clear_interaction_state(chat_id)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -4749,14 +4760,7 @@ def webhook():
         return "ok"
 
     if text == "⬅️ Головне меню":
-        waiting_for_ingredients.pop(chat_id, None)
-        active_list_context.pop(chat_id, None)
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        clear_list_context(chat_id)
-        pending_inventory_quantity_clarification.pop(chat_id, None)
-        pending_add_destination_clarification.pop(chat_id, None)
-        pending_undo_action.pop(chat_id, None)
+        clear_interaction_state(chat_id)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
