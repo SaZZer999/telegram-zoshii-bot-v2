@@ -2230,6 +2230,70 @@ def _validate_saved_updates(updates, items):
     return valid
 
 
+# Package/container words the saved-edit router must never be allowed to
+# silently turn into a piece count ("шт.") — a "пачка"/"paczka" is not a
+# fixed number of items. Ukrainian + Polish forms only, exactly as specified;
+# no fuzzy matching or extra inflections guessed beyond this list.
+_PACKAGE_WORD_RE = re.compile(
+    r"\b(пачка|пачки|пачок|упаковка|упаковки|упаковок|paczka|paczki|opakowanie|opakowania)\b",
+    re.IGNORECASE,
+)
+_PACKAGE_NUMBER_WORDS = (
+    "два", "дві", "три", "чотири", "п'ять", "п’ять", "пара", "пару",
+    "dwa", "dwie", "trzy", "cztery", "jeden", "jedna",
+)
+
+
+def _extract_package_phrase(text):
+    """Find the first package/container word in `text` and return it
+    together with an immediately preceding quantity word/number when
+    present (e.g. "дві пачки", "2 paczki"), for the user-facing safety
+    message. Returns None if no package word is present anywhere in text."""
+    match = _PACKAGE_WORD_RE.search(text or "")
+    if not match:
+        return None
+    prefix = text[:match.start()]
+    prefix_match = re.search(
+        r"(\d+|" + "|".join(re.escape(w) for w in _PACKAGE_NUMBER_WORDS) + r")\s*$",
+        prefix, re.IGNORECASE,
+    )
+    if prefix_match:
+        return text[prefix_match.start():match.end()]
+    return match.group(0)
+
+
+def _saved_edit_text_has_unsafe_package_conversion(text, valid_updates):
+    """True if the raw user text mentions a package/container phrase while
+    at least one validated saved-edit candidate would set a structured
+    piece count ("шт."). This is exactly the dangerous conversion the
+    Gemini edit router must not be allowed to make on its own — a package
+    is not a fixed number of pieces — so the whole edit request is blocked
+    rather than guessing which single candidate the phrase referred to (no
+    fuzzy matching). Ordinary edits that set "шт." without any package word
+    in the text (e.g. "Сосиски — 2 шт.") are never affected.
+    """
+    if not _PACKAGE_WORD_RE.search(text or ""):
+        return False
+    for upd in valid_updates:
+        qty = upd.get("quantity_text")
+        if not qty:
+            continue
+        value, unit = _parse_structured_quantity(qty)
+        if unit == "шт." and value is not None:
+            return True
+    return False
+
+
+def _format_package_conversion_blocked_message(text):
+    phrase = _extract_package_phrase(text) or "пачки"
+    return (
+        f"Не можу безпечно перетворити «{phrase}» на штуки.\n\n"
+        "Пачка не дорівнює певній кількості товару.\n"
+        "Для зміни кількості в штуках напиши, наприклад: «Сосиски — 2 шт.».\n\n"
+        "Щоб додати нове надходження пачками, напиши: «Купив дві пачки сосисок»."
+    )
+
+
 def _quantity_values_equal(a, b):
     """Decimal-exact comparison for two possibly-None, possibly-float/Decimal
     quantity values. Never compares via bare float equality — converting
@@ -4741,7 +4805,9 @@ def webhook():
                     intent = router_result["intent"]
                     if intent == "edit_saved_items":
                         valid_updates = _validate_saved_updates(router_result["updates"], list_items)
-                        if valid_updates:
+                        if valid_updates and _saved_edit_text_has_unsafe_package_conversion(text, valid_updates):
+                            send_message(chat_id, _format_package_conversion_blocked_message(text))
+                        elif valid_updates:
                             real_updates, noop_updates = _split_noop_saved_updates(valid_updates, list_items, alias_map)
                             if not real_updates:
                                 send_message(chat_id, _format_noop_saved_edit_message(noop_updates, list_items, ctx))

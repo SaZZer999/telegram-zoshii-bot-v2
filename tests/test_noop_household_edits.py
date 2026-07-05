@@ -155,7 +155,11 @@ class TestNoopSavedEditWebhookFlow(unittest.TestCase):
         with patch.object(bot, "get_inventory_items", return_value=[_sausage_row()]):
             with patch.object(bot, "_ask_gemini_saved_list_router", return_value=_router_result(updates)):
                 with patch.object(bot, "update_inventory_items_batch") as mock_update:
-                    _call_webhook(_make_update(994000001, chat_id, "Сосиски — дві пачки"))
+                    # No package word here on purpose — this test is about the
+                    # plain no-op guard (repeating the exact same quantity),
+                    # kept separate from the package-conversion guard covered
+                    # in tests/test_block_package_saved_edits.py.
+                    _call_webhook(_make_update(994000001, chat_id, "Сосиски — 2 шт."))
                     mock_update.assert_not_called()
         self.assertNotIn(chat_id, pending_saved_edit)
         texts = self._sent_texts()
@@ -202,7 +206,8 @@ class TestNoopSavedEditWebhookFlow(unittest.TestCase):
         ]
         with patch.object(bot, "get_inventory_items", return_value=[_sausage_row(), _banana_row()]):
             with patch.object(bot, "_ask_gemini_saved_list_router", return_value=_router_result(updates)):
-                _call_webhook(_make_update(994000004, chat_id, "Сосиски — дві пачки, банани — 5 шт."))
+                # No package word here on purpose — see the note above.
+                _call_webhook(_make_update(994000004, chat_id, "Сосиски — 2 шт., банани — 5 шт."))
         self.assertIn(chat_id, pending_saved_edit)
         pending_updates = pending_saved_edit[chat_id]["validated_updates"]
         self.assertEqual(len(pending_updates), 1)
