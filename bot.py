@@ -853,6 +853,130 @@ def parse_item_text(text):
         return parts[0].strip(), parts[1].strip()
     return text.strip(), None
 
+def _numbered_inventory_display_items(items):
+    """Rebuilds the exact same 1-based numbering format_grouped_list shows
+    the user for an inventory snapshot — CATEGORY_ORDER traversal (grouped
+    by category, in CATEGORY_ORDER's fixed sequence), never the raw
+    get_inventory_items() SQL order ("category, name ASC" — plain
+    alphabetical, which does NOT match CATEGORY_ORDER). This is the single
+    source of truth for what "number N" means to the user on screen, reused
+    by the deterministic numbered-reference delete-selection path so it can
+    never number items differently than what's actually displayed.
+    Returns an ordered list of (number, item) tuples.
+    """
+    numbered = []
+    counter = 1
+    for cat in CATEGORY_ORDER:
+        for item in items:
+            if (item.get("category") or DEFAULT_CATEGORY) != cat:
+                continue
+            numbered.append((counter, item))
+            counter += 1
+    return numbered
+
+
+def _render_inventory_item_label(item):
+    """The exact per-item label text format_grouped_list renders after the
+    number (name + optional "(виправлено)" + optional " — quantity"),
+    without the leading "N. " — used to verify a user-typed description
+    against the actual current label at that position."""
+    label = item["name"]
+    if item.get("was_corrected"):
+        label += " (виправлено)"
+    _, _, qty_display = _effective_quantity(item)
+    if qty_display:
+        label += f" — {qty_display}"
+    return label
+
+
+def _normalize_delete_match_text(s):
+    """Lower/trim/collapse whitespace and strip punctuation — used only for
+    exact-equality comparison of a numbered delete reference's description
+    against the actual rendered label, never substring/fuzzy matching."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^\w\s]", "", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+_NUMBERED_DELETE_LINE_RE = re.compile(r"^\s*(\d+)[.)]\s*(.+?)\s*$")
+
+
+def _parse_numbered_delete_lines(text):
+    """Detect an EXPLICIT numbered-reference delete request — every
+    non-blank line of `text` must match "N. description" or "N) description".
+    Returns an ordered list of (number, description) tuples, or None if the
+    text isn't entirely composed of such lines — the caller then falls back
+    to the existing natural-language/Gemini selection path unchanged."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    parsed = []
+    for line in lines:
+        m = _NUMBERED_DELETE_LINE_RE.match(line)
+        if not m:
+            return None
+        parsed.append((int(m.group(1)), m.group(2)))
+    return parsed
+
+
+def _format_numbered_delete_mismatch_message(number, exists):
+    """Blocks the whole batch — never guess which item a stale/mismatched
+    numbered reference meant."""
+    if not exists:
+        reason = f"Номер {number} не існує в поточному списку запасів."
+    else:
+        reason = f"Номер {number} зараз відповідає іншій позиції у запасах."
+    return (
+        "Не можу безпечно підтвердити вибір.\n\n"
+        f"{reason}\n"
+        "Покажи список запасів ще раз і вибери актуальний номер."
+    )
+
+
+def _resolve_numbered_inventory_delete_selection(text, items):
+    """Deterministic, non-Gemini resolution for an explicit numbered
+    inventory-delete request (every line shaped "N. description" / "N)
+    description"). Never fuzzy-matched, never stemmed/lemmatized, never
+    passed to Gemini — an exact match (after safe normalization) against the
+    CURRENT rendered label at that exact display position, or the whole
+    batch is blocked.
+
+    Returns one of:
+      (None, None) — text isn't a purely-numbered request; caller should
+          fall back to the existing natural-language/Gemini selection path.
+      ("mismatch", (number_or_None, exists_bool)) — blocks the whole batch:
+          a referenced number doesn't exist in the current snapshot, or its
+          description doesn't match the item currently at that position.
+      ("ok", [item, ...]) — every referenced number exists and matches;
+          deduplicated (a repeated number is never selected twice), order
+          preserved as first referenced.
+    """
+    parsed = _parse_numbered_delete_lines(text)
+    if parsed is None:
+        return None, None
+
+    numbered = _numbered_inventory_display_items(items)
+    by_number = {n: item for n, item in numbered}
+
+    selected = []
+    seen_ids = set()
+    for number, description in parsed:
+        item = by_number.get(number)
+        if item is None:
+            return "mismatch", (number, False)
+        rendered = _render_inventory_item_label(item)
+        if _normalize_delete_match_text(description) != _normalize_delete_match_text(rendered):
+            return "mismatch", (number, True)
+        if item["id"] not in seen_ids:
+            seen_ids.add(item["id"])
+            selected.append(item)
+
+    if not selected:
+        return "mismatch", (None, False)
+    return "ok", selected
+
+
 def format_grouped_list(items, header):
     lines = [header, ""]
     counter = 1
@@ -4132,6 +4256,23 @@ def webhook():
             items = get_inventory_items(household_id)
             if not items:
                 send_message(chat_id, "Запаси поки порожні.")
+                return "ok"
+            # Explicit numbered references ("N. назва — кількість" / "N)
+            # ...") never go through Gemini — resolved deterministically
+            # against the SAME numbering the user was just shown, so a
+            # semantically-similar item (e.g. "Сосиски — 2 шт." vs the
+            # user's "сосисок — пару") can never be picked instead of the
+            # exact position requested. Falls back to the existing
+            # natural-language Gemini flow untouched when the text isn't
+            # entirely composed of such numbered lines.
+            numbered_kind, numbered_payload = _resolve_numbered_inventory_delete_selection(text, items)
+            if numbered_kind == "ok":
+                _show_remove_preview(chat_id, numbered_payload, household_id, user_db_id)
+                return "ok"
+            if numbered_kind == "mismatch":
+                number, exists = numbered_payload
+                send_message(chat_id, _format_numbered_delete_mismatch_message(number, exists))
+                inventory_mode[chat_id] = "removing"
                 return "ok"
             kind, payload = _ask_gemini_for_selection(text, items, "Список запасів", "прибрати із запасів")
             if kind == "ok":
