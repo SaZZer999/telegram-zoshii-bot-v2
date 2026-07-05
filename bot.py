@@ -52,6 +52,8 @@ from database import (
 import expenses
 import household_router
 import action_history
+import quantities
+from quantities import STRUCTURED_UNITS, format_quantity_display, merge_quantity_values, _UNIT_ALIASES
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -1451,6 +1453,14 @@ def _parse_qty(qty_text):
 
 # =========================
 # STRUCTURED QUANTITY HELPERS
+#
+# Pure quantity parsing/merging/formatting (STRUCTURED_UNITS, _UNIT_ALIASES,
+# parse_structured_quantity, merge_quantity_values, format_quantity_display)
+# now lives in quantities.py — the single source of truth database.py also
+# imports from. Only product-name synonym rules (_NAME_SYNONYMS) stay here,
+# a self-contained mirror of database.py's identical copy on purpose (this
+# file must not depend on database.py's own RAM-only pending-preview code
+# paths going through a different module).
 # =========================
 
 _NAME_SYNONYMS = {
@@ -1463,37 +1473,6 @@ _NAME_SYNONYMS = {
     "śmietanka": "вершки",
     "smietana": "сметана",
     "śmietana": "сметана",
-}
-
-_UNIT_ALIASES = {
-    "шт": "шт.", "шт.": "шт.", "штук": "шт.", "штуки": "шт.", "штука": "шт.",
-    "л": "л", "літр": "л", "літри": "л", "літра": "л", "l": "л",
-    "мл": "мл", "мілілітр": "мл", "мілілітри": "мл", "мілілітрів": "мл", "ml": "мл",
-    "г": "г", "грам": "г", "грами": "г", "грама": "г", "грамів": "г",
-    "кг": "кг", "кілограм": "кг", "кілограми": "кг", "кілограмів": "кг",
-}
-
-STRUCTURED_UNITS = {"шт.", "л", "мл", "г", "кг"}
-
-# Cross-unit merge groups: units within the same group ("mass"/"volume") are
-# safely interconvertible (both are exact powers of 10 apart, so Decimal
-# conversion is always exact — see merge_quantity_values). "шт." deliberately
-# has no group — it never merges with mass or volume, only with itself.
-# Mirrors database.py's identical copy.
-_UNIT_CONVERSION_GROUPS = {
-    "г": ("mass", Decimal("1")),
-    "кг": ("mass", Decimal("1000")),
-    "мл": ("volume", Decimal("1")),
-    "л": ("volume", Decimal("1000")),
-}
-
-# Word-numbers that resolve to an exact count — deliberately a tiny, exact
-# whitelist (never fuzzy/NLP); always flagged quantity_inferred=True by
-# normalize_item_quantity since the whole quantity (not just the unit) is an
-# assumption here, unlike an explicit digit.
-_WORD_NUMBER_QUANTITIES = {
-    "пара": Decimal("2"),
-    "пару": Decimal("2"),
 }
 
 # Narrow, deterministic Latin/Cyrillic homoglyph whitelist — mirrors
@@ -1599,37 +1578,10 @@ def resolve_item_name(name, alias_map):
     return name, canonicalize_name(name)
 
 
-def _parse_structured_quantity(quantity_text):
-    """Parse an unambiguous 'value unit' or bare-number quantity_text.
-
-    Returns (value, unit). Never raises. See database.py's identical copy
-    (parse_structured_quantity) for the full docstring: a bare number with
-    no unit word, or an exact word-number from _WORD_NUMBER_QUANTITIES
-    ("пара"/"пару"), returns (Decimal, "шт.") — new code, never round-tripped
-    through float. The existing "value unit" branch is unchanged (float).
-    """
-    if not quantity_text or not quantity_text.strip():
-        return None, None
-    normalized = quantity_text.strip().replace(",", ".")
-    parts = normalized.split()
-    if len(parts) == 1:
-        word = parts[0].lower()
-        if word in _WORD_NUMBER_QUANTITIES:
-            return _WORD_NUMBER_QUANTITIES[word], "шт."
-        try:
-            return Decimal(parts[0]), "шт."
-        except InvalidOperation:
-            return None, None
-    if len(parts) == 2:
-        try:
-            value = float(parts[0])
-        except ValueError:
-            return None, None
-        unit = _UNIT_ALIASES.get(parts[1].lower().rstrip("."))
-        if unit is None:
-            return None, None
-        return value, unit
-    return None, None
+# Bare-name alias so every existing call site (_parse_structured_quantity(...))
+# keeps working unchanged — the implementation itself now lives in
+# quantities.py, the single source of truth database.py also imports from.
+_parse_structured_quantity = quantities.parse_structured_quantity
 
 
 def _split_number_and_unit_no_space(text):
@@ -1674,27 +1626,14 @@ def _parse_explicit_clarification_quantity(text):
     return value, unit
 
 
-def format_quantity_display(value, unit):
-    """Format a numeric value+unit for display: comma decimal, no trailing
-    zeros, never scientific notation, never rounds/truncates the value
-    itself — a small nonzero value (e.g. 0.00001) must never be shown as
-    "0". Converts through Decimal(str(value)) rather than Decimal(value)
-    directly to avoid binary-float artifacts when value is a plain float.
-    """
-    if value is None:
-        return ""
-    dec_value = value if isinstance(value, Decimal) else Decimal(str(value))
-    text = format(dec_value.normalize(), "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    if text.lstrip("-") in ("", "0"):
-        text = "0"
-    value_str = text.replace(".", ",")
-    return f"{value_str} {unit}" if unit else value_str
-
-
 def normalize_item_quantity(name, quantity_text, quantity_value=None, quantity_unit=None, allow_default_unit=False, alias_map=None):
     """Compute name/canonical_name/quantity_value/quantity_unit/quantity_inferred/quantity_text for an item.
+
+    Thin wrapper: name/canonical_name come from this module's own
+    resolve_item_name (household alias lookup + product-name synonym
+    rules, out of quantities.py's scope); the quantity fields themselves
+    are computed by quantities.parse_quantity_fields, the single shared
+    implementation database.py's normalize_quantity_fields also calls.
 
     If quantity_value+quantity_unit are already known, they're used as-is.
     Otherwise quantity_text is parsed locally when unambiguous. allow_default_unit=True
@@ -1705,19 +1644,15 @@ def normalize_item_quantity(name, quantity_text, quantity_value=None, quantity_u
     it never affects quantity parsing, which is computed independently below.
     """
     resolved_name, canonical_name = resolve_item_name(name, alias_map or {})
-    inferred = False
     if quantity_value is not None and quantity_unit is not None:
-        value, unit = quantity_value, quantity_unit
+        value, unit, inferred = quantity_value, quantity_unit, False
+        display = quantities.format_quantity_display(value, unit)
     else:
-        value, unit = _parse_structured_quantity(quantity_text)
-        if value is None and not (quantity_text or "").strip() and allow_default_unit:
-            value, unit, inferred = 1.0, "шт.", True
-        elif value is not None and not any(ch.isdigit() for ch in (quantity_text or "")):
-            # Resolved from a non-digit word (e.g. "пара"/"пару") rather than
-            # an explicit number — the whole quantity is an assumption here,
-            # not just the unit (mirrors database.py's normalize_quantity_fields).
-            inferred = True
-    display = format_quantity_display(value, unit) if value is not None else (quantity_text or "").strip()
+        fields = quantities.parse_quantity_fields(quantity_text, allow_default_unit=allow_default_unit)
+        value = fields["quantity_value"]
+        unit = fields["quantity_unit"]
+        inferred = fields["quantity_inferred"]
+        display = fields["quantity_text"]
     return {
         "name": resolved_name,
         "canonical_name": canonical_name,
@@ -1726,42 +1661,6 @@ def normalize_item_quantity(name, quantity_text, quantity_value=None, quantity_u
         "quantity_inferred": inferred,
         "quantity_text": display,
     }
-
-
-def merge_quantity_values(value_a, unit_a, value_b, unit_b):
-    """Return merged (value, unit) if two structured quantities can be safely
-    summed, else None. Both units must be known structured units; either the
-    same unit, or two units from the same conversion group (_UNIT_CONVERSION_
-    GROUPS — mass: г/кг, volume: мл/л). "шт." has no group, so it only merges
-    with itself, never with mass/volume — a count is never quantity-
-    convertible into a weight/volume. The merged result always keeps unit_a
-    (the FIRST/existing quantity's unit) as the display representation, per
-    every caller's convention of passing the existing row first.
-
-    Sums via exact Decimal arithmetic (never binary float directly, each
-    input safely converted through Decimal(str(value))) and never rounds the
-    result — full precision is preserved for NUMERIC storage; only
-    format_quantity_display decides how to show it. Cross-unit conversion is
-    likewise exact: every group factor is a power of 10, so the Decimal
-    division below never loses precision. Returns the merged value as an
-    exact Decimal (never float) — callers must pass it straight through to
-    PostgreSQL's NUMERIC column without any float() round-trip, which would
-    reintroduce binary-float imprecision right before storage.
-    """
-    if value_a is None or value_b is None:
-        return None
-    if unit_a not in STRUCTURED_UNITS or unit_b not in STRUCTURED_UNITS:
-        return None
-    dec_a = value_a if isinstance(value_a, Decimal) else Decimal(str(value_a))
-    dec_b = value_b if isinstance(value_b, Decimal) else Decimal(str(value_b))
-    if unit_a == unit_b:
-        return dec_a + dec_b, unit_a
-    group_a = _UNIT_CONVERSION_GROUPS.get(unit_a)
-    group_b = _UNIT_CONVERSION_GROUPS.get(unit_b)
-    if group_a is None or group_b is None or group_a[0] != group_b[0]:
-        return None
-    converted_b = (dec_b * group_b[1]) / group_a[1]
-    return dec_a + converted_b, unit_a
 
 
 # =========================

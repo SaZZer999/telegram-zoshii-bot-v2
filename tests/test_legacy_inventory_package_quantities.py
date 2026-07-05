@@ -126,7 +126,7 @@ class TestParseInventoryListWithGemini(unittest.TestCase):
             result = bot.parse_inventory_list_with_gemini("0,00011 г шафрану")
         item = result["items"][0]
         self.assertEqual(item["name"], "Шафран")
-        self.assertAlmostEqual(item["quantity_value"], 0.00011)
+        self.assertEqual(item["quantity_value"], Decimal("0.00011"))
         self.assertEqual(item["quantity_unit"], "г")
         self.assertFalse(item["quantity_inferred"])
 
