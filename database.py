@@ -110,7 +110,10 @@ def merge_quantity_values(value_a, unit_a, value_b, unit_b):
     units. Sums via exact Decimal arithmetic (never binary float directly,
     each input safely converted through Decimal(str(value))) and never
     rounds the result — full precision is preserved for NUMERIC storage;
-    only format_quantity_display decides how to show it.
+    only format_quantity_display decides how to show it. Returns the merged
+    value as an exact Decimal (never float) — callers must pass it straight
+    through to PostgreSQL's NUMERIC column without any float() round-trip,
+    which would reintroduce binary-float imprecision right before storage.
     """
     if value_a is None or value_b is None:
         return None
@@ -120,7 +123,7 @@ def merge_quantity_values(value_a, unit_a, value_b, unit_b):
         return None
     dec_a = value_a if isinstance(value_a, Decimal) else Decimal(str(value_a))
     dec_b = value_b if isinstance(value_b, Decimal) else Decimal(str(value_b))
-    return float(dec_a + dec_b), unit_a
+    return dec_a + dec_b, unit_a
 
 
 # =========================

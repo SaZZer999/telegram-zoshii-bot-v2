@@ -86,29 +86,54 @@ class FakeConnection:
 class TestMergeQuantityValuesPrecision(unittest.TestCase):
     """Case 1 — tiny quantities must sum exactly, not round to zero. Checked
     against BOTH existing copies of merge_quantity_values (bot.py and the
-    real database.py)."""
+    real database.py). The merge result is now an exact Decimal (never
+    float again after this follow-up), so every expected value below is
+    compared as a Decimal — not float — to make sure no accidental
+    float() round-trip has crept back in anywhere in the comparison itself."""
 
     def test_bot_copy_sums_tiny_grams_without_rounding_to_zero(self):
         value, unit = bot_merge_quantity_values(0.0001, "г", 0.00001, "г")
         self.assertEqual(unit, "г")
-        self.assertAlmostEqual(value, 0.00011, places=10)
+        self.assertIsInstance(value, Decimal)
+        self.assertEqual(value, Decimal("0.00011"))
         self.assertNotEqual(value, 0)
 
     def test_database_copy_sums_tiny_grams_without_rounding_to_zero(self):
         value, unit = real_database.merge_quantity_values(0.0001, "г", 0.00001, "г")
         self.assertEqual(unit, "г")
-        self.assertAlmostEqual(value, 0.00011, places=10)
+        self.assertIsInstance(value, Decimal)
+        self.assertEqual(value, Decimal("0.00011"))
         self.assertNotEqual(value, 0)
+
+    # Requirement 5 — merge result type is Decimal, not float, for both copies
+    def test_merge_result_is_decimal_not_float(self):
+        value, _ = bot_merge_quantity_values(1.5, "л", 2, "л")
+        self.assertIsInstance(value, Decimal)
+        self.assertNotIsInstance(value, float)
+
+        value_db, _ = real_database.merge_quantity_values(1.5, "л", 2, "л")
+        self.assertIsInstance(value_db, Decimal)
+        self.assertNotIsInstance(value_db, float)
+
+    # Requirement 5 — Decimal("0.1") + Decimal("0.2") must stay exactly
+    # Decimal("0.3"), never the classic binary-float 0.30000000000000004
+    def test_decimal_tenths_plus_two_tenths_is_exact(self):
+        value, unit = bot_merge_quantity_values(Decimal("0.1"), "л", Decimal("0.2"), "л")
+        self.assertEqual(unit, "л")
+        self.assertEqual(value, Decimal("0.3"))
+
+        value_db, _ = real_database.merge_quantity_values(Decimal("0.1"), "л", Decimal("0.2"), "л")
+        self.assertEqual(value_db, Decimal("0.3"))
 
     # Case 4 — ordinary quantities still merge exactly as before
     def test_ordinary_liters_still_merge_correctly(self):
         value, unit = bot_merge_quantity_values(1.5, "л", 2, "л")
         self.assertEqual(unit, "л")
-        self.assertEqual(value, 3.5)
+        self.assertEqual(value, Decimal("3.5"))
 
         value2, unit2 = real_database.merge_quantity_values(1.5, "л", 2, "л")
         self.assertEqual(unit2, "л")
-        self.assertEqual(value2, 3.5)
+        self.assertEqual(value2, Decimal("3.5"))
 
     # Case 5 — incompatible units still refuse to merge
     def test_incompatible_units_still_do_not_merge(self):
@@ -126,10 +151,19 @@ class TestMergeQuantityValuesPrecision(unittest.TestCase):
     def test_decimal_inputs_are_accepted_directly(self):
         value, unit = bot_merge_quantity_values(Decimal("0.0001"), "г", Decimal("0.00001"), "г")
         self.assertEqual(unit, "г")
-        self.assertAlmostEqual(value, 0.00011, places=10)
+        self.assertEqual(value, Decimal("0.00011"))
 
 
 class TestFormatQuantityDisplayPrecision(unittest.TestCase):
+    # Requirement 5 — display of the actual merge result (a Decimal) stays
+    # "0,00011 г", not "0 г" and not scientific notation.
+    def test_merge_result_decimal_displays_as_expected(self):
+        value, unit = bot_merge_quantity_values(0.0001, "г", 0.00001, "г")
+        self.assertEqual(bot_format_quantity_display(value, unit), "0,00011 г")
+
+        value_db, unit_db = real_database.merge_quantity_values(0.0001, "г", 0.00001, "г")
+        self.assertEqual(real_database.format_quantity_display(value_db, unit_db), "0,00011 г")
+
     # Case 2 — small nonzero values never display as "0 г"
     def test_small_nonzero_value_never_shown_as_zero(self):
         self.assertEqual(bot_format_quantity_display(0.0001, "г"), "0,0001 г")
@@ -173,7 +207,8 @@ class TestAutoMergeInPlacePrecision(unittest.TestCase):
         item2 = self._saffron_item("0,00001 г")
         result = _auto_merge_in_place([item1, item2])
         self.assertEqual(len(result), 1)
-        self.assertNotEqual(result[0]["quantity_value"], 0)
+        self.assertIsInstance(result[0]["quantity_value"], Decimal)
+        self.assertEqual(result[0]["quantity_value"], Decimal("0.00011"))
         self.assertEqual(result[0]["quantity_text"], "0,00011 г")
 
 
@@ -198,8 +233,8 @@ class TestInventoryAndShoppingMergeInTxPrecision(unittest.TestCase):
         self.assertIn("UPDATE inventory_items", update_sql)
         quantity_text, quantity_value, quantity_unit = update_params[0], update_params[1], update_params[2]
         self.assertEqual(quantity_text, "0,00011 г")
-        self.assertNotEqual(quantity_value, 0)
-        self.assertAlmostEqual(quantity_value, 0.00011, places=10)
+        self.assertIsInstance(quantity_value, Decimal)
+        self.assertEqual(quantity_value, Decimal("0.00011"))
         self.assertEqual(quantity_unit, "г")
 
     def test_shopping_merge_preserves_tiny_quantity(self):
@@ -217,8 +252,8 @@ class TestInventoryAndShoppingMergeInTxPrecision(unittest.TestCase):
         self.assertIn("UPDATE shopping_items", update_sql)
         quantity_text, quantity_value = update_params[0], update_params[1]
         self.assertEqual(quantity_text, "0,00011 г")
-        self.assertNotEqual(quantity_value, 0)
-        self.assertAlmostEqual(quantity_value, 0.00011, places=10)
+        self.assertIsInstance(quantity_value, Decimal)
+        self.assertEqual(quantity_value, Decimal("0.00011"))
 
 
 if __name__ == '__main__':
