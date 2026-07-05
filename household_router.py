@@ -321,14 +321,80 @@ def _validate_new_item_op(op, alias_map):
     return item
 
 
-def _validate_operations(router_result, inventory_items, recent_expenses, now, alias_map=None):
-    """Validate the global household router's JSON against live snapshots.
+def apply_inventory_representation_guard(add_inventory_items, inventory_items):
+    """Run the Inventory Representation Guard v1 pass over add_inventory_items
+    against a snapshot of existing inventory_items — extracted out of
+    _validate_operations_detailed so it can be re-run on its own later, with
+    a FRESH inventory_items snapshot, once a quantity clarification reply
+    has replaced one item's previously-inferred quantity with an explicit
+    one (see bot.py's pending_inventory_quantity_clarification continuation
+    flow). Never mutates the input list/dicts in place — returns new dicts —
+    so calling it again for the same items is always safe and never re-runs
+    Gemini or re-parses the original message.
+
+    Returns:
+      ("ok", (updated_items, inventory_merge_targets))
+      ("clarify", {"item_name", "canonical_name", "category", "existing_items"})
+          — existing_items is the full list of conflicting rows (see
+          resolve_inventory_representation's own "clarify" docstring).
+    """
+    updated_items = []
+    inventory_merge_targets = []
+    for item in add_inventory_items:
+        item = dict(item)
+        outcome, existing = _bot.resolve_inventory_representation(
+            inventory_items, item.get("canonical_name"), item.get("category"),
+            item.get("quantity_value"), item.get("quantity_unit"), item.get("quantity_inferred", False),
+        )
+        if outcome == "clarify":
+            # Blocks the WHOLE compound preview — never apply the rest of
+            # the operations partially just because one item is ambiguous.
+            return "clarify", {
+                "item_name": item["name"],
+                "canonical_name": item.get("canonical_name"),
+                "category": item.get("category"),
+                "existing_items": existing,
+            }
+        if outcome == "merge":
+            merged_value, merged_unit = _bot.merge_quantity_values(
+                existing["quantity_value"], existing["quantity_unit"],
+                item["quantity_value"], item["quantity_unit"],
+            )
+            item["_representation_outcome"] = "merge"
+            item["_representation_note"] = _bot.format_representation_merge_line(
+                item["name"], existing["quantity_text"], item["quantity_text"],
+                _bot.format_quantity_display(merged_value, merged_unit),
+            )
+            inventory_merge_targets.append({
+                "item_id": existing["id"], "quantity_value": existing["quantity_value"],
+                "quantity_unit": existing["quantity_unit"],
+            })
+        elif outcome == "separate":
+            item["_representation_outcome"] = "separate"
+            item["_representation_note"] = _bot.format_representation_separate_warning(
+                item["name"], existing["quantity_text"], item["quantity_text"],
+            )
+        else:
+            item.pop("_representation_outcome", None)
+            item.pop("_representation_note", None)
+        updated_items.append(item)
+    return "ok", (updated_items, inventory_merge_targets)
+
+
+def _validate_operations_detailed(router_result, inventory_items, recent_expenses, now, alias_map=None):
+    """Same validation as _validate_operations, but the "clarify" outcome
+    carries full structured detail instead of a formatted message — used by
+    build_household_operations_preview (and, through it, bot.py's
+    _try_global_household_router) to set up a continuation state instead of
+    just displaying a dead-end message. _validate_operations itself stays a
+    thin wrapper around this function so its own external contract (and
+    every existing test against it) is completely unchanged.
 
     Returns one of:
       ("ok", payload) — payload has add_shopping_items, add_inventory_items
           (each add_inventory item may carry "_representation_outcome"
           "merge"/"separate" plus a "_representation_note" preview line —
-          see the Inventory Representation Guard v1 pass below),
+          see apply_inventory_representation_guard above),
           inventory_merge_targets ([{item_id, quantity_value, quantity_unit}]
           snapshots for every "merge" outcome, to be folded into the
           caller's inventory_targets so confirm-time re-verifies them),
@@ -337,10 +403,15 @@ def _validate_operations(router_result, inventory_items, recent_expenses, now, a
           snapshot + display label).
       ("unresolved", [fragment_str, ...]) — blocks the entire result.
       ("invalid", [reason_str, ...]) — blocks the entire result.
-      ("clarify", message_str) — an inferred incoming inventory quantity
-          conflicts with an existing row's representation; blocks the
-          entire result (never a partial apply) and asks the user to state
-          an explicit quantity instead of guessing.
+      ("clarify", {"item_name", "canonical_name", "category", "existing_items",
+                    "add_shopping_items", "add_inventory_items",
+                    "consume_changes", "new_expense", "delete_expense"})
+          — an inferred incoming inventory quantity conflicts with an
+          existing row's representation; blocks the entire result (never a
+          partial apply). Carries every operation already validated up to
+          that point, so a caller can resolve the ambiguous quantity later
+          and re-run apply_inventory_representation_guard without redoing
+          any of this work or re-calling Gemini.
       ("none", None)
     """
     fragments = router_result.get("unresolved_fragments")
@@ -495,39 +566,18 @@ def _validate_operations(router_result, inventory_items, recent_expenses, now, a
     # Inventory Representation Guard v1 — runs on the FINAL (already
     # RAM-deduplicated) add_inventory_items, once per distinct product, so a
     # message mentioning the same product twice is checked against the live
-    # inventory exactly once, using its combined quantity. Checks every
-    # existing row sharing canonical_name (not just the first) via
-    # _bot.resolve_inventory_representation — never a silent merge/duplicate
-    # on a unit mismatch.
-    inventory_merge_targets = []
-    for item in add_inventory_items:
-        outcome, existing = _bot.resolve_inventory_representation(
-            inventory_items, item.get("canonical_name"), item.get("category"),
-            item.get("quantity_value"), item.get("quantity_unit"), item.get("quantity_inferred", False),
-        )
-        if outcome == "clarify":
-            # Blocks the WHOLE compound preview — never apply the rest of
-            # the operations partially just because one item is ambiguous.
-            return "clarify", _bot.format_representation_clarify_message(item["name"], existing)
-        if outcome == "merge":
-            merged_value, merged_unit = _bot.merge_quantity_values(
-                existing["quantity_value"], existing["quantity_unit"],
-                item["quantity_value"], item["quantity_unit"],
-            )
-            item["_representation_outcome"] = "merge"
-            item["_representation_note"] = _bot.format_representation_merge_line(
-                item["name"], existing["quantity_text"], item["quantity_text"],
-                _bot.format_quantity_display(merged_value, merged_unit),
-            )
-            inventory_merge_targets.append({
-                "item_id": existing["id"], "quantity_value": existing["quantity_value"],
-                "quantity_unit": existing["quantity_unit"],
-            })
-        elif outcome == "separate":
-            item["_representation_outcome"] = "separate"
-            item["_representation_note"] = _bot.format_representation_separate_warning(
-                item["name"], existing["quantity_text"], item["quantity_text"],
-            )
+    # inventory exactly once, using its combined quantity.
+    guard_kind, guard_result = apply_inventory_representation_guard(add_inventory_items, inventory_items)
+    if guard_kind == "clarify":
+        return "clarify", {
+            **guard_result,
+            "add_shopping_items": add_shopping_items,
+            "add_inventory_items": add_inventory_items,
+            "consume_changes": consume_changes,
+            "new_expense": new_expense,
+            "delete_expense": delete_expense,
+        }
+    add_inventory_items, inventory_merge_targets = guard_result
 
     if not add_shopping_items and not add_inventory_items and not consume_changes and not new_expense and not delete_expense:
         return "invalid", ["Не знайшов жодної дії для виконання."]
@@ -540,6 +590,32 @@ def _validate_operations(router_result, inventory_items, recent_expenses, now, a
         "delete_expense": delete_expense,
         "inventory_merge_targets": inventory_merge_targets,
     }
+
+
+def _validate_operations(router_result, inventory_items, recent_expenses, now, alias_map=None):
+    """Validate the global household router's JSON against live snapshots.
+
+    Thin wrapper around _validate_operations_detailed that formats its
+    structured "clarify" payload down to a plain message string — this is
+    the exact same external contract this function has always had, kept
+    unchanged on purpose so every existing caller/test of THIS function
+    (as opposed to build_household_operations_preview, which calls the
+    detailed version directly) keeps working without modification.
+
+    Returns one of:
+      ("ok", payload) — see _validate_operations_detailed.
+      ("unresolved", [fragment_str, ...]) — blocks the entire result.
+      ("invalid", [reason_str, ...]) — blocks the entire result.
+      ("clarify", message_str) — an inferred incoming inventory quantity
+          conflicts with an existing row's representation; blocks the
+          entire result (never a partial apply) and asks the user to state
+          an explicit quantity instead of guessing.
+      ("none", None)
+    """
+    kind, result = _validate_operations_detailed(router_result, inventory_items, recent_expenses, now, alias_map=alias_map)
+    if kind == "clarify":
+        return "clarify", _bot.format_representation_clarify_message(result["item_name"], result["existing_items"])
+    return kind, result
 
 
 # =========================
@@ -637,4 +713,10 @@ def build_household_operations_preview(text, shopping_items, inventory_items, re
     router_result = _ask_gemini_household_router(
         text, now_context, shopping_items, inventory_items, recent_expenses, alias_map=alias_map,
     )
-    return _validate_operations(router_result, inventory_items, recent_expenses, now, alias_map=alias_map)
+    # Uses the _detailed variant (not _validate_operations itself) so a
+    # "clarify" outcome carries full structured detail — see
+    # _validate_operations_detailed's docstring — which bot.py's
+    # _try_global_household_router needs to set up
+    # pending_inventory_quantity_clarification instead of just displaying a
+    # dead-end message.
+    return _validate_operations_detailed(router_result, inventory_items, recent_expenses, now, alias_map=alias_map)

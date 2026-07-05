@@ -114,6 +114,18 @@ expense_delete_selection = expenses.expense_delete_selection
 pending_global_household = {}  # chat_id -> {add_shopping_items, add_inventory_items,
                                 #             consume_changes, new_expense, delete_expense,
                                 #             inventory_targets, household_id, user_db_id, origin}
+# Inventory Quantity Clarification v1 — short-lived RAM-only continuation
+# state for the ONE case where the Global Household Router blocked the
+# whole request because an inferred incoming inventory quantity conflicted
+# with every existing representation of that product (see
+# household_router.apply_inventory_representation_guard's "clarify"
+# outcome). Holds only structured data, never raw text/Gemini history, so
+# the next plain-text reply (e.g. "1Л") can safely continue the ORIGINAL
+# command instead of falling through to general AI-chat.
+pending_inventory_quantity_clarification = {}  # chat_id -> {household_id, user_db_id, origin,
+                                #             item_name, canonical_name, category,
+                                #             add_shopping_items, add_inventory_items,
+                                #             consume_changes, new_expense, delete_expense}
 
 # Every OTHER flow's pending preview/confirm state — deliberately excludes
 # pending_alias_action itself (a new global alias command is allowed to
@@ -133,6 +145,10 @@ _ALIAS_GATE_BLOCKING_PENDING_STATES = (
     # blocking tuple, all built by extending this one, also treats it as an
     # active preview to defer to.
     pending_global_household,
+    # Inventory Quantity Clarification v1's own continuation state — same
+    # reasoning: while active, no other gate/flow may start a new preview,
+    # touch the database, or reach general AI-chat.
+    pending_inventory_quantity_clarification,
 )
 
 
@@ -1520,6 +1536,48 @@ def _parse_structured_quantity(quantity_text):
     return None, None
 
 
+def _split_number_and_unit_no_space(text):
+    """Insert a space between a leading numeral and an immediately-following
+    unit word (e.g. "1Л" -> "1 Л", "500мл" -> "500 мл") so a plain
+    number+unit reply can be split like any other structured quantity.
+    Only touches a single leading numeral+unit token — never guesses at
+    anything more complex; returns text unchanged if it doesn't match."""
+    match = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s*([^\d\s]+)\s*$", text or "")
+    if match:
+        return f"{match.group(1)} {match.group(2)}"
+    return text
+
+
+def _parse_explicit_clarification_quantity(text):
+    """Parse an Inventory Quantity Clarification reply (see
+    pending_inventory_quantity_clarification) into an explicit
+    (Decimal value, unit) pair, or (None, None) if the reply isn't an
+    unambiguous number+unit. Deliberately NEVER falls back to the bare-
+    number-defaults-to-"шт." behavior _parse_structured_quantity's own
+    single-token branch has for other flows — a clarification reply's whole
+    purpose is to remove an inferred guess, so the unit must always be
+    explicit here (a bare "2" is rejected, "2 шт." is accepted). Handles
+    both spaced ("1 л") and unspaced ("1Л") forms; comma or dot decimals.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return None, None
+    normalized = _split_number_and_unit_no_space(stripped).replace(",", ".")
+    parts = normalized.split()
+    if len(parts) != 2:
+        return None, None
+    try:
+        value = Decimal(parts[0])
+    except InvalidOperation:
+        return None, None
+    if value <= 0:
+        return None, None
+    unit = _UNIT_ALIASES.get(parts[1].lower().rstrip("."))
+    if unit is None:
+        return None, None
+    return value, unit
+
+
 def format_quantity_display(value, unit):
     """Format a numeric value+unit for display: comma decimal, no trailing
     zeros, never scientific notation, never rounds/truncates the value
@@ -1715,6 +1773,32 @@ def format_representation_clarify_message(name, existing_items):
     lines.append("Не хочу вгадувати, до якого запису додати нову покупку.")
     lines.append(f"Напиши точну кількість, наприклад: «Купив 1 л {name.lower()}».")
     return "\n".join(lines)
+
+
+def format_global_quantity_clarification_message(name, existing_items):
+    """Clarification message for the Global Household Router's Inventory
+    Quantity Clarification v1 continuation flow (pending_inventory_
+    quantity_clarification) — deliberately separate wording from
+    format_representation_clarify_message (which stays used, unchanged, by
+    the normal/legacy "➕ Додати продукти" add flow): since the next reply
+    here continues the ORIGINAL command instead of restating it in full,
+    the example shows a bare quantity, not "Купив 1 л X"."""
+    if len(existing_items) == 1:
+        lines = [f"У запасах уже є «{name} — {existing_items[0]['quantity_text']}».", ""]
+    else:
+        lines = [f"У запасах уже є кілька записів «{name}»:", ""]
+        for item in existing_items:
+            lines.append(f"• {item['quantity_text']}")
+        lines.append("")
+    lines.append("Не хочу вгадувати, до якого запису додати нову покупку.")
+    lines.append("Напиши точну кількість, наприклад: «1 л» або «500 мл».")
+    return "\n".join(lines)
+
+
+_GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG = (
+    "Потрібна точна кількість з одиницею.\n\n"
+    "Напиши, наприклад: «1 л», «500 мл» або «2 шт.»."
+)
 
 
 def format_representation_separate_warning(name, existing_display, incoming_display):
@@ -3538,9 +3622,28 @@ def _try_global_household_router(chat_id, user_id, display_name, text):
         if kind == "clarify":
             # Inventory Representation Guard: an inferred incoming quantity
             # conflicts with an existing row's representation — block the
-            # whole compound preview, nothing is written, ask for an
-            # explicit quantity instead of guessing.
-            send_message(chat_id, payload, reply_markup=keyboard)
+            # whole compound preview, nothing is written, and start the
+            # Inventory Quantity Clarification v1 continuation state instead
+            # of a dead-end message, so the next plain-text reply (e.g.
+            # "1Л") can safely continue THIS command.
+            pending_inventory_quantity_clarification[chat_id] = {
+                "household_id": household_id,
+                "user_db_id": user_db_id,
+                "origin": origin,
+                "item_name": payload["item_name"],
+                "canonical_name": payload["canonical_name"],
+                "category": payload["category"],
+                "add_shopping_items": payload["add_shopping_items"],
+                "add_inventory_items": payload["add_inventory_items"],
+                "consume_changes": payload["consume_changes"],
+                "new_expense": payload["new_expense"],
+                "delete_expense": payload["delete_expense"],
+            }
+            send_message(
+                chat_id,
+                format_global_quantity_clarification_message(payload["item_name"], payload["existing_items"]),
+                reply_markup=keyboard,
+            )
             return True
         # kind == "ok"
         inventory_targets = _snapshot_targets(payload["consume_changes"]) + payload["inventory_merge_targets"]
@@ -3603,6 +3706,108 @@ def _apply_global_household_confirm(chat_id):
         send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=keyboard)
     except Exception:
         send_message(chat_id, "Не вдалося застосувати зміни. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+
+
+def _continue_inventory_quantity_clarification(chat_id, text):
+    """Handle a plain-text reply while pending_inventory_quantity_
+    clarification is active for this chat (Inventory Quantity Clarification
+    v1). Never re-calls Gemini and never hand-builds a sentence to send back
+    through the router — works entirely off the structured payload captured
+    when the clarification started. Always returns having fully handled the
+    message (the caller must not fall through to anything else)."""
+    data = pending_inventory_quantity_clarification[chat_id]
+    value, unit = _parse_explicit_clarification_quantity(text)
+    if value is None or unit is None:
+        send_message(chat_id, _GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG)
+        return
+
+    household_id = data["household_id"]
+    keyboard = household_router.origin_keyboard(data.get("origin", "global"))
+    canonical_name = data["canonical_name"]
+    category = data["category"]
+
+    try:
+        add_inventory_items = data["add_inventory_items"]
+        match_index = next(
+            (i for i, it in enumerate(add_inventory_items)
+             if it.get("canonical_name") == canonical_name and it.get("category") == category),
+            None,
+        )
+        if match_index is None:
+            pending_inventory_quantity_clarification.pop(chat_id, None)
+            send_message(chat_id, "Не зміг безпечно продовжити цю дію. Спробуй написати команду ще раз.", reply_markup=keyboard)
+            return
+
+        resolved_item = dict(add_inventory_items[match_index])
+        resolved_item["quantity_value"] = value
+        resolved_item["quantity_unit"] = unit
+        resolved_item["quantity_text"] = format_quantity_display(value, unit)
+        resolved_item["quantity_inferred"] = False
+        resolved_item.pop("_representation_outcome", None)
+        resolved_item.pop("_representation_note", None)
+        updated_items = list(add_inventory_items)
+        updated_items[match_index] = resolved_item
+
+        # Свіжий стан: re-fetch inventory now, never reuse the snapshot
+        # shown when the clarification question was asked — a conflicting
+        # row could have appeared (or disappeared) in the meantime.
+        fresh_inventory_items = get_inventory_items(household_id)
+        guard_kind, guard_result = household_router.apply_inventory_representation_guard(
+            updated_items, fresh_inventory_items,
+        )
+
+        if guard_kind == "clarify":
+            # Still ambiguous (possibly a DIFFERENT item this time) — never
+            # build a preview or apply anything; keep clarifying with the
+            # freshest representation list instead of a dead end.
+            pending_inventory_quantity_clarification[chat_id] = {
+                "household_id": household_id,
+                "user_db_id": data["user_db_id"],
+                "origin": data.get("origin", "global"),
+                "item_name": guard_result["item_name"],
+                "canonical_name": guard_result["canonical_name"],
+                "category": guard_result["category"],
+                "add_shopping_items": data["add_shopping_items"],
+                "add_inventory_items": updated_items,
+                "consume_changes": data["consume_changes"],
+                "new_expense": data["new_expense"],
+                "delete_expense": data["delete_expense"],
+            }
+            send_message(
+                chat_id,
+                format_global_quantity_clarification_message(guard_result["item_name"], guard_result["existing_items"]),
+            )
+            return
+
+        # guard_kind == "ok" — resolved cleanly; build the normal combined
+        # preview exactly like a fresh (non-clarification) Global Router
+        # "ok" result would.
+        pending_inventory_quantity_clarification.pop(chat_id, None)
+        final_items, inventory_merge_targets = guard_result
+        payload = {
+            "add_shopping_items": data["add_shopping_items"],
+            "add_inventory_items": final_items,
+            "consume_changes": data["consume_changes"],
+            "new_expense": data["new_expense"],
+            "delete_expense": data["delete_expense"],
+            "inventory_merge_targets": inventory_merge_targets,
+        }
+        inventory_targets = _snapshot_targets(payload["consume_changes"]) + payload["inventory_merge_targets"]
+        pending_global_household[chat_id] = {
+            "add_shopping_items": payload["add_shopping_items"],
+            "add_inventory_items": payload["add_inventory_items"],
+            "consume_changes": payload["consume_changes"],
+            "inventory_targets": inventory_targets,
+            "new_expense": payload["new_expense"],
+            "delete_expense": payload["delete_expense"],
+            "household_id": household_id,
+            "user_db_id": data["user_db_id"],
+            "origin": data.get("origin", "global"),
+        }
+        send_message(chat_id, household_router.format_preview(payload), reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+    except Exception:
+        pending_inventory_quantity_clarification.pop(chat_id, None)
+        send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
 
 
 @app.route("/")
@@ -3784,6 +3989,10 @@ def webhook():
             data = pending_global_household.pop(chat_id, None)
             origin = (data or {}).get("origin", "global")
             send_message(chat_id, "Зміни скасовано.", reply_markup=household_router.origin_keyboard(origin))
+        elif chat_id in pending_inventory_quantity_clarification:
+            data = pending_inventory_quantity_clarification.pop(chat_id, None)
+            origin = (data or {}).get("origin", "global")
+            send_message(chat_id, "Уточнення скасовано.", reply_markup=household_router.origin_keyboard(origin))
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
@@ -4113,6 +4322,7 @@ def webhook():
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         clear_list_context(chat_id)
+        pending_inventory_quantity_clarification.pop(chat_id, None)
         send_message(
             chat_id,
             "Привіт! Я твій домашній помічник 🏠\n\n"
@@ -4127,6 +4337,7 @@ def webhook():
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         clear_list_context(chat_id)
+        pending_inventory_quantity_clarification.pop(chat_id, None)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -4213,6 +4424,7 @@ def webhook():
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         clear_list_context(chat_id)
+        pending_inventory_quantity_clarification.pop(chat_id, None)
         send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
         return "ok"
 
@@ -4694,6 +4906,18 @@ def webhook():
         # router, replace the pending preview, touch the database, or reach
         # general AI-chat — the preview must be confirmed or cancelled first.
         send_message(chat_id, EXPENSE_PREVIEW_GUARD_MSG)
+        _preview_intercepted = True
+
+    elif chat_id in pending_inventory_quantity_clarification:
+        # Inventory Quantity Clarification v1: the Global Household Router
+        # blocked the original command because an inferred quantity
+        # conflicted with every existing representation of that product —
+        # this reply (e.g. "1Л") continues that ORIGINAL command instead of
+        # reaching the router gate below, legacy flows, the database, or
+        # general AI-chat. The confirm/cancel button texts for a preview
+        # this might eventually produce are handled earlier, before this
+        # chain, same as every other pending-state branch here.
+        _continue_inventory_quantity_clarification(chat_id, text)
         _preview_intercepted = True
 
     elif chat_id in pending_global_household:
