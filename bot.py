@@ -3593,6 +3593,65 @@ def format_batch_preview(items, ignored_items=None):
 # of its own); this function only fetches the live snapshots it needs,
 # stores pending_global_household, and sends the resulting message.
 # =========================
+def _handle_household_router_result(chat_id, kind, payload, household_id, user_db_id, origin, keyboard):
+    """Shared tail for both _try_global_household_router and
+    _try_global_explicit_add — both call a household_router builder that
+    returns the exact same (kind, payload) shape, so the unresolved/
+    invalid/clarify/ok dispatch (preview, pending_global_household,
+    Inventory Quantity Clarification v1 continuation state) only needs to
+    exist once. Always returns True (message fully handled) — "none" is
+    handled by each caller itself, before this function is ever called,
+    since what counts as "nothing to do" differs slightly between them.
+    """
+    if kind == "unresolved":
+        send_message(chat_id, household_router.format_unresolved_message(payload), reply_markup=keyboard)
+        return True
+    if kind == "invalid":
+        send_message(chat_id, household_router.format_invalid_message(payload), reply_markup=keyboard)
+        return True
+    if kind == "clarify":
+        # Inventory Representation Guard: an inferred incoming quantity
+        # conflicts with an existing row's representation — block the
+        # whole compound preview, nothing is written, and start the
+        # Inventory Quantity Clarification v1 continuation state instead
+        # of a dead-end message, so the next plain-text reply (e.g.
+        # "1Л") can safely continue THIS command.
+        pending_inventory_quantity_clarification[chat_id] = {
+            "household_id": household_id,
+            "user_db_id": user_db_id,
+            "origin": origin,
+            "item_name": payload["item_name"],
+            "canonical_name": payload["canonical_name"],
+            "category": payload["category"],
+            "add_shopping_items": payload["add_shopping_items"],
+            "add_inventory_items": payload["add_inventory_items"],
+            "consume_changes": payload["consume_changes"],
+            "new_expense": payload["new_expense"],
+            "delete_expense": payload["delete_expense"],
+        }
+        send_message(
+            chat_id,
+            format_global_quantity_clarification_message(payload["item_name"], payload["existing_items"]),
+            reply_markup=keyboard,
+        )
+        return True
+    # kind == "ok"
+    inventory_targets = _snapshot_targets(payload["consume_changes"]) + payload["inventory_merge_targets"]
+    pending_global_household[chat_id] = {
+        "add_shopping_items": payload["add_shopping_items"],
+        "add_inventory_items": payload["add_inventory_items"],
+        "consume_changes": payload["consume_changes"],
+        "inventory_targets": inventory_targets,
+        "new_expense": payload["new_expense"],
+        "delete_expense": payload["delete_expense"],
+        "household_id": household_id,
+        "user_db_id": user_db_id,
+        "origin": origin,
+    }
+    send_message(chat_id, household_router.format_preview(payload), reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+    return True
+
+
 def _try_global_household_router(chat_id, user_id, display_name, text):
     """Returns True if the message was fully handled (a preview, an
     unresolved/invalid clarification, or an error message was sent) — the
@@ -3613,53 +3672,36 @@ def _try_global_household_router(chat_id, user_id, display_name, text):
         )
         if kind == "none":
             return False
-        if kind == "unresolved":
-            send_message(chat_id, household_router.format_unresolved_message(payload), reply_markup=keyboard)
-            return True
-        if kind == "invalid":
-            send_message(chat_id, household_router.format_invalid_message(payload), reply_markup=keyboard)
-            return True
-        if kind == "clarify":
-            # Inventory Representation Guard: an inferred incoming quantity
-            # conflicts with an existing row's representation — block the
-            # whole compound preview, nothing is written, and start the
-            # Inventory Quantity Clarification v1 continuation state instead
-            # of a dead-end message, so the next plain-text reply (e.g.
-            # "1Л") can safely continue THIS command.
-            pending_inventory_quantity_clarification[chat_id] = {
-                "household_id": household_id,
-                "user_db_id": user_db_id,
-                "origin": origin,
-                "item_name": payload["item_name"],
-                "canonical_name": payload["canonical_name"],
-                "category": payload["category"],
-                "add_shopping_items": payload["add_shopping_items"],
-                "add_inventory_items": payload["add_inventory_items"],
-                "consume_changes": payload["consume_changes"],
-                "new_expense": payload["new_expense"],
-                "delete_expense": payload["delete_expense"],
-            }
-            send_message(
-                chat_id,
-                format_global_quantity_clarification_message(payload["item_name"], payload["existing_items"]),
-                reply_markup=keyboard,
-            )
-            return True
-        # kind == "ok"
-        inventory_targets = _snapshot_targets(payload["consume_changes"]) + payload["inventory_merge_targets"]
-        pending_global_household[chat_id] = {
-            "add_shopping_items": payload["add_shopping_items"],
-            "add_inventory_items": payload["add_inventory_items"],
-            "consume_changes": payload["consume_changes"],
-            "inventory_targets": inventory_targets,
-            "new_expense": payload["new_expense"],
-            "delete_expense": payload["delete_expense"],
-            "household_id": household_id,
-            "user_db_id": user_db_id,
-            "origin": origin,
-        }
-        send_message(chat_id, household_router.format_preview(payload), reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+        return _handle_household_router_result(chat_id, kind, payload, household_id, user_db_id, origin, keyboard)
+    except Exception:
+        send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
         return True
+
+
+def _try_global_explicit_add(chat_id, user_id, display_name, text):
+    """Global Explicit Add v1 — a message with an EXPLICIT destination
+    phrase ("Додай до покупок ...", "Додай в запаси ...", see
+    household_router.detect_explicit_add_destination) adds to that list
+    regardless of which menu is open. Returns True if handled (a preview,
+    clarification, or invalid/unresolved message was sent). Returns False
+    only when no explicit destination phrase is present at all, letting
+    the caller fall through to the existing legacy gates/AI-chat exactly
+    as before this route existed — this is the ONLY case bare "Додай
+    молоко" (no destination) ever hits, so its behavior is untouched.
+    """
+    destination, item_text = household_router.detect_explicit_add_destination(text)
+    if destination is None:
+        return False
+    origin = household_router.current_origin(chat_id)
+    keyboard = household_router.origin_keyboard(origin)
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        inventory_items = get_inventory_items(household_id) if destination == "add_inventory" else []
+        alias_map = get_household_alias_map(household_id)
+        kind, payload = household_router.build_explicit_add_preview(
+            destination, item_text, inventory_items, alias_map=alias_map,
+        )
+        return _handle_household_router_result(chat_id, kind, payload, household_id, user_db_id, origin, keyboard)
     except Exception:
         send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
         return True
@@ -4931,6 +4973,20 @@ def webhook():
         # pending preview, touch the database, or reach general AI-chat
         # while a plan of changes is still awaiting confirmation.
         send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        _preview_intercepted = True
+
+    elif (
+        not _has_blocking_pending_state_for_reports(chat_id)
+        and _try_global_explicit_add(chat_id, user_id, display_name, text)
+    ):
+        # Global Explicit Add v1 — a message with an EXPLICIT destination
+        # phrase ("Додай до покупок ...", "Додай в запаси ...", see
+        # household_router.detect_explicit_add_destination) adds to that
+        # list regardless of which menu is open. Checked ahead of the
+        # household_router gate below so an explicit destination always
+        # wins; _try_global_explicit_add itself returns False when no such
+        # phrase is present at all, falling through unchanged to every gate
+        # below exactly as before this route existed.
         _preview_intercepted = True
 
     elif (

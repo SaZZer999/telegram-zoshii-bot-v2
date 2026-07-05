@@ -720,3 +720,192 @@ def build_household_operations_preview(text, shopping_items, inventory_items, re
     # pending_inventory_quantity_clarification instead of just displaying a
     # dead-end message.
     return _validate_operations_detailed(router_result, inventory_items, recent_expenses, now, alias_map=alias_map)
+
+
+# =========================
+# GLOBAL EXPLICIT ADD v1 — a message with an EXPLICIT, unambiguous
+# destination phrase ("Додай до покупок ...", "Додай в запаси ...") adds to
+# that list regardless of which menu is open. Destination is decided by
+# Python BEFORE any Gemini call — deterministically, via the fixed phrase
+# list below, never fuzzy matching — so Gemini is only ever asked to
+# extract a plain item list from the ALREADY-cleaned text (destination
+# phrase stripped) via EXPLICIT_ADD_ITEM_PROMPT. That prompt's JSON contract
+# has no operation "type", no expense, no consumption, no deletion field at
+# all — so there is structurally nothing for a misbehaving Gemini response
+# to smuggle in beyond a malformed item (which _validate_explicit_add_items
+# already rejects); build_explicit_add_preview always assigns every parsed
+# item to the ONE destination bucket Python already decided.
+# =========================
+_EXPLICIT_SHOPPING_DESTINATION_RE = re.compile(
+    r"^додай(?:те)?\s+(?:до\s+покупок|у\s+покупки|в\s+список\s+покупок)[:\-]?\s+",
+    re.IGNORECASE,
+)
+_EXPLICIT_INVENTORY_DESTINATION_RE = re.compile(
+    r"^додай(?:те)?\s+(?:в\s+запаси|у\s+запаси|до\s+запасів)[:\-]?\s+",
+    re.IGNORECASE,
+)
+
+
+def detect_explicit_add_destination(text):
+    """Deterministically detect an EXPLICIT shopping/inventory destination
+    phrase at the very start of `text` — the fixed phrase list only (see
+    module docstring above), never fuzzy matching or guessing at intent.
+
+    Returns ("add_shopping"|"add_inventory", item_text) with the phrase
+    already stripped off, or (None, None) if no exact phrase matches, or
+    if nothing but the phrase itself was sent (no item text to parse).
+    """
+    if not isinstance(text, str):
+        return None, None
+    stripped = text.strip()
+    if not stripped:
+        return None, None
+    match = _EXPLICIT_SHOPPING_DESTINATION_RE.match(stripped)
+    if match:
+        rest = stripped[match.end():].strip()
+        return ("add_shopping", rest) if rest else (None, None)
+    match = _EXPLICIT_INVENTORY_DESTINATION_RE.match(stripped)
+    if match:
+        rest = stripped[match.end():].strip()
+        return ("add_inventory", rest) if rest else (None, None)
+    return None, None
+
+
+EXPLICIT_ADD_ITEM_PROMPT = (
+    "Розбий текст на список товарів для додавання. Це ЛИШЕ список товарів — ніколи не вигадуй суми грошей, "
+    "витрати чи списання, навіть якщо текст на це схожий; якщо щось таке трапляється, опиши весь цей "
+    "фрагмент у unresolved_fragments і не вигадуй для нього товар.\n"
+    "Кожен товар має: name (сама назва, БЕЗ жодних слів про кількість чи тару), quantity_text (кількість як "
+    "у тексті, або порожній рядок якщо кількість не вказана), category — одна з фіксованих категорій нижче.\n"
+    "Правила відокремлення кількості від назви: якщо кількість — просто число без одиниці («2 банани») — "
+    "quantity_text рівно «2», name — «Банани» (без числа). Якщо кількість — слово «пара»/«пару» («пару "
+    "сосисок») — quantity_text рівно «пара» чи «пару» (як у тексті), name — «Сосиски» (без слова «пара»). "
+    "Якщо кількість описана через тару («дві пачки сосисок») — усю фразу кількості («дві пачки») клади в "
+    "quantity_text, а name — лише сам товар («Сосиски»); НІКОЛИ не залишай слова «пачка»/«упаковка»/"
+    "числівники всередині name. Якщо безпечно відокремити кількість від назви не вдається — постав "
+    "quantity_text порожнім рядком і опиши весь фрагмент у unresolved_fragments, а не вигадуй назву.\n"
+    "Категорії: М'ясо та риба, Молочне та яйця, Овочі та зелень, Фрукти та ягоди, Хліб і випічка, "
+    "Крупи, макарони та борошно, Соуси, спеції та бакалія, Солодке та снеки, Напої, Заморожене, "
+    "Інше їстівне.\n"
+    "Якщо частину тексту не можна безпечно перетворити на товар — опиши цей фрагмент у unresolved_fragments "
+    "(масив рядків) і НЕ вигадуй товар для нього. Завжди повертай це поле, навіть порожнім масивом.\n\n"
+    "Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON:\n"
+    '{"items":[{"name":"Молоко","quantity_text":"","category":"Молочне та яйця"},'
+    '{"name":"Хліб","quantity_text":"","category":"Хліб і випічка"}],"unresolved_fragments":[]}'
+)
+
+_EXPLICIT_ADD_FALLBACK = {"items": [], "unresolved_fragments": []}
+
+
+def _ask_gemini_explicit_add_items(item_text):
+    """ONE Gemini call for Global Explicit Add v1 — item_text already has
+    the destination phrase stripped off by detect_explicit_add_destination.
+    The JSON contract here (items + unresolved_fragments only) has no
+    concept of destination, expense, consumption, or deletion at all."""
+    raw = _bot.call_gemini([{"role": "user", "content": item_text}], EXPLICIT_ADD_ITEM_PROMPT, temperature=0.1)
+    if not raw:
+        return dict(_EXPLICIT_ADD_FALLBACK)
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
+        if m:
+            cleaned = m.group(1).strip()
+    try:
+        data = json.loads(cleaned)
+        return {
+            "items": data.get("items") if isinstance(data.get("items"), list) else [],
+            "unresolved_fragments": (
+                data.get("unresolved_fragments") if isinstance(data.get("unresolved_fragments"), list) else []
+            ),
+        }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return dict(_EXPLICIT_ADD_FALLBACK)
+
+
+def _validate_explicit_add_items(items_raw, alias_map):
+    """Validate a list of raw {name, quantity_text, category} dicts from
+    _ask_gemini_explicit_add_items into normalized item dicts (same shape
+    _validate_new_item_op produces for the main router). Returns None if
+    ANY entry is malformed or still leaks a quantity/container phrase into
+    name — the whole explicit-add request is rejected rather than silently
+    dropping just the one bad item."""
+    result = []
+    for op in items_raw:
+        if not isinstance(op, dict):
+            return None
+        leaked_name = op.get("name")
+        if isinstance(leaked_name, str) and _looks_like_leaked_quantity_phrase(leaked_name):
+            return None
+        item = _validate_new_item_op(op, alias_map)
+        if item is None:
+            return None
+        result.append(item)
+    return result
+
+
+def build_explicit_add_preview(destination, item_text, inventory_items, alias_map=None):
+    """Top-level entry point for Global Explicit Add v1. `destination`
+    ("add_shopping" or "add_inventory") and `item_text` (destination phrase
+    already stripped) come from detect_explicit_add_destination — Gemini
+    never sees the original destination phrase and never decides or
+    changes the destination itself.
+
+    Returns the exact same (kind, payload) shape as
+    _validate_operations_detailed (see its docstring): ("ok", payload) /
+    ("unresolved", [...]) / ("invalid", [...]) / ("clarify", {...}). Never
+    returns "none" — once an explicit destination phrase with non-empty
+    item text has been detected, the request is always either fulfilled or
+    explicitly rejected, never silently ignored.
+    """
+    if expenses._EXPENSE_AMOUNT_RE.search(item_text):
+        return "invalid", [
+            "Для покупки з витратою напиши, наприклад:\n«Купив молоко за 10 zł»."
+        ]
+
+    router_result = _ask_gemini_explicit_add_items(item_text)
+    fragments = router_result.get("unresolved_fragments")
+    if isinstance(fragments, list):
+        cleaned_fragments = [str(f).strip() for f in fragments if str(f).strip()]
+        if cleaned_fragments:
+            return "unresolved", cleaned_fragments
+
+    raw_items = router_result.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        return "invalid", ["Не зміг розпізнати жодного товару в повідомленні."]
+
+    validated = _validate_explicit_add_items(raw_items, alias_map)
+    if validated is None:
+        return "invalid", ["Не зміг безпечно розпізнати товар."]
+
+    if destination == "add_shopping":
+        add_shopping_items = _bot._auto_merge_in_place(validated)
+        return "ok", {
+            "add_shopping_items": add_shopping_items,
+            "add_inventory_items": [],
+            "consume_changes": [],
+            "new_expense": None,
+            "delete_expense": None,
+            "inventory_merge_targets": [],
+        }
+
+    # destination == "add_inventory"
+    add_inventory_items = _bot._auto_merge_in_place(validated)
+    guard_kind, guard_result = apply_inventory_representation_guard(add_inventory_items, inventory_items)
+    if guard_kind == "clarify":
+        return "clarify", {
+            **guard_result,
+            "add_shopping_items": [],
+            "add_inventory_items": add_inventory_items,
+            "consume_changes": [],
+            "new_expense": None,
+            "delete_expense": None,
+        }
+    add_inventory_items, inventory_merge_targets = guard_result
+    return "ok", {
+        "add_shopping_items": [],
+        "add_inventory_items": add_inventory_items,
+        "consume_changes": [],
+        "new_expense": None,
+        "delete_expense": None,
+        "inventory_merge_targets": inventory_merge_targets,
+    }
