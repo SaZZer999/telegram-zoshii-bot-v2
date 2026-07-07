@@ -79,6 +79,7 @@ from list_editing import _compute_merged_quantity, _apply_pending_merge
 import legacy_shopping_flow
 import legacy_inventory_flow
 import message_dispatcher
+import interaction_state
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -200,113 +201,29 @@ pending_add_destination_clarification = {}  # chat_id -> {household_id, user_db_
 # apply_undo_action's own transaction, never trusted from this dict.
 pending_undo_action = {}  # chat_id -> {action_id, household_id, user_db_id}
 
-# Every OTHER flow's pending preview/confirm state — deliberately excludes
-# pending_alias_action itself (a new global alias command is allowed to
-# overwrite an already-pending alias action, same as the dedicated aliases
-# submenu already does) and pending_batch/pending_inventory_batch/
-# pending_inventory_reconciliation_clarify (already checked earlier in the
-# same if/elif chain the gate lives in, so reaching the gate already implies
-# they're inactive for this chat — listed anyway for robustness against
-# future reordering).
-_ALIAS_GATE_BLOCKING_PENDING_STATES = (
-    pending_batch, pending_inventory_batch, pending_mark_batch, pending_delete_batch,
-    pending_remove_batch, pending_merge, pending_saved_edit, pending_quick_purchase,
-    pending_inventory_consumption, pending_compound_inventory,
-    pending_inventory_reconciliation, pending_inventory_reconciliation_clarify,
-    # The Global Household Router's own combined preview — added here (rather
-    # than only to the report-gate tuple below) so every other gate's
-    # blocking tuple, all built by extending this one, also treats it as an
-    # active preview to defer to.
-    pending_global_household,
-    # Inventory Quantity Clarification v1's own continuation state — same
-    # reasoning: while active, no other gate/flow may start a new preview,
-    # touch the database, or reach general AI-chat.
-    pending_inventory_quantity_clarification,
-    # Inventory Representation Clarification V2's own continuation state —
-    # same reasoning: while a count-vs-mass/volume conflict is unresolved,
-    # no other gate/flow may start a new preview, touch the database, or
-    # reach general AI-chat.
-    pending_inventory_representation_clarification,
-    # Global Bare Add v1's own continuation state — same reasoning: while a
-    # "куди додати?" question is unanswered, no other gate/flow may start a
-    # new preview, touch the database, or reach general AI-chat.
-    pending_add_destination_clarification,
-)
-
-
+# Gate-blocking pending-state groups and the guard predicates built on top of
+# them now live in interaction_state.py (called via _interaction_state_deps,
+# built further down once every dict/callback it needs exists) — these are
+# thin compatibility wrappers so every existing call site/test patch of the
+# same name keeps working unchanged.
 def _has_blocking_pending_state(chat_id):
-    """True if some other flow's pending preview/confirm is currently active
-    for this chat — the global alias command gate must never interrupt it."""
-    return any(chat_id in d for d in _ALIAS_GATE_BLOCKING_PENDING_STATES)
-
-
-# Every OTHER flow's pending preview/confirm state that must block the global
-# expense command gate — everything the alias gate already guards against,
-# PLUS an active alias action, PLUS an in-progress expense-deletion flow
-# (selection mode or delete preview). Unlike the alias gate (which deliberately
-# allows a new global alias command to overwrite its own already-pending alias
-# action), the expense-add gate must never override an alias preview or a
-# deletion in progress: per spec, those have priority over a new "add expense"
-# command. pending_expense's own state is deliberately excluded, same
-# reasoning as the alias gate excluding its own.
-_EXPENSE_GATE_BLOCKING_PENDING_STATES = _ALIAS_GATE_BLOCKING_PENDING_STATES + (
-    pending_alias_action, pending_expense_delete, expense_delete_selection,
-)
+    return interaction_state.has_blocking_pending_state(_interaction_state_deps, chat_id)
 
 
 def _has_blocking_pending_state_for_expense(chat_id):
-    """True if some other flow's pending preview/confirm — including an
-    active alias action or an in-progress expense deletion — is currently
-    active for this chat."""
-    return any(chat_id in d for d in _EXPENSE_GATE_BLOCKING_PENDING_STATES)
-
-
-# Every pending preview/confirm state in the file, expense-add and
-# expense-deletion included. The two read-only expense report commands must
-# never fire while ANY operation has an unconfirmed preview open —
-# "показати останні витрати" is not worth silently discarding a half-finished
-# purchase/inventory/alias/expense edit or deletion.
-_REPORT_GATE_BLOCKING_PENDING_STATES = _EXPENSE_GATE_BLOCKING_PENDING_STATES + (pending_expense,)
+    return interaction_state.has_blocking_pending_state_for_expense(_interaction_state_deps, chat_id)
 
 
 def _has_blocking_pending_state_for_reports(chat_id):
-    """True if ANY flow's pending preview/confirm is currently active for
-    this chat — the expense report gate must never override any of them."""
-    return any(chat_id in d for d in _REPORT_GATE_BLOCKING_PENDING_STATES)
-
-
-# Every OTHER flow's pending preview/confirm state that must block the global
-# expense-DELETE gate — everything the report gate already guards against
-# (base flows, alias action, expense-add preview), EXCLUDING its own two
-# states (pending_expense_delete, expense_delete_selection): a new global
-# delete command, or free text typed mid-selection, is allowed to keep
-# progressing its own flow rather than being blocked by itself — same
-# reasoning as every other gate in this file.
-_EXPENSE_DELETE_GATE_BLOCKING_PENDING_STATES = _ALIAS_GATE_BLOCKING_PENDING_STATES + (
-    pending_alias_action, pending_expense,
-)
+    return interaction_state.has_blocking_pending_state_for_reports(_interaction_state_deps, chat_id)
 
 
 def _has_blocking_pending_state_for_expense_delete(chat_id):
-    """True if some other flow's pending preview/confirm — including an
-    active alias action or a pending expense-add preview — is currently
-    active for this chat."""
-    return any(chat_id in d for d in _EXPENSE_DELETE_GATE_BLOCKING_PENDING_STATES)
-
-
-# The two states an unconfirmed expense preview can be in — deliberately
-# excludes expense_delete_selection (the earlier "pick a number" stage,
-# which already has its own correct handling: any text there resolves
-# against the shown list, and that behavior is unchanged by this guard).
-_ACTIVE_EXPENSE_PREVIEW_STATES = (pending_expense, pending_expense_delete)
+    return interaction_state.has_blocking_pending_state_for_expense_delete(_interaction_state_deps, chat_id)
 
 
 def _has_active_expense_preview(chat_id):
-    """True if an expense add-preview or delete-preview is awaiting
-    confirm/cancel for this chat. While true, no OTHER plain text may start
-    a new expense router, replace the pending preview, touch the database,
-    or reach general AI-chat — see EXPENSE_PREVIEW_GUARD_MSG."""
-    return any(chat_id in d for d in _ACTIVE_EXPENSE_PREVIEW_STATES)
+    return interaction_state.has_active_expense_preview(_interaction_state_deps, chat_id)
 
 
 _SEEN_UPDATE_IDS_MAXLEN = 1000
@@ -1370,32 +1287,18 @@ def get_household_and_user(user_id, display_name=None):
     user_db_id = get_or_create_user(user_id, household_id, display_name)
     return household_id, user_db_id
 
+# clear_shopping_state/clear_inventory_state/clear_interaction_state's real
+# logic now lives in interaction_state.py (called via _interaction_state_deps,
+# built further down); these stay as thin compatibility wrappers so every
+# existing call site/test patch of the same name keeps working unchanged —
+# including DispatcherDeps's runtime lambda-forward of clear_interaction_state.
 def clear_shopping_state(chat_id):
-    shopping_mode.pop(chat_id, None)
-    pending_batch.pop(chat_id, None)
-    pending_mark_batch.pop(chat_id, None)
-    pending_delete_batch.pop(chat_id, None)
-    pending_merge.pop(chat_id, None)
-    saved_list_context.pop(chat_id, None)
-    pending_saved_edit.pop(chat_id, None)
-    pending_quick_purchase.pop(chat_id, None)
-    pending_alias_action.pop(chat_id, None)
-    expenses.clear_expense_state(chat_id)
+    interaction_state.clear_shopping_state(_interaction_state_deps, chat_id)
+
 
 def clear_inventory_state(chat_id):
-    inventory_mode.pop(chat_id, None)
-    pending_inventory_batch.pop(chat_id, None)
-    pending_remove_batch.pop(chat_id, None)
-    pending_merge.pop(chat_id, None)
-    saved_list_context.pop(chat_id, None)
-    pending_saved_edit.pop(chat_id, None)
-    pending_quick_purchase.pop(chat_id, None)
-    pending_inventory_consumption.pop(chat_id, None)
-    pending_compound_inventory.pop(chat_id, None)
-    pending_inventory_reconciliation.pop(chat_id, None)
-    pending_inventory_reconciliation_clarify.pop(chat_id, None)
-    pending_alias_action.pop(chat_id, None)
-    expenses.clear_expense_state(chat_id)
+    interaction_state.clear_inventory_state(_interaction_state_deps, chat_id)
+
 
 def clear_alias_state(chat_id):
     pending_alias_action.pop(chat_id, None)
@@ -1404,30 +1307,7 @@ def clear_alias_state(chat_id):
 clear_expense_state = expenses.clear_expense_state
 
 def clear_interaction_state(chat_id):
-    """Routing Contract v1: the single place that decides what "start over"
-    means for navigation (/start, /menu, "⬅️ Головне меню") — replaces the
-    3 copy-pasted cleanup blocks that used to live in those handlers.
-    Clears every pending preview/confirm/clarification state across every
-    flow, so the next command is always treated as new, never a
-    continuation of whatever was open before navigation. Composes the
-    existing clear_shopping_state/clear_inventory_state (which already
-    cover shopping_mode, inventory_mode, every legacy pending_* batch/merge/
-    consumption/reconciliation state, aliases, and expenses) and adds the
-    Global Household Router/Action History states that predate this helper
-    and were missing from at least one of the 3 old blocks —
-    pending_global_household in particular was never cleared by navigation
-    at all before this.
-    """
-    waiting_for_ingredients.pop(chat_id, None)
-    active_list_context.pop(chat_id, None)
-    clear_shopping_state(chat_id)
-    clear_inventory_state(chat_id)
-    clear_list_context(chat_id)
-    pending_global_household.pop(chat_id, None)
-    pending_inventory_quantity_clarification.pop(chat_id, None)
-    pending_inventory_representation_clarification.pop(chat_id, None)
-    pending_add_destination_clarification.pop(chat_id, None)
-    pending_undo_action.pop(chat_id, None)
+    interaction_state.clear_interaction_state(_interaction_state_deps, chat_id)
 
 # _parse_qty/_MERGEABLE_UNITS_BOT now live in list_editing.py — imported above.
 
@@ -2651,26 +2531,11 @@ def _merge_snapshot_targets(validated_groups):
     return list_editing._merge_snapshot_targets(validated_groups, canonicalize_name, DEFAULT_CATEGORY)
 
 
+# _should_restore_persisted_context's real logic now lives in
+# interaction_state.py (called via _interaction_state_deps); thin
+# compatibility wrapper, same reasoning as the cleanup/guard wrappers above.
 def _should_restore_persisted_context(chat_id):
-    """True if there's no RAM saved_list_context and no other active preview
-    or special mode that must take priority over restoring a persisted context.
-
-    shopping_mode/inventory_mode and pending_batch/pending_inventory_batch are
-    intentionally not checked here — they're already excluded by the time this
-    is reached (handled earlier in webhook() with their own early returns, or
-    by the outer if/elif around the saved_list_context branch).
-    """
-    if saved_list_context.get(chat_id) is not None:
-        return False
-    return not any(
-        chat_id in d for d in (
-            pending_mark_batch, pending_delete_batch, pending_remove_batch,
-            pending_saved_edit, pending_quick_purchase, pending_merge,
-            pending_inventory_consumption, pending_compound_inventory,
-            pending_inventory_reconciliation, pending_inventory_reconciliation_clarify,
-            pending_alias_action,
-        )
-    )
+    return interaction_state.should_restore_persisted_context(_interaction_state_deps, chat_id)
 
 
 def _ask_gemini_for_selection(user_text, items, list_label, action_label):
@@ -3485,6 +3350,45 @@ _inventory_deps = legacy_inventory_flow.InventoryFlowDeps(
     valid_categories=VALID_CATEGORIES,
     inventory_error_msg=INVENTORY_ERROR_MSG,
     selection_error_msg=SELECTION_ERROR_MSG,
+)
+
+# Interaction State Facade V1 — interaction_state.py owns the cleanup/guard
+# logic (clear_shopping_state/clear_inventory_state/clear_interaction_state,
+# the gate-blocking pending-state groups, _has_active_expense_preview,
+# _should_restore_persisted_context) but NOT any of the dicts themselves —
+# every dict field below is the SAME object its owner module (bot.py,
+# legacy_shopping_flow.py, legacy_inventory_flow.py, expenses.py) already
+# holds. clear_expense_state/clear_list_context are lambda-forwards for the
+# same patchability reason as every other callback in this file.
+_interaction_state_deps = interaction_state.InteractionStateDeps(
+    shopping_mode=shopping_mode,
+    pending_batch=pending_batch,
+    pending_mark_batch=pending_mark_batch,
+    pending_delete_batch=pending_delete_batch,
+    inventory_mode=inventory_mode,
+    pending_inventory_batch=pending_inventory_batch,
+    pending_remove_batch=pending_remove_batch,
+    pending_expense=pending_expense,
+    pending_expense_delete=pending_expense_delete,
+    expense_delete_selection=expense_delete_selection,
+    pending_merge=pending_merge,
+    pending_saved_edit=pending_saved_edit,
+    pending_quick_purchase=pending_quick_purchase,
+    pending_inventory_consumption=pending_inventory_consumption,
+    pending_compound_inventory=pending_compound_inventory,
+    pending_inventory_reconciliation=pending_inventory_reconciliation,
+    pending_inventory_reconciliation_clarify=pending_inventory_reconciliation_clarify,
+    pending_alias_action=pending_alias_action,
+    pending_global_household=pending_global_household,
+    pending_inventory_quantity_clarification=pending_inventory_quantity_clarification,
+    pending_inventory_representation_clarification=pending_inventory_representation_clarification,
+    pending_add_destination_clarification=pending_add_destination_clarification,
+    pending_undo_action=pending_undo_action,
+    active_list_context=active_list_context,
+    saved_list_context=saved_list_context,
+    waiting_for_ingredients=waiting_for_ingredients,
+    clear_expense_state=lambda *a, **kw: clear_expense_state(*a, **kw),
+    clear_list_context=lambda *a, **kw: clear_list_context(*a, **kw),
 )
 
 # Message Dispatcher V1 — message_dispatcher.py owns the ordered navigation/
