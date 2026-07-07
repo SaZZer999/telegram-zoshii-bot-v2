@@ -24,6 +24,19 @@ Two-layer recognition, cheapest first:
    intent. Its output is validated the same way real DB rows are searched:
    exact canonical-name equality, no fuzzy matching, no invented products.
 
+Two public entrypoints share the exact same deterministic parser and answer
+builders (no duplicated logic):
+- `try_handle_direct_household_read` — deterministic-only, no topic gate,
+  no Gemini, ever. Meant to be checked BEFORE the saved-list router (see
+  message_dispatcher.py's `DispatcherDeps.direct_household_read`) so an
+  explicit "Що треба купити?" is answered even while a saved shopping/
+  inventory list context is open, instead of being swallowed by the saved-
+  list router's own AI edit-parser.
+- `try_handle_household_read` — the full route: tries the same
+  deterministic parser first, then falls back to the topic gate + Gemini
+  classifier for non-standard phrasings. Meant to stay in its existing
+  Phase D slot, after cooking mode and before the general AI fallback.
+
 Item lookup never guesses: a query product is normalized through
 `resolve_item_name` (household alias, then built-in synonym — the exact
 same resolver used everywhere else in the project, so old raw rows like
@@ -158,6 +171,27 @@ _ALLOWED_INTENTS = {
     "shopping_overview", "shopping_presence", "none",
 }
 
+# Typographic quote characters a message may be wrapped in ("«Що треба
+# купити?»", a lone opening "«Що треба купити?" from a copy-paste, etc.).
+# Deliberately does NOT include any apostrophe variant (' or ’) — those are
+# never stripped, since Ukrainian words like "м'ясо" use an apostrophe as a
+# real letter, never as a wrapping quote.
+_WRAPPING_QUOTE_CHARS = "«»„“”\""
+
+
+def _strip_wrapping_quotes(text):
+    """Strip a leading/trailing typographic quote character (if present)
+    plus surrounding whitespace. Each side is checked independently, so an
+    unbalanced opening quote with no closing quote is handled too. Never
+    touches an apostrophe anywhere in the text — only the small fixed
+    quote-character set above, and only at the very start/end."""
+    stripped = (text or "").strip()
+    if stripped and stripped[0] in _WRAPPING_QUOTE_CHARS:
+        stripped = stripped[1:].strip()
+    if stripped and stripped[-1] in _WRAPPING_QUOTE_CHARS:
+        stripped = stripped[:-1].strip()
+    return stripped
+
 
 def _normalize_phrase(text):
     normalized = (text or "").strip().lower()
@@ -187,7 +221,7 @@ def _resolve_category_keyword(category_raw, category_order):
 
 
 def _deterministic_parse(text, category_order):
-    stripped = text.strip()
+    stripped = _strip_wrapping_quotes(text)
     normalized_full = _normalize_phrase(stripped)
 
     if normalized_full in _OVERVIEW_PHRASES:
@@ -385,23 +419,12 @@ def _answer_shopping_overview(deps, chat_id, household_id):
     deps.send_message(chat_id, deps.format_shopping_list(items))
 
 
-def try_handle_household_read(deps, chat_id, user_id, display_name, text):
-    """Public entrypoint. Returns True if `text` was a household read-
-    question and an answer has already been sent via `deps.send_message`;
-    False if it wasn't (caller should continue to the general AI fallback).
-    Never writes to the DB, never opens a preview, never stores any new
-    state of its own."""
-    if not isinstance(text, str) or not text.strip():
-        return False
-
-    parsed = _deterministic_parse(text, deps.category_order)
-    if parsed is None:
-        if not _TOPIC_GATE_RE.search(text):
-            return False
-        parsed = _classify_with_gemini(deps, text, deps.category_order)
-        if parsed is None:
-            return False
-
+def _dispatch_parsed(deps, chat_id, user_id, display_name, parsed):
+    """Shared by both public entrypoints: resolves household_id once and
+    calls the matching answer builder for an already-recognized intent
+    dict (from either `_deterministic_parse` or `_classify_with_gemini`).
+    Returns True (an answer was sent) or False (unrecognized intent —
+    defensive, should not happen for either caller)."""
     household_id, _ = deps.get_household_and_user(user_id, display_name)
     intent = parsed["intent"]
 
@@ -419,3 +442,45 @@ def try_handle_household_read(deps, chat_id, user_id, display_name, text):
         return False
 
     return True
+
+
+def try_handle_direct_household_read(deps, chat_id, user_id, display_name, text):
+    """Direct/deterministic-only entrypoint — no local topic gate, no
+    Gemini call, ever, and no new state. Meant to be checked BEFORE the
+    saved-list router (see message_dispatcher.py's `DispatcherDeps.
+    direct_household_read`) so an explicit read-question like "Що треба
+    купити?" is answered even while a saved shopping/inventory list context
+    is open. Returns True only when a deterministic pattern matched and an
+    answer has already been sent via `deps.send_message`; False otherwise
+    (caller must continue, e.g. into saved_list_router)."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+
+    parsed = _deterministic_parse(text, deps.category_order)
+    if parsed is None:
+        return False
+
+    return _dispatch_parsed(deps, chat_id, user_id, display_name, parsed)
+
+
+def try_handle_household_read(deps, chat_id, user_id, display_name, text):
+    """Public entrypoint. Returns True if `text` was a household read-
+    question and an answer has already been sent via `deps.send_message`;
+    False if it wasn't (caller should continue to the general AI fallback).
+    Never writes to the DB, never opens a preview, never stores any new
+    state of its own. Tries the same deterministic parser
+    `try_handle_direct_household_read` uses first — only a message that
+    parser doesn't recognize ever reaches the local topic gate + Gemini
+    classifier fallback."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+
+    parsed = _deterministic_parse(text, deps.category_order)
+    if parsed is None:
+        if not _TOPIC_GATE_RE.search(text):
+            return False
+        parsed = _classify_with_gemini(deps, text, deps.category_order)
+        if parsed is None:
+            return False
+
+    return _dispatch_parsed(deps, chat_id, user_id, display_name, parsed)

@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import MagicMock
 
 import household_read_context as hrc
+import message_dispatcher
 
 CATEGORY_ORDER = [
     "М'ясо та риба", "Молочне та яйця", "Овочі та зелень",
@@ -74,6 +75,14 @@ def _milk_row(**overrides):
     row = {"id": 1, "name": "Молоко", "category": "Молочне та яйця",
             "canonical_name": "молоко", "quantity_text": "1 л",
             "quantity_value": 1, "quantity_unit": "л", "quantity_inferred": False}
+    row.update(overrides)
+    return row
+
+
+def _bread_row(**overrides):
+    row = {"id": 9, "name": "Хліб", "category": "Хліб і випічка",
+            "canonical_name": "хліб", "quantity_text": "2 шт.",
+            "quantity_value": 2, "quantity_unit": "шт.", "quantity_inferred": False}
     row.update(overrides)
     return row
 
@@ -332,6 +341,206 @@ class RoutingBoundaryTests(unittest.TestCase):
                 self.assertNotIn("INSERT", str(call).upper())
                 self.assertNotIn("UPDATE", str(call).upper())
                 self.assertNotIn("DELETE", str(call).upper())
+
+
+class DirectHouseholdReadEntryPointTests(unittest.TestCase):
+    """try_handle_direct_household_read: deterministic-only, no topic gate,
+    no Gemini, ever — the routing fix's actual new public entrypoint."""
+
+    def test_what_to_buy_answers_without_gemini(self):
+        call_gemini = MagicMock(return_value=None)
+        deps = _make_deps(shopping_items=[_bread_row()], call_gemini=call_gemini)
+
+        handled = hrc.try_handle_direct_household_read(deps, 1, 555, "Тест", "Що треба купити?")
+
+        self.assertTrue(handled)
+        call_gemini.assert_not_called()
+        message = deps.send_message.call_args[0][1]
+        self.assertIn("Хліб", message)
+
+    def test_unbalanced_opening_guillemet_is_stripped(self):
+        deps = _make_deps(shopping_items=[_bread_row()])
+
+        handled = hrc.try_handle_direct_household_read(deps, 1, 555, "Тест", "«Що треба купити?")
+
+        self.assertTrue(handled)
+        message = deps.send_message.call_args[0][1]
+        self.assertIn("Хліб", message)
+
+    def test_balanced_guillemets_and_padding_whitespace_are_stripped(self):
+        deps_wrapped = _make_deps(shopping_items=[_bread_row()])
+        deps_padded = _make_deps(shopping_items=[_bread_row()])
+
+        handled_wrapped = hrc.try_handle_direct_household_read(deps_wrapped, 1, 555, "Тест", "«Що треба купити?»")
+        handled_padded = hrc.try_handle_direct_household_read(deps_padded, 1, 555, "Тест", "  Що треба купити?  ")
+
+        self.assertTrue(handled_wrapped)
+        self.assertTrue(handled_padded)
+
+    def test_apostrophe_inside_word_never_touched(self):
+        # "м'ясо" keeps its apostrophe — only wrapping quote characters at
+        # the very start/end of the whole message are ever stripped.
+        deps = _make_deps(inventory_items=[])
+
+        handled = hrc.try_handle_direct_household_read(deps, 1, 555, "Тест", "Яке м'ясо є вдома?")
+
+        self.assertTrue(handled)
+        message = deps.send_message.call_args[0][1]
+        self.assertIn("нічого немає", message)
+
+    def test_bread_presence_in_shopping_list(self):
+        deps = _make_deps(shopping_items=[_bread_row()])
+
+        handled = hrc.try_handle_direct_household_read(deps, 1, 555, "Тест", "Чи є хліб у покупках?")
+
+        self.assertTrue(handled)
+        message = deps.send_message.call_args[0][1]
+        self.assertIn("Так, у списку покупок є:", message)
+
+    def test_category_question_works_without_gemini(self):
+        call_gemini = MagicMock(return_value=None)
+        deps = _make_deps(inventory_items=[_milk_row()], call_gemini=call_gemini)
+
+        handled = hrc.try_handle_direct_household_read(deps, 1, 555, "Тест", "Що є з молочного?")
+
+        self.assertTrue(handled)
+        call_gemini.assert_not_called()
+
+    def test_non_deterministic_saved_list_edit_returns_false(self):
+        call_gemini = MagicMock(return_value=None)
+        deps = _make_deps(shopping_items=[_bread_row()], call_gemini=call_gemini)
+
+        handled = hrc.try_handle_direct_household_read(deps, 1, 555, "Тест", "2 хліби")
+
+        self.assertFalse(handled)
+        call_gemini.assert_not_called()
+        deps.send_message.assert_not_called()
+
+    def test_write_command_returns_false(self):
+        deps = _make_deps(inventory_items=[_milk_row()])
+
+        handled = hrc.try_handle_direct_household_read(deps, 1, 555, "Тест", "Купив хліб за 10 zł")
+
+        self.assertFalse(handled)
+        deps.send_message.assert_not_called()
+
+
+def _make_command_route_deps(**overrides):
+    defaults = dict(
+        ambiguous_add_route=MagicMock(return_value=False),
+        explicit_global_add=MagicMock(return_value=False),
+        bare_global_add=MagicMock(return_value=False),
+        global_household_router=MagicMock(return_value=False),
+        expense_report_route=MagicMock(return_value=False),
+        expense_delete_command_route=MagicMock(return_value=False),
+        active_aliases_context=MagicMock(return_value=None),
+        global_alias_command=MagicMock(return_value=False),
+        active_expenses_context=MagicMock(return_value=None),
+        global_expense_command=MagicMock(return_value=False),
+        saved_list_router=MagicMock(return_value=True),
+        general_ai_fallback=MagicMock(),
+    )
+    defaults.update(overrides)
+    return message_dispatcher.CommandRouteDeps(**defaults)
+
+
+def _make_dispatcher_deps(command_routes, **overrides):
+    defaults = dict(
+        send_message=MagicMock(),
+        clear_interaction_state=MagicMock(),
+        main_keyboard={},
+        help_text="help",
+        shopping_deps=MagicMock(),
+        inventory_deps=MagicMock(),
+        command_routes=command_routes,
+    )
+    defaults.update(overrides)
+    return message_dispatcher.DispatcherDeps(**defaults)
+
+
+class DispatcherPlacementTests(unittest.TestCase):
+    """A thin, dispatcher-level slice locking in the actual routing fix:
+    direct_household_read is checked inside _dispatch_command_routes
+    strictly before saved_list_router. Full end-to-end dispatch()
+    precedence (confirm/cancel, navigation, pending states, cooking mode,
+    etc.) is already covered by test_routing_precedence_contract.py and
+    test_message_dispatcher_command_routes.py — this only locks in the one
+    new slot relative to saved_list_router."""
+
+    def test_direct_read_intercepts_before_saved_list_router(self):
+        household_read_deps = _make_deps(shopping_items=[_bread_row()])
+        saved_list_router = MagicMock(return_value=True)
+        deps = _make_dispatcher_deps(
+            _make_command_route_deps(saved_list_router=saved_list_router),
+            direct_household_read=lambda *a, **kw: hrc.try_handle_direct_household_read(household_read_deps, *a, **kw),
+        )
+
+        outcome = message_dispatcher._dispatch_command_routes(deps, 1, 555, "Тест", "Що треба купити?")
+
+        self.assertEqual(outcome, message_dispatcher.RouteOutcome.HANDLED)
+        saved_list_router.assert_not_called()
+        household_read_deps.call_gemini.assert_not_called()
+
+    def test_direct_read_intercepts_unbalanced_opening_quote(self):
+        household_read_deps = _make_deps(shopping_items=[_bread_row()])
+        saved_list_router = MagicMock(return_value=True)
+        deps = _make_dispatcher_deps(
+            _make_command_route_deps(saved_list_router=saved_list_router),
+            direct_household_read=lambda *a, **kw: hrc.try_handle_direct_household_read(household_read_deps, *a, **kw),
+        )
+
+        outcome = message_dispatcher._dispatch_command_routes(deps, 1, 555, "Тест", "«Що треба купити?")
+
+        self.assertEqual(outcome, message_dispatcher.RouteOutcome.HANDLED)
+        saved_list_router.assert_not_called()
+
+    def test_bread_presence_intercepts_before_saved_list_router(self):
+        household_read_deps = _make_deps(shopping_items=[_bread_row()])
+        saved_list_router = MagicMock(return_value=True)
+        deps = _make_dispatcher_deps(
+            _make_command_route_deps(saved_list_router=saved_list_router),
+            direct_household_read=lambda *a, **kw: hrc.try_handle_direct_household_read(household_read_deps, *a, **kw),
+        )
+
+        outcome = message_dispatcher._dispatch_command_routes(deps, 1, 555, "Тест", "Чи є хліб у покупках?")
+
+        self.assertEqual(outcome, message_dispatcher.RouteOutcome.HANDLED)
+        saved_list_router.assert_not_called()
+
+    def test_non_deterministic_edit_falls_through_to_saved_list_router(self):
+        household_read_deps = _make_deps(shopping_items=[_bread_row()])
+        saved_list_router = MagicMock(return_value=True)
+        deps = _make_dispatcher_deps(
+            _make_command_route_deps(saved_list_router=saved_list_router),
+            direct_household_read=lambda *a, **kw: hrc.try_handle_direct_household_read(household_read_deps, *a, **kw),
+        )
+
+        outcome = message_dispatcher._dispatch_command_routes(deps, 1, 555, "Тест", "2 хліби")
+
+        self.assertEqual(outcome, message_dispatcher.RouteOutcome.HANDLED)
+        saved_list_router.assert_called_once()
+
+    def test_write_command_intercepted_before_direct_household_read_is_ever_called(self):
+        direct_household_read = MagicMock()
+        deps = _make_dispatcher_deps(
+            _make_command_route_deps(global_household_router=MagicMock(return_value=True)),
+            direct_household_read=direct_household_read,
+        )
+
+        outcome = message_dispatcher._dispatch_command_routes(deps, 1, 555, "Тест", "Купив хліб за 10 zł")
+
+        self.assertEqual(outcome, message_dispatcher.RouteOutcome.HANDLED)
+        direct_household_read.assert_not_called()
+
+    def test_dispatcher_deps_without_direct_household_read_stays_compatible(self):
+        saved_list_router = MagicMock(return_value=True)
+        deps = _make_dispatcher_deps(_make_command_route_deps(saved_list_router=saved_list_router))
+
+        self.assertIsNone(deps.direct_household_read)
+        outcome = message_dispatcher._dispatch_command_routes(deps, 1, 555, "Тест", "Що треба купити?")
+
+        self.assertEqual(outcome, message_dispatcher.RouteOutcome.HANDLED)
+        saved_list_router.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -33,13 +33,20 @@ V3B: the highest-priority route of all — the shared confirm/cancel button
     V3B, webhook() contains no application routing at all — only update
     parsing, deduplication, `/myid`, the access check, and the single
     `dispatch(...)` call.
-Household Read Context V1: an optional, purely read-only slot in Phase D,
-    tried after cooking mode and before the general AI fallback (see
-    `dispatch()`'s own docstring and `DispatcherDeps.household_read`) — it
-    never claims a message any earlier route (confirm/cancel, navigation,
-    special buttons, menus, modes, pending states, command/context routes,
-    or cooking mode) already claimed, since all of those return before
-    Phase D is ever reached.
+Household Read Context V1: two read-only slots, both optional. A direct/
+    deterministic-only slot (`DispatcherDeps.direct_household_read`) inside
+    `_dispatch_command_routes`, checked after every write/context route
+    (V2B) but STRICTLY before saved_list_router — so an explicit read-
+    question like "Що треба купити?" is answered even while a saved
+    shopping/inventory list context is open, never swallowed by the saved-
+    list router's own AI edit-parser. A second, fuller slot
+    (`DispatcherDeps.household_read`) in Phase D, tried after cooking mode
+    and before the general AI fallback, covering non-standard phrasings via
+    a local topic gate + Gemini classifier. Neither slot claims a message
+    any earlier route (confirm/cancel, navigation, special buttons, menus,
+    modes, pending states, or any V2B command/context route above it)
+    already claimed, since all of those return before either slot is ever
+    reached.
 
 Route contract: `dispatch(...)` returns a `RouteOutcome` — kept for the
 pre-V3A test suite and for `_resolve_route_outcome`'s own internal
@@ -192,6 +199,15 @@ class DispatcherDeps:
     # None) so DispatcherDeps built before this existed keeps working
     # unchanged, same reasoning as every other Optional field above.
     household_read: Callable = None
+    # Household Read Context V1 — direct/deterministic-only routing fix.
+    # Thin lambda-forward to try_handle_direct_household_read (no topic
+    # gate, no Gemini). Checked inside _dispatch_command_routes, right
+    # before saved_list_router, so an explicit read-question like "Що
+    # треба купити?" is answered even while a saved shopping/inventory list
+    # context is open, instead of being swallowed by the saved-list
+    # router's own AI edit-parser. Optional for the same reason as every
+    # other field above.
+    direct_household_read: Callable = None
 
 
 def _dispatch_confirm_or_cancel(deps, chat_id, user_id, display_name, text):
@@ -437,6 +453,14 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # Global expense command gate — fires from anywhere but never
         # overrides an active preview/confirm from ANY other flow, aliases
         # included (aliases has priority over a new expense command).
+        return RouteOutcome.HANDLED
+
+    if deps.direct_household_read and deps.direct_household_read(chat_id, user_id, display_name, text):
+        # Household Read Context V1 — direct/deterministic read-questions
+        # only (no topic gate, no Gemini). Checked after every write/
+        # context route above but STRICTLY before saved_list_router so an
+        # explicit "Що треба купити?" is answered even while a saved
+        # shopping/inventory list context is open.
         return RouteOutcome.HANDLED
 
     if routes.saved_list_router(chat_id, user_id, display_name, text):

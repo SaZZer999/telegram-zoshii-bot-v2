@@ -4464,6 +4464,7 @@ _dispatcher_deps = message_dispatcher.DispatcherDeps(
     cooking_mode=lambda *a, **kw: _try_handle_cooking_mode(*a, **kw),
     confirm_or_cancel=lambda *a, **kw: _try_handle_confirm_or_cancel(*a, **kw),
     household_read=lambda *a, **kw: household_read_context.try_handle_household_read(_household_read_deps, *a, **kw),
+    direct_household_read=lambda *a, **kw: household_read_context.try_handle_direct_household_read(_household_read_deps, *a, **kw),
 )
 
 
