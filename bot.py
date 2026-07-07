@@ -77,6 +77,7 @@ from inventory import (
 import list_editing
 from list_editing import _compute_merged_quantity, _apply_pending_merge
 import legacy_shopping_flow
+import legacy_inventory_flow
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -123,9 +124,13 @@ pending_batch = legacy_shopping_flow.pending_batch
 pending_mark_batch = legacy_shopping_flow.pending_mark_batch
 pending_delete_batch = legacy_shopping_flow.pending_delete_batch
 pending_merge = {}            # chat_id -> {groups, household_id, user_db_id, list_type}
-inventory_mode = {}           # chat_id -> "adding" | "removing"
-pending_inventory_batch = {}  # chat_id -> {items, ignored_items, household_id, user_db_id}
-pending_remove_batch = {}     # chat_id -> {items, household_id, user_db_id}
+# inventory_mode/pending_inventory_batch/pending_remove_batch now live in
+# legacy_inventory_flow.py — re-exported below (same dict objects, not
+# copies) so every existing test that does `from bot import inventory_mode`
+# etc. keeps working.
+inventory_mode = legacy_inventory_flow.inventory_mode
+pending_inventory_batch = legacy_inventory_flow.pending_inventory_batch
+pending_remove_batch = legacy_inventory_flow.pending_remove_batch
 saved_list_context = {}       # chat_id -> "shopping_saved" | "inventory_saved"
 pending_saved_edit = {}       # chat_id -> {items_snapshot, validated_updates, household_id, user_db_id, context_type}
 pending_quick_purchase = {}   # chat_id -> {items, ignored_items, household_id, user_db_id}
@@ -2715,93 +2720,16 @@ def _ask_gemini_for_selection(user_text, items, list_label, action_label):
         return "invalid", None
     return "ok", selected
 
-def _show_remove_preview(chat_id, items, household_id, user_db_id):
-    pending_remove_batch[chat_id] = {
-        "items": items,
-        "household_id": household_id,
-        "user_db_id": user_db_id,
-    }
-    preview = format_grouped_list(items, f"🧊 Буде прибрано із запасів: {len(items)}")
-    send_message(chat_id, preview, reply_markup=REMOVE_PREVIEW_KEYBOARD)
-
-# parse_shopping_list_with_gemini now lives in legacy_shopping_flow.py (called
-# via _shopping_deps below); its inventory mirror stays here.
-
-# Narrow whitelist mirror of household_router.py's identical
-# _LEAKED_QUANTITY_PREFIX_RE/_looks_like_leaked_quantity_phrase — duplicated
-# on purpose (same reasoning as every other small pure helper already
-# duplicated across this codebase) rather than reaching into a private name
-# in another module. Detects a quantity/container word that leaked into the
-# front of `name` instead of being separated into quantity_text — a sign
-# Gemini failed to split the phrase safely, e.g. name="дві пачки сосисок".
-_LEAKED_QUANTITY_PREFIX_RE = re.compile(
-    r"^(пара|пару|два|дві|три|чотири|п['’]?ять|пачка|пачки|пачок|упаковка|упаковки|упаковок)\b",
-    re.IGNORECASE,
-)
-
-
-def _looks_like_leaked_quantity_phrase(name):
-    """True if `name` still starts with a quantity/container word that
-    should have been separated into quantity_text instead. Never guessed at
-    beyond this exact whitelist."""
-    return bool(_LEAKED_QUANTITY_PREFIX_RE.match((name or "").strip()))
-
-
+# _show_remove_preview/parse_inventory_list_with_gemini (real logic) now live
+# in legacy_inventory_flow.py. bot.py keeps a thin compatibility wrapper below
+# for parse_inventory_list_with_gemini, since it's also exposed as an
+# InventoryFlowDeps callback (deps.parse_inventory_list_with_gemini resolves
+# this exact bot.py name at call time) — patch.object(bot,
+# "parse_inventory_list_with_gemini", ...) in existing tests must keep
+# affecting the real inventory_mode "adding" webhook flow, not just direct
+# calls.
 def parse_inventory_list_with_gemini(text, alias_map=None):
-    """Inventory-only mirror of parse_shopping_list_with_gemini — same
-    contract/return shape, but uses INVENTORY_PARSE_PROMPT (explicit rules
-    for word-numbers/container quantities like "дві пачки"/"пачка"/"пару"
-    staying verbatim in quantity_text, never converted to a digit or left
-    inside name) and additionally refuses to turn a leaked quantity/
-    container phrase in `name` into a broken canonical item — such an item
-    is treated exactly like a non-consumable one (excluded from the
-    returned items, listed under ignored_items) instead of creating a
-    preview with a garbage name.
-    """
-    history = [{"role": "user", "content": text}]
-    raw = call_gemini(history, INVENTORY_PARSE_PROMPT, temperature=0.1)
-    if not raw:
-        return None
-    cleaned = raw.strip()
-    if "```" in cleaned:
-        match = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
-        if match:
-            cleaned = match.group(1).strip()
-    try:
-        data = json.loads(cleaned)
-        raw_items = data.get("items")
-        if not isinstance(raw_items, list):
-            return None
-        ignored = list(data.get("ignored_items") or [])
-        consumable = []
-        for item in raw_items:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("name", "").strip()
-            if not name:
-                continue
-            if not item.get("is_consumable", True):
-                ignored.append(name)
-                continue
-            if _looks_like_leaked_quantity_phrase(name):
-                ignored.append(name)
-                continue
-            cat = item.get("category", "").strip()
-            if cat not in VALID_CATEGORIES:
-                cat = DEFAULT_CATEGORY
-            normalized = normalize_item_quantity(name, item.get("quantity_text", "").strip(), allow_default_unit=True, alias_map=alias_map)
-            entry = {
-                "name": name,
-                "category": cat,
-                "was_corrected": bool(item.get("was_corrected", False)),
-            }
-            entry.update(normalized)
-            consumable.append(entry)
-        if not consumable and not ignored:
-            return None
-        return {"items": consumable, "ignored_items": ignored}
-    except (json.JSONDecodeError, AttributeError, TypeError):
-        return None
+    return legacy_inventory_flow.parse_inventory_list_with_gemini(_inventory_deps, text, alias_map=alias_map)
 
 
 def format_batch_preview(items, ignored_items=None):
@@ -3507,6 +3435,57 @@ _shopping_deps = legacy_shopping_flow.ShoppingFlowDeps(
     selection_error_msg=SELECTION_ERROR_MSG,
 )
 
+# Legacy Inventory Flow V1 — legacy_inventory_flow.py owns inventory_mode/
+# pending_inventory_batch/pending_remove_batch and the inventory-only
+# handlers; it has no import of bot.py, so everything it needs from here is
+# passed once via this injected dependency container. Same lambda-forward
+# reasoning as _shopping_deps above — every function-valued field resolves
+# the name fresh against bot.py's globals on every call, so
+# `patch.object(bot, "...")` in existing tests keeps working, including
+# patch.object(bot, "parse_inventory_list_with_gemini", ...) at the webhook
+# level (see the wrapper of that name above).
+_inventory_deps = legacy_inventory_flow.InventoryFlowDeps(
+    send_message=lambda *a, **kw: send_message(*a, **kw),
+    call_gemini=lambda *a, **kw: call_gemini(*a, **kw),
+    get_household_and_user=lambda *a, **kw: get_household_and_user(*a, **kw),
+    get_inventory_items=lambda *a, **kw: get_inventory_items(*a, **kw),
+    get_household_alias_map=lambda *a, **kw: get_household_alias_map(*a, **kw),
+    save_list_context=lambda *a, **kw: save_list_context(*a, **kw),
+    normalize_item_quantity=lambda *a, **kw: normalize_item_quantity(*a, **kw),
+    canonicalize_name=lambda *a, **kw: canonicalize_name(*a, **kw),
+    parse_inventory_list_with_gemini=lambda *a, **kw: parse_inventory_list_with_gemini(*a, **kw),
+    resolve_inventory_representation=lambda *a, **kw: resolve_inventory_representation(*a, **kw),
+    format_representation_clarify_message=lambda *a, **kw: format_representation_clarify_message(*a, **kw),
+    format_representation_separate_warning=lambda *a, **kw: format_representation_separate_warning(*a, **kw),
+    format_representation_merge_quantity_fragment=lambda *a, **kw: format_representation_merge_quantity_fragment(*a, **kw),
+    merge_quantity_values=lambda *a, **kw: merge_quantity_values(*a, **kw),
+    format_quantity_display=lambda *a, **kw: format_quantity_display(*a, **kw),
+    ask_gemini_for_selection=lambda *a, **kw: _ask_gemini_for_selection(*a, **kw),
+    ask_gemini_preview_edit_router=lambda *a, **kw: _ask_gemini_preview_edit_router(*a, **kw),
+    validate_preview_updates=lambda *a, **kw: _validate_preview_updates(*a, **kw),
+    apply_preview_updates=lambda *a, **kw: _apply_preview_updates(*a, **kw),
+    auto_merge_in_place=lambda *a, **kw: _auto_merge_in_place(*a, **kw),
+    format_grouped_list=lambda *a, **kw: format_grouped_list(*a, **kw),
+    format_inventory_list=lambda *a, **kw: format_inventory_list(*a, **kw),
+    format_inventory_preview=lambda *a, **kw: format_inventory_preview(*a, **kw),
+    format_unresolved_fragments_message=lambda *a, **kw: _format_unresolved_fragments_message(*a, **kw),
+    resolve_numbered_inventory_delete_selection=lambda *a, **kw: _resolve_numbered_inventory_delete_selection(*a, **kw),
+    format_numbered_delete_mismatch_message=lambda *a, **kw: _format_numbered_delete_mismatch_message(*a, **kw),
+    clear_shopping_state=lambda *a, **kw: clear_shopping_state(*a, **kw),
+    clear_inventory_state=lambda *a, **kw: clear_inventory_state(*a, **kw),
+    active_list_context=active_list_context,
+    saved_list_context=saved_list_context,
+    waiting_for_ingredients=waiting_for_ingredients,
+    inventory_keyboard=INVENTORY_KEYBOARD,
+    add_inventory_preview_keyboard=ADD_INVENTORY_PREVIEW_KEYBOARD,
+    remove_preview_keyboard=REMOVE_PREVIEW_KEYBOARD,
+    inventory_parse_prompt=INVENTORY_PARSE_PROMPT,
+    default_category=DEFAULT_CATEGORY,
+    valid_categories=VALID_CATEGORIES,
+    inventory_error_msg=INVENTORY_ERROR_MSG,
+    selection_error_msg=SELECTION_ERROR_MSG,
+)
+
 
 @app.route("/")
 def home():
@@ -4111,56 +4090,19 @@ def webhook():
         return "ok"
 
     if text == "🧊 Запаси":
-        waiting_for_ingredients.pop(chat_id, None)
-        active_list_context[chat_id] = "inventory"
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        saved_list_context[chat_id] = "inventory_saved"
-        try:
-            household_id, _ = get_household_and_user(user_id, display_name)
-            save_list_context(chat_id, household_id, "inventory_saved")
-            items = get_inventory_items(household_id)
-            send_message(chat_id, format_inventory_list(items), reply_markup=INVENTORY_KEYBOARD)
-        except Exception:
-            send_message(chat_id, INVENTORY_ERROR_MSG, reply_markup=INVENTORY_KEYBOARD)
+        legacy_inventory_flow.handle_open_inventory_menu(_inventory_deps, chat_id, user_id, display_name)
         return "ok"
 
     if text == "➕ Додати продукти":
-        active_list_context[chat_id] = "inventory"
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        inventory_mode[chat_id] = "adding"
-        send_message(chat_id, "Надішли один продукт або список продуктів. Можна кожен продукт з нового рядка.")
+        legacy_inventory_flow.handle_start_inventory_add(_inventory_deps, chat_id)
         return "ok"
 
     if text == "📋 Показати запаси":
-        active_list_context[chat_id] = "inventory"
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        saved_list_context[chat_id] = "inventory_saved"
-        try:
-            household_id, _ = get_household_and_user(user_id, display_name)
-            save_list_context(chat_id, household_id, "inventory_saved")
-            items = get_inventory_items(household_id)
-            send_message(chat_id, format_inventory_list(items))
-        except Exception:
-            send_message(chat_id, INVENTORY_ERROR_MSG)
+        legacy_inventory_flow.handle_show_inventory_list(_inventory_deps, chat_id, user_id, display_name)
         return "ok"
 
     if text == "➖ Використати / прибрати":
-        active_list_context[chat_id] = "inventory"
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        try:
-            household_id, _ = get_household_and_user(user_id, display_name)
-            items = get_inventory_items(household_id)
-            if not items:
-                send_message(chat_id, "Запаси поки порожні.")
-            else:
-                send_message(chat_id, format_inventory_list(items) + "\n\nНапиши, що прибрати із запасів:")
-                inventory_mode[chat_id] = "removing"
-        except Exception:
-            send_message(chat_id, INVENTORY_ERROR_MSG)
+        legacy_inventory_flow.handle_start_inventory_remove(_inventory_deps, chat_id, user_id, display_name)
         return "ok"
 
     if text == "🍽️ Що приготувати":
@@ -4189,129 +4131,9 @@ def webhook():
         return "ok"
 
     # =========================
-    # INVENTORY MODE
+    # INVENTORY MODE (legacy_inventory_flow.py)
     # =========================
-    inv_mode = inventory_mode.pop(chat_id, None)
-
-    if inv_mode == "adding":
-        try:
-            household_id, user_db_id = get_household_and_user(user_id, display_name)
-            alias_map = get_household_alias_map(household_id)
-        except Exception:
-            inventory_mode[chat_id] = "adding"
-            send_message(chat_id, INVENTORY_ERROR_MSG)
-            return "ok"
-        result = parse_inventory_list_with_gemini(text, alias_map=alias_map)
-        if result is None:
-            inventory_mode[chat_id] = "adding"
-            send_message(
-                chat_id,
-                "Не зміг точно розібрати список. Надішли продукти ще раз, бажано кожен з нового рядка."
-            )
-            return "ok"
-        items = result["items"]
-        if not items:
-            inventory_mode[chat_id] = "adding"
-            ignored = result["ignored_items"]
-            msg = "Не знайшов їстівних продуктів у списку. Надішли ще раз."
-            if ignored:
-                msg += "\n\nНе додано: " + ", ".join(ignored)
-            send_message(chat_id, msg)
-            return "ok"
-        items = _auto_merge_in_place(items)
-        try:
-            existing_inventory = get_inventory_items(household_id)
-            inventory_targets = []
-            representation_notes = []
-            display_items = []
-            for item in items:
-                outcome, existing = resolve_inventory_representation(
-                    existing_inventory, item.get("canonical_name"), item.get("category"),
-                    item.get("quantity_value"), item.get("quantity_unit"), item.get("quantity_inferred", False),
-                )
-                if outcome == "clarify":
-                    inventory_mode[chat_id] = "adding"
-                    send_message(chat_id, format_representation_clarify_message(item["name"], existing))
-                    return "ok"
-                if outcome == "merge":
-                    # `items` (the write path, stored in pending_inventory_batch below)
-                    # keeps the raw incoming quantity untouched — the actual merge
-                    # arithmetic happens fresh at confirm time in
-                    # _merge_or_insert_inventory_in_tx. `display_items` is a
-                    # preview-only copy so the honest "X + Y -> буде Z" line can
-                    # replace the plain quantity without touching what gets written.
-                    merged_value, merged_unit = merge_quantity_values(
-                        existing["quantity_value"], existing["quantity_unit"],
-                        item["quantity_value"], item["quantity_unit"],
-                    )
-                    display_item = dict(item)
-                    display_item["quantity_value"] = None
-                    display_item["quantity_text"] = format_representation_merge_quantity_fragment(
-                        existing["quantity_text"], item["quantity_text"],
-                        format_quantity_display(merged_value, merged_unit),
-                    )
-                    display_items.append(display_item)
-                    inventory_targets.append({
-                        "item_id": existing["id"], "quantity_value": existing["quantity_value"],
-                        "quantity_unit": existing["quantity_unit"],
-                    })
-                    continue
-                if outcome == "separate":
-                    representation_notes.append(format_representation_separate_warning(
-                        item["name"], existing["quantity_text"], item["quantity_text"],
-                    ))
-                display_items.append(item)
-
-            pending_inventory_batch[chat_id] = {
-                "items": items,
-                "ignored_items": result["ignored_items"],
-                "household_id": household_id,
-                "user_db_id": user_db_id,
-                "inventory_targets": inventory_targets,
-            }
-            preview = format_inventory_preview(display_items, result["ignored_items"])
-            if representation_notes:
-                preview = "\n\n".join(representation_notes) + "\n\n" + preview
-            send_message(chat_id, preview, reply_markup=ADD_INVENTORY_PREVIEW_KEYBOARD)
-        except Exception:
-            send_message(chat_id, INVENTORY_ERROR_MSG)
-        return "ok"
-
-    if inv_mode == "removing":
-        try:
-            household_id, user_db_id = get_household_and_user(user_id, display_name)
-            items = get_inventory_items(household_id)
-            if not items:
-                send_message(chat_id, "Запаси поки порожні.")
-                return "ok"
-            # Explicit numbered references ("N. назва — кількість" / "N)
-            # ...") never go through Gemini — resolved deterministically
-            # against the SAME numbering the user was just shown, so a
-            # semantically-similar item (e.g. "Сосиски — 2 шт." vs the
-            # user's "сосисок — пару") can never be picked instead of the
-            # exact position requested. Falls back to the existing
-            # natural-language Gemini flow untouched when the text isn't
-            # entirely composed of such numbered lines.
-            numbered_kind, numbered_payload = _resolve_numbered_inventory_delete_selection(text, items)
-            if numbered_kind == "ok":
-                _show_remove_preview(chat_id, numbered_payload, household_id, user_db_id)
-                return "ok"
-            if numbered_kind == "mismatch":
-                number, exists = numbered_payload
-                send_message(chat_id, _format_numbered_delete_mismatch_message(number, exists))
-                inventory_mode[chat_id] = "removing"
-                return "ok"
-            kind, payload = _ask_gemini_for_selection(text, items, "Список запасів", "прибрати із запасів")
-            if kind == "ok":
-                _show_remove_preview(chat_id, payload, household_id, user_db_id)
-            elif kind == "unresolved":
-                send_message(chat_id, _format_unresolved_fragments_message(payload))
-                inventory_mode[chat_id] = "removing"
-            else:
-                send_message(chat_id, SELECTION_ERROR_MSG)
-                inventory_mode[chat_id] = "removing"
-        except Exception:
-            send_message(chat_id, INVENTORY_ERROR_MSG)
+    if legacy_inventory_flow.handle_inventory_mode_text(_inventory_deps, chat_id, user_id, display_name, text):
         return "ok"
 
     # =========================
@@ -4328,33 +4150,7 @@ def webhook():
         _preview_intercepted = legacy_shopping_flow.handle_pending_batch_edit_text(_shopping_deps, chat_id, text)
 
     elif chat_id in pending_inventory_batch:
-        batch = pending_inventory_batch[chat_id]
-        try:
-            router_result = _ask_gemini_preview_edit_router(text, batch["items"], "inventory_pending_add")
-            intent = router_result["intent"]
-            if intent == "edit_preview":
-                valid_updates = _validate_preview_updates(router_result["updates"], batch["items"])
-                if valid_updates:
-                    alias_map = get_household_alias_map(batch["household_id"])
-                    batch["items"] = _apply_preview_updates(batch["items"], valid_updates, alias_map=alias_map)
-                    preview = format_inventory_preview(batch["items"], batch.get("ignored_items"))
-                    send_message(chat_id, preview, reply_markup=ADD_INVENTORY_PREVIEW_KEYBOARD)
-                else:
-                    send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
-                _preview_intercepted = True
-            elif intent == "merge_duplicates":
-                merged = _auto_merge_in_place(batch["items"])
-                if len(merged) < len(batch["items"]):
-                    batch["items"] = merged
-                    preview = format_inventory_preview(merged, batch.get("ignored_items"))
-                    send_message(chat_id, preview, reply_markup=ADD_INVENTORY_PREVIEW_KEYBOARD)
-                else:
-                    send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
-                _preview_intercepted = True
-            # intent == "none": fall through to AI chat
-        except Exception:
-            send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
-            _preview_intercepted = True
+        _preview_intercepted = legacy_inventory_flow.handle_pending_inventory_batch_edit_text(_inventory_deps, chat_id, text)
 
     elif chat_id in pending_inventory_reconciliation_clarify:
         clarify_data = pending_inventory_reconciliation_clarify[chat_id]
@@ -4680,7 +4476,7 @@ def webhook():
                                 elif action == "delete_shopping":
                                     legacy_shopping_flow._show_delete_preview(_shopping_deps, chat_id, selected, household_id, user_db_id)
                                 elif action == "remove_inventory":
-                                    _show_remove_preview(chat_id, selected, household_id, user_db_id)
+                                    legacy_inventory_flow._show_remove_preview(_inventory_deps, chat_id, selected, household_id, user_db_id)
                             else:
                                 send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
                         _preview_intercepted = True
