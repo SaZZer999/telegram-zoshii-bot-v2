@@ -235,16 +235,22 @@ class TestConsumeInventoryNormalizationHint(unittest.TestCase):
 
 
 class TestIncompatibleUnitsStillBlockSafely(unittest.TestCase):
-    # Case 14
-    def test_grams_against_pieces_only_item_is_blocked(self):
+    # Case 14 — superseded by Inventory Representation Clarification V2:
+    # grams against a "шт."-only item is no longer a hard block, it's a
+    # conversational Flow A conflict (see
+    # tests/test_inventory_representation_clarification_v2.py for the full
+    # conversation). This still proves it's not silently accepted as a
+    # normal consumption — the whole batch still blocks until resolved.
+    def test_grams_against_pieces_only_item_starts_representation_clarification(self):
         router_result = {
             "intent": "household_operations",
             "operations": [{"type": "consume_inventory", "item_number": 1, "quantity_value": 200, "quantity_unit": "г"}],
             "unresolved_fragments": [],
         }
-        kind, reasons = household_router._validate_operations(router_result, [_ser_item()], [], NOW)
-        self.assertEqual(kind, "invalid")
-        self.assertTrue(any("несумісні одиниці" in r for r in reasons))
+        kind, payload = household_router._validate_operations(router_result, [_ser_item()], [], NOW)
+        self.assertEqual(kind, "clarify_representation")
+        self.assertEqual(payload["conflict"]["kind"], "consume")
+        self.assertEqual(payload["conflict"]["name"], "ser")
 
 
 if __name__ == '__main__':

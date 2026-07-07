@@ -123,6 +123,55 @@ def resolve_inventory_representation(inventory_items, canonical_name, category,
     return "separate", candidates[0]
 
 
+# =========================
+# INVENTORY REPRESENTATION CLARIFICATION V2 — count ("шт.") vs an explicit
+# mass/volume quantity for the SAME product. Deliberately narrower than the
+# guard above: only this exact shape ever triggers it (never mass<->volume,
+# never a text quantity — those never carry a quantity_unit at all — and
+# never an inferred incoming guess, which stays Inventory Quantity
+# Clarification v1's job), and only when there is exactly one existing
+# count row to reason about — several candidate rows is a genuinely
+# ambiguous "complex case" this version deliberately leaves to the existing
+# guard's own "separate"/"clarify" handling instead.
+# =========================
+_MASS_UNITS = {"г", "кг"}
+_VOLUME_UNITS = {"л", "мл"}
+_MASS_OR_VOLUME_UNITS = _MASS_UNITS | _VOLUME_UNITS
+
+
+def detect_count_vs_mass_volume_conflict(existing_value, existing_unit, incoming_value, incoming_unit, incoming_inferred):
+    """True iff `existing` (a structured count row) and `incoming` (an
+    explicit mass/volume quantity) are exactly the Inventory Representation
+    Clarification V2 shape."""
+    if incoming_inferred:
+        return False
+    if existing_unit != "шт." or existing_value is None:
+        return False
+    if incoming_value is None or incoming_unit not in _MASS_OR_VOLUME_UNITS:
+        return False
+    return True
+
+
+def detect_add_representation_v2_conflict(inventory_items, canonical_name, category,
+                                           incoming_value, incoming_unit, incoming_inferred):
+    """Add-side (Flow B) conflict detection: returns the single existing
+    "шт." row this incoming item conflicts with, or None. Only ever returns
+    a row when there is EXACTLY ONE existing candidate sharing this
+    canonical_name/category — several candidates falls through to the
+    existing guard's own handling, untouched, per the "complex incompatible
+    rows" carve-out above."""
+    candidates = find_inventory_representation_matches(inventory_items, canonical_name, category)
+    if len(candidates) != 1:
+        return None
+    existing = candidates[0]
+    if not detect_count_vs_mass_volume_conflict(
+        existing.get("quantity_value"), existing.get("quantity_unit"),
+        incoming_value, incoming_unit, incoming_inferred,
+    ):
+        return None
+    return existing
+
+
 def format_representation_clarify_message(name, existing_items):
     """The blocking clarification message for the "clarify" outcome — no
     preview is built and nothing is written; the user must restate an

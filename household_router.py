@@ -384,6 +384,264 @@ def apply_inventory_representation_guard(add_inventory_items, inventory_items):
     return "ok", (updated_items, inventory_merge_targets)
 
 
+# =========================
+# INVENTORY REPRESENTATION CLARIFICATION V2 — a conversational resolution
+# for the ONE conflict shape apply_inventory_representation_guard above
+# can't safely resolve on its own: an existing structured count ("шт.") row
+# against an EXPLICIT (never inferred) incoming mass/volume quantity for
+# the SAME product, in a Global Household Operation (add_inventory or
+# consume_inventory). Never mass<->volume, never a text quantity, never an
+# inferred incoming guess (that stays Inventory Quantity Clarification v1's
+# job) — see inventory.detect_count_vs_mass_volume_conflict's own docstring
+# for the exact narrow shape this fires on.
+#
+# Every function below is pure (no Telegram, no DB, no Gemini) — bot.py
+# owns pending_inventory_representation_clarification (the RAM-only
+# continuation state) and calls back into these for every choice/reply, the
+# same split of responsibility as Inventory Quantity Clarification v1.
+# =========================
+_REPRESENTATION_V2_MASS_UNITS = {"г", "кг"}
+_REPRESENTATION_V2_VOLUME_UNITS = {"л", "мл"}
+
+
+def _build_consume_representation_conflict(item, value, unit):
+    """A consume_inventory op whose requested mass/volume conflicts with an
+    existing structured count ("шт.") row — Flow A. `item` is the existing
+    inventory row (from the numbered snapshot), value/unit the requested
+    consume quantity."""
+    return {
+        "kind": "consume",
+        "canonical_name": item.get("canonical_name"), "category": item.get("category"),
+        "name": item["name"],
+        "existing": {
+            "item_id": item["id"], "quantity_value": item["quantity_value"],
+            "quantity_unit": item["quantity_unit"],
+            "quantity_text": item.get("quantity_text") or _bot.format_quantity_display(item["quantity_value"], item["quantity_unit"]),
+        },
+        "requested_value": value, "requested_unit": unit,
+        "requested_display": _bot.format_quantity_display(value, unit),
+    }
+
+
+def _build_add_representation_conflict(item, existing):
+    """An add_inventory item whose explicit mass/volume quantity conflicts
+    with an existing structured count ("шт.") row — Flow B. `item` is the
+    already merged/deduplicated incoming item; `existing` is the
+    conflicting row."""
+    return {
+        "kind": "add",
+        "canonical_name": item.get("canonical_name"), "category": item.get("category"),
+        "name": item["name"],
+        "existing": {
+            "item_id": existing["id"], "quantity_value": existing["quantity_value"],
+            "quantity_unit": existing["quantity_unit"],
+            "quantity_text": existing.get("quantity_text") or _bot.format_quantity_display(existing["quantity_value"], existing["quantity_unit"]),
+        },
+        "incoming_item": item,
+        "incoming_value": item["quantity_value"], "incoming_unit": item["quantity_unit"],
+        "incoming_display": item["quantity_text"],
+    }
+
+
+def format_representation_v2_consume_choice_message(conflict):
+    """Flow A's first question — see module docstring above for the shape
+    this fires on."""
+    name = conflict["name"]
+    existing_text = conflict["existing"]["quantity_text"]
+    requested_text = conflict["requested_display"]
+    return (
+        f"У запасах є «{name} — {existing_text}», а ти хочеш списати {requested_text}.\n\n"
+        "Що це означає?\n\n"
+        "⚖️ Це частина наявного запасу\n"
+        "📦 Це інший / не облікований продукт\n"
+        "❌ Скасувати"
+    )
+
+
+def format_representation_v2_add_choice_message(conflict):
+    """Flow B's first question."""
+    name = conflict["name"]
+    existing_text = conflict["existing"]["quantity_text"]
+    incoming_text = conflict["incoming_display"]
+    return (
+        f"У запасах уже є «{name} — {existing_text}», а нова кількість — {incoming_text}.\n\n"
+        f"Що означають ці {incoming_text}?\n\n"
+        "📦 Це окрема упаковка — додати окремо\n"
+        "⚖️ Це вага наявного запису — уточнити його\n"
+        "❌ Скасувати"
+    )
+
+
+def format_representation_v2_total_quantity_question(conflict):
+    """Flow A follow-up, after "⚖️ Це частина наявного запасу" — asks for
+    the total mass/volume of the WHOLE existing stock (mass wording when
+    the requested consume unit is mass, volume wording when it's volume)."""
+    name = conflict["name"]
+    if conflict["requested_unit"] in _REPRESENTATION_V2_MASS_UNITS:
+        return f"Скільки важив увесь наявний запас «{name}»?\n\nНапиши, наприклад: «250 г»."
+    return f"Скільки було всього наявного запасу «{name}»?\n\nНапиши, наприклад: «500 мл»."
+
+
+_REPRESENTATION_V2_CONSUME_PART_ANSWERS = {
+    "⚖️ це частина наявного запасу", "це частина наявного запасу", "частина наявного запасу",
+}
+_REPRESENTATION_V2_CONSUME_SKIP_ANSWERS = {
+    "📦 це інший / не облікований продукт", "це інший / не облікований продукт",
+    "інший / не облікований продукт", "інший продукт", "не облікований продукт",
+}
+_REPRESENTATION_V2_ADD_SEPARATE_ANSWERS = {
+    "📦 це окрема упаковка — додати окремо", "це окрема упаковка — додати окремо", "окрема упаковка",
+}
+_REPRESENTATION_V2_ADD_RELABEL_ANSWERS = {
+    "⚖️ це вага наявного запису — уточнити його", "це вага наявного запису — уточнити його", "вага наявного запису",
+}
+
+
+def parse_representation_v2_consume_choice(text):
+    """Flow A's choice reply -> "part_of_existing"/"separate_product"/None
+    (invalid) — fixed phrase set, never fuzzy matching or Gemini."""
+    if not isinstance(text, str):
+        return None
+    normalized = text.strip().lower()
+    if normalized in _REPRESENTATION_V2_CONSUME_PART_ANSWERS:
+        return "part_of_existing"
+    if normalized in _REPRESENTATION_V2_CONSUME_SKIP_ANSWERS:
+        return "separate_product"
+    return None
+
+
+def parse_representation_v2_add_choice(text):
+    """Flow B's choice reply -> "separate_package"/"relabel_existing"/None
+    (invalid) — fixed phrase set, never fuzzy matching or Gemini."""
+    if not isinstance(text, str):
+        return None
+    normalized = text.strip().lower()
+    if normalized in _REPRESENTATION_V2_ADD_SEPARATE_ANSWERS:
+        return "separate_package"
+    if normalized in _REPRESENTATION_V2_ADD_RELABEL_ANSWERS:
+        return "relabel_existing"
+    return None
+
+
+def validate_representation_v2_total_quantity(conflict, total_value, total_unit):
+    """Validate a Flow A "скільки важив увесь запас" reply against the
+    active consume-side conflict. Returns ("ok", remaining_value,
+    remaining_unit) or ("invalid", None, None). total_unit must be in the
+    SAME mass/volume group as the requested consume unit (never "шт.",
+    never the other group), and total_value must be strictly greater than
+    what's being consumed — never equal, never less."""
+    requested_unit = conflict["requested_unit"]
+    requested_value = conflict["requested_value"]
+    same_group = (
+        (requested_unit in _REPRESENTATION_V2_MASS_UNITS and total_unit in _REPRESENTATION_V2_MASS_UNITS)
+        or (requested_unit in _REPRESENTATION_V2_VOLUME_UNITS and total_unit in _REPRESENTATION_V2_VOLUME_UNITS)
+    )
+    if not same_group or total_value <= requested_value:
+        return "invalid", None, None
+    kind, remaining, remaining_unit = _bot._resolve_consumption(total_value, total_unit, requested_value, requested_unit)
+    if kind != "ok":
+        return "invalid", None, None
+    return "ok", remaining, remaining_unit
+
+
+def resolve_representation_v2_consume_skip(conflict):
+    """Flow A "📦 Це інший / не облікований продукт" choice: the existing
+    row is untouched, nothing is consumed — a pure preview-only resolution
+    entry, no DB effect at all."""
+    return {
+        "mode": "skip_consume",
+        "item_id": conflict["existing"]["item_id"],
+        "canonical_name": conflict["canonical_name"], "category": conflict["category"], "name": conflict["name"],
+        "source_value": conflict["existing"]["quantity_value"], "source_unit": conflict["existing"]["quantity_unit"],
+        "source_display": conflict["existing"]["quantity_text"],
+        "consume_value": conflict["requested_value"], "consume_unit": conflict["requested_unit"],
+        "consume_display": conflict["requested_display"],
+    }
+
+
+def resolve_representation_v2_consume_relabel(conflict, total_value, total_unit, remaining_value, remaining_unit):
+    """Flow A "⚖️ Це частина наявного запасу" choice, after a valid total
+    quantity reply: relabel the existing "шт." row to the given total, then
+    consume the originally-requested amount from it. Returns
+    (resolution_entry, consume_change_entry) — the consume_change entry
+    feeds into the SAME consume_updates/consume_changes mechanism every
+    other partial consumption already uses (never a second write path);
+    the resolution entry is preview-only bookkeeping."""
+    total_display = _bot.format_quantity_display(total_value, total_unit)
+    remaining_display = _bot.format_quantity_display(remaining_value, remaining_unit)
+    resolution = {
+        "mode": "relabel_and_consume",
+        "item_id": conflict["existing"]["item_id"],
+        "canonical_name": conflict["canonical_name"], "category": conflict["category"], "name": conflict["name"],
+        "source_value": conflict["existing"]["quantity_value"], "source_unit": conflict["existing"]["quantity_unit"],
+        "source_display": conflict["existing"]["quantity_text"],
+        "resolved_value": total_value, "resolved_unit": total_unit, "resolved_display": total_display,
+        "consume_value": conflict["requested_value"], "consume_unit": conflict["requested_unit"],
+        "consume_display": conflict["requested_display"],
+        "remaining_value": remaining_value, "remaining_unit": remaining_unit, "remaining_display": remaining_display,
+    }
+    consume_change = {
+        "item_id": conflict["existing"]["item_id"], "name": conflict["name"],
+        "old_value": conflict["existing"]["quantity_value"], "old_unit": conflict["existing"]["quantity_unit"],
+        "old_display": conflict["existing"]["quantity_text"],
+        "new_value": float(remaining_value), "new_unit": remaining_unit, "new_display": remaining_display,
+        "will_remove": False,
+    }
+    return resolution, consume_change
+
+
+def resolve_representation_v2_add_separate(conflict):
+    """Flow B "📦 Це окрема упаковка" choice: applies the EXISTING separate-
+    representation behavior unchanged — the "шт." row stays untouched, the
+    incoming item becomes its own row."""
+    item = dict(conflict["incoming_item"])
+    item["_representation_outcome"] = "separate"
+    item["_representation_note"] = _bot.format_representation_separate_warning(
+        conflict["name"], conflict["existing"]["quantity_text"], conflict["incoming_display"],
+    )
+    return item
+
+
+def resolve_representation_v2_add_relabel(conflict):
+    """Flow B "⚖️ Це вага наявного запису" choice: corrects the existing
+    row's representation to the incoming quantity — no new row, treated as
+    a representation fix, not a purchase. Returns (resolution_entry,
+    consume_change_entry) — same split as resolve_representation_v2_consume_relabel."""
+    resolved_display = conflict["incoming_display"]
+    resolution = {
+        "mode": "relabel_existing",
+        "item_id": conflict["existing"]["item_id"],
+        "canonical_name": conflict["canonical_name"], "category": conflict["category"], "name": conflict["name"],
+        "source_value": conflict["existing"]["quantity_value"], "source_unit": conflict["existing"]["quantity_unit"],
+        "source_display": conflict["existing"]["quantity_text"],
+        "resolved_value": conflict["incoming_value"], "resolved_unit": conflict["incoming_unit"],
+        "resolved_display": resolved_display,
+    }
+    consume_change = {
+        "item_id": conflict["existing"]["item_id"], "name": conflict["name"],
+        "old_value": conflict["existing"]["quantity_value"], "old_unit": conflict["existing"]["quantity_unit"],
+        "old_display": conflict["existing"]["quantity_text"],
+        "new_value": conflict["incoming_value"], "new_unit": conflict["incoming_unit"], "new_display": resolved_display,
+        "will_remove": False,
+    }
+    return resolution, consume_change
+
+
+def representation_v2_targets_still_fresh(resolutions, fresh_inventory_items):
+    """True iff every representation resolution's target row still matches
+    its captured source snapshot exactly — re-checked against a FRESH
+    inventory snapshot right before building the final combined preview,
+    never trusted from when the clarification started."""
+    fresh_by_id = {item["id"]: item for item in fresh_inventory_items}
+    for r in resolutions:
+        fresh = fresh_by_id.get(r["item_id"])
+        if fresh is None:
+            return False
+        if fresh.get("quantity_value") != r["source_value"] or fresh.get("quantity_unit") != r["source_unit"]:
+            return False
+    return True
+
+
 def _legacy_single_expense(new_expenses):
     """Backward-compat derived value for the "new_expense" (singular) payload
     key every pre-Multi-Expense-Batch caller/test still reads: the one
@@ -426,6 +684,19 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
           that point, so a caller can resolve the ambiguous quantity later
           and re-run apply_inventory_representation_guard without redoing
           any of this work or re-calling Gemini.
+      ("clarify_representation", {"conflict", "queue", "add_shopping_items",
+                    "add_inventory_items", "inventory_merge_targets",
+                    "consume_changes", "new_expenses", "new_expense",
+                    "delete_expense"})
+          — Inventory Representation Clarification V2: a structured count
+          ("шт.") row conflicts with an explicit incoming mass/volume
+          quantity for the same product (add or consume side). Blocks the
+          entire result (never a partial apply); "conflict" is the first
+          one to ask about, "queue" holds any others found in the same
+          message. Every other operation already validated is carried
+          through untouched, so a caller can resolve conflicts one at a
+          time and build the final combined preview without redoing any of
+          this work or re-calling Gemini.
       ("none", None)
     """
     fragments = router_result.get("unresolved_fragments")
@@ -445,6 +716,7 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
     add_shopping_raw = []
     add_inventory_raw = []
     consume_changes = []
+    consume_representation_conflicts = []
     used_inventory_numbers = set()
     new_expenses = []
     delete_expense = None
@@ -501,6 +773,17 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             cur_unit = item.get("quantity_unit")
             if cur_value is None or cur_unit is None:
                 reasons.append(f"«{item['name']}» — не вказана точна кількість, не можна безпечно списати частину.")
+                continue
+            if _bot.detect_count_vs_mass_volume_conflict(cur_value, cur_unit, value, unit, False):
+                # Inventory Representation Clarification V2 (Flow A) — a
+                # structured count row vs an explicit mass/volume consume
+                # request is a conversational conflict, not a hard block;
+                # deferred here (never added to reasons/consume_changes) so
+                # the rest of the batch survives while this ONE item is
+                # asked about later (see _validate_operations_detailed's
+                # post-merge representation_conflict_queue handling below).
+                used_inventory_numbers.add(num)
+                consume_representation_conflicts.append(_build_consume_representation_conflict(item, value, unit))
                 continue
             kind, remaining, remaining_unit = _bot._resolve_consumption(cur_value, cur_unit, value, unit)
             if kind == "incompatible_units":
@@ -572,11 +855,39 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
     add_shopping_items = _bot._auto_merge_in_place(add_shopping_raw) if add_shopping_raw else []
     add_inventory_items = _bot._auto_merge_in_place(add_inventory_raw) if add_inventory_raw else []
 
+    # Inventory Representation Clarification V2 (Flow B) — pull out any
+    # add_inventory item whose explicit mass/volume quantity conflicts with
+    # a SINGLE existing structured count ("шт.") row, BEFORE the v1 guard
+    # ever sees it, so v1 never gets the chance to silently file it as
+    # "separate". Several candidate rows (a genuinely ambiguous case) is
+    # deliberately left alone here — detect_add_representation_v2_conflict
+    # itself returns None for anything but exactly one candidate.
+    add_representation_conflicts = []
+    filtered_add_inventory_items = []
+    for item in add_inventory_items:
+        existing = _bot.detect_add_representation_v2_conflict(
+            inventory_items, item.get("canonical_name"), item.get("category"),
+            item.get("quantity_value"), item.get("quantity_unit"), item.get("quantity_inferred", False),
+        )
+        if existing is not None:
+            add_representation_conflicts.append(_build_add_representation_conflict(item, existing))
+        else:
+            filtered_add_inventory_items.append(item)
+
     # Inventory Representation Guard v1 — runs on the FINAL (already
     # RAM-deduplicated) add_inventory_items, once per distinct product, so a
     # message mentioning the same product twice is checked against the live
     # inventory exactly once, using its combined quantity.
-    guard_kind, guard_result = apply_inventory_representation_guard(add_inventory_items, inventory_items)
+    guard_kind, guard_result = apply_inventory_representation_guard(filtered_add_inventory_items, inventory_items)
+    if guard_kind == "clarify" and add_representation_conflicts:
+        # A genuinely complex message — a v1 ambiguity elsewhere AND a V2-
+        # shaped conflict at the same time. Never attempt both conversations
+        # at once: fall back to the guard's ORIGINAL, unfiltered view (the
+        # V2 item behaves exactly as it did before this feature existed — a
+        # silent "separate" add) so the v1 clarify path sees precisely what
+        # it always has, and nothing from the batch is lost.
+        guard_kind, guard_result = apply_inventory_representation_guard(add_inventory_items, inventory_items)
+        add_representation_conflicts = []
     if guard_kind == "clarify":
         return "clarify", {
             **guard_result,
@@ -588,6 +899,20 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             "delete_expense": delete_expense,
         }
     add_inventory_items, inventory_merge_targets = guard_result
+
+    representation_conflict_queue = consume_representation_conflicts + add_representation_conflicts
+    if representation_conflict_queue:
+        return "clarify_representation", {
+            "conflict": representation_conflict_queue[0],
+            "queue": representation_conflict_queue[1:],
+            "add_shopping_items": add_shopping_items,
+            "add_inventory_items": add_inventory_items,
+            "inventory_merge_targets": inventory_merge_targets,
+            "consume_changes": consume_changes,
+            "new_expenses": new_expenses,
+            "new_expense": _legacy_single_expense(new_expenses),
+            "delete_expense": delete_expense,
+        }
 
     if not add_shopping_items and not add_inventory_items and not consume_changes and not new_expenses and not delete_expense:
         return "invalid", ["Не знайшов жодної дії для виконання."]
@@ -651,7 +976,8 @@ def format_preview(payload):
         for item in payload["add_shopping_items"]:
             lines.append(_format_new_item_line(item))
 
-    if payload["add_inventory_items"] or payload["consume_changes"]:
+    representation_resolutions = payload.get("inventory_representation_resolutions") or []
+    if payload["add_inventory_items"] or payload["consume_changes"] or representation_resolutions:
         separate_warnings = [
             item["_representation_note"] for item in payload["add_inventory_items"]
             if item.get("_representation_outcome") == "separate"
@@ -666,7 +992,31 @@ def format_preview(payload):
                 lines.append(item["_representation_note"])
             else:
                 lines.append(_format_new_item_line(item))
+        # Inventory Representation Clarification V2 resolutions — rendered
+        # BEFORE the normal consume_changes loop below (which skips any
+        # entry tagged "_from_representation_resolution": those are the
+        # SAME relabel_and_consume/relabel_existing entries, already shown
+        # here with their own two-line/one-line wording, never twice).
+        for r in representation_resolutions:
+            if r["mode"] == "relabel_existing":
+                lines.append(
+                    f"• {r['name']} — {r['source_display']} → {r['resolved_display']} "
+                    "(уточнено, без додавання нового товару)"
+                )
+            elif r["mode"] == "relabel_and_consume":
+                lines.append(f"• {r['name']} — {r['source_display']} → {r['resolved_display']}")
+                lines.append(
+                    f"• {r['name']} — {r['resolved_display']} − {r['consume_display']} → "
+                    f"буде {r['remaining_display']}"
+                )
+            elif r["mode"] == "skip_consume":
+                lines.append(
+                    f"⚠️ {r['name']} — {r['consume_display']} не списувати: "
+                    "це окремий продукт, якого немає у запасах."
+                )
         for c in payload["consume_changes"]:
+            if c.get("_from_representation_resolution"):
+                continue
             label = c["name"]
             if c["old_display"]:
                 label += f" — {c['old_display']}"

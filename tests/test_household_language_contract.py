@@ -41,6 +41,7 @@ import household_router  # noqa: E402
 from bot import (  # noqa: E402
     pending_global_household,
     pending_inventory_quantity_clarification,
+    pending_inventory_representation_clarification,
     pending_add_destination_clarification,
     pending_undo_action,
     pending_expense,
@@ -73,6 +74,7 @@ class HouseholdLanguageContractTestCase(unittest.TestCase):
     def setUp(self):
         for d in (
             pending_global_household, pending_inventory_quantity_clarification,
+            pending_inventory_representation_clarification,
             pending_add_destination_clarification, pending_undo_action, pending_expense,
         ):
             d.clear()
@@ -134,6 +136,7 @@ class HouseholdLanguageContractTestCase(unittest.TestCase):
     def tearDown(self):
         for d in (
             pending_global_household, pending_inventory_quantity_clarification,
+            pending_inventory_representation_clarification,
             pending_add_destination_clarification, pending_undo_action, pending_expense,
         ):
             d.clear()
@@ -205,6 +208,28 @@ class TestGlobalHouseholdCommandsWorkFromAnywhere(HouseholdLanguageContractTestC
         self.assertEqual(payload["consume_changes"][0]["new_value"], 300.0)
         self.mock_call_gemini.assert_not_called()
 
+    # Scenario 3b (Inventory Representation Clarification V2): "З'їв 200 г
+    # сиру" against an existing "1 шт." row -> a representation
+    # clarification, never a hard "несумісні одиниці" block, never general AI.
+    def test_consume_mass_against_count_only_row_starts_representation_clarification(self):
+        chat_id = 700015
+        self.mock_inventory.return_value = [{
+            "id": 602, "name": "Сир", "category": "Молочне та яйця", "canonical_name": "сир",
+            "quantity_value": 1.0, "quantity_unit": "шт.", "quantity_text": "1 шт.", "quantity_inferred": False,
+        }]
+        self.mock_hr.return_value = {
+            "intent": "household_operations",
+            "operations": [{"type": "consume_inventory", "item_number": 1,
+                             "quantity_value": 200, "quantity_unit": "г"}],
+            "unresolved_fragments": [],
+        }
+        _call_webhook(_make_update(700000015, chat_id, "З'їв 200 г сиру"))
+        self.assertIn(chat_id, pending_inventory_representation_clarification)
+        self.assertNotIn(chat_id, pending_global_household)
+        self.mock_call_gemini.assert_not_called()
+        texts = self._sent_texts()
+        self.assertTrue(any("Що це означає?" in t for t in texts))
+
     # Scenario 4: "Додай до покупок молоко і хліб" -> shopping preview only
     def test_explicit_shopping_destination_builds_shopping_only_preview(self):
         chat_id = 700004
@@ -266,6 +291,28 @@ class TestGlobalHouseholdCommandsWorkFromAnywhere(HouseholdLanguageContractTestC
         self.assertTrue(any("🧊 Запаси" in t and "💸 Витрати" in t for t in texts))
         self.assertFalse(any("лише одну нову витрату" in t for t in texts))
         self.mock_call_gemini.assert_not_called()
+
+    # Scenario 5c (Inventory Representation Clarification V2): "Купив 250 г
+    # сиру" against an existing "1 шт." row -> an add-side representation
+    # clarification, never a silent "separate row" insert.
+    def test_add_mass_against_count_only_row_starts_representation_clarification(self):
+        chat_id = 700021
+        self.mock_inventory.return_value = [{
+            "id": 603, "name": "Сир", "category": "Молочне та яйця", "canonical_name": "сир",
+            "quantity_value": 1.0, "quantity_unit": "шт.", "quantity_text": "1 шт.", "quantity_inferred": False,
+        }]
+        self.mock_hr.return_value = {
+            "intent": "household_operations",
+            "operations": [{"type": "add_inventory", "name": "Сир", "quantity_text": "250 г",
+                             "category": "Молочне та яйця"}],
+            "unresolved_fragments": [],
+        }
+        _call_webhook(_make_update(700000021, chat_id, "Купив 250 г сиру"))
+        self.assertIn(chat_id, pending_inventory_representation_clarification)
+        self.assertNotIn(chat_id, pending_global_household)
+        self.mock_apply.assert_not_called()
+        texts = self._sent_texts()
+        self.assertTrue(any("Що означають ці 250 г?" in t for t in texts))
 
 
 # =========================

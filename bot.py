@@ -64,6 +64,8 @@ from inventory import (
     format_representation_separate_warning,
     format_representation_merge_line,
     format_representation_merge_quantity_fragment,
+    detect_count_vs_mass_volume_conflict,
+    detect_add_representation_v2_conflict,
     _resolve_consumption,
     _validate_consumptions,
     _format_consumption_preview,
@@ -152,6 +154,25 @@ pending_inventory_quantity_clarification = {}  # chat_id -> {household_id, user_
                                 #             add_shopping_items, add_inventory_items,
                                 #             consume_changes, new_expense, delete_expense}
 
+# Inventory Representation Clarification V2 — short-lived RAM-only
+# continuation state for the ONE conflict shape the Inventory Representation
+# Guard can't safely resolve on its own: an existing structured count
+# ("шт.") row against an EXPLICIT incoming mass/volume quantity for the same
+# product (add or consume side — see household_router.
+# detect_count_vs_mass_volume_conflict/detect_add_representation_v2_conflict).
+# Holds only structured data, never raw text/Gemini history, so a reply
+# (a button choice, then optionally a total-quantity number) can safely
+# continue the ORIGINAL command instead of falling through to general
+# AI-chat. "queue" holds any further such conflicts found in the same
+# message, resolved one at a time; "representation_resolutions" accumulates
+# the resolved entries for the eventual combined preview.
+pending_inventory_representation_clarification = {}  # chat_id -> {household_id, user_db_id, origin,
+                                #             stage ("choice"|"awaiting_total"), conflict, queue,
+                                #             add_shopping_items, add_inventory_items,
+                                #             inventory_merge_targets, consume_changes,
+                                #             new_expenses, new_expense, delete_expense,
+                                #             representation_resolutions}
+
 # Global Bare Add v1 — short-lived RAM-only continuation state for a bare
 # "Додай молоко" (no destination phrase) typed from a menu that doesn't
 # already imply one (main menu, aliases, expenses). Holds only the already
@@ -191,6 +212,11 @@ _ALIAS_GATE_BLOCKING_PENDING_STATES = (
     # reasoning: while active, no other gate/flow may start a new preview,
     # touch the database, or reach general AI-chat.
     pending_inventory_quantity_clarification,
+    # Inventory Representation Clarification V2's own continuation state —
+    # same reasoning: while a count-vs-mass/volume conflict is unresolved,
+    # no other gate/flow may start a new preview, touch the database, or
+    # reach general AI-chat.
+    pending_inventory_representation_clarification,
     # Global Bare Add v1's own continuation state — same reasoning: while a
     # "куди додати?" question is unanswered, no other gate/flow may start a
     # new preview, touch the database, or reach general AI-chat.
@@ -886,6 +912,45 @@ ADD_DESTINATION_CLARIFICATION_INVALID_MSG = (
     "🧊 До запасів"
 )
 
+# Inventory Representation Clarification V2 — see household_router.py's own
+# "INVENTORY REPRESENTATION CLARIFICATION V2" section for the pure
+# formatting/parsing/resolution logic; this is only the Telegram-facing
+# keyboards and the fixed messages that never need conflict-specific data.
+REPRESENTATION_V2_CONSUME_CHOICE_KEYBOARD = {
+    "keyboard": [
+        ["⚖️ Це частина наявного запасу"],
+        ["📦 Це інший / не облікований продукт"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+REPRESENTATION_V2_ADD_CHOICE_KEYBOARD = {
+    "keyboard": [
+        ["📦 Це окрема упаковка — додати окремо"],
+        ["⚖️ Це вага наявного запису — уточнити його"],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+REPRESENTATION_V2_PREVIEW_GUARD_MSG = (
+    "Є незавершене уточнення щодо запасів.\n\n"
+    "Вибери варіант або скасуй його."
+)
+
+_REPRESENTATION_V2_TOTAL_QUANTITY_INVALID_MSG = (
+    "Потрібна загальна вага або об’єм наявного запасу.\n\n"
+    "Напиши значення більше за те, що списується. Наприклад: «250 г»."
+)
+
+_REPRESENTATION_V2_STALE_MSG = (
+    "Запаси змінилися, тому це уточнення вже неактуальне.\n\n"
+    "Нічого не було змінено. Спробуй команду ще раз."
+)
+
 RECONCILIATION_PREVIEW_KEYBOARD = {
     "keyboard": [
         ["✅ Підтвердити звіряння"],
@@ -1350,6 +1415,7 @@ def clear_interaction_state(chat_id):
     clear_list_context(chat_id)
     pending_global_household.pop(chat_id, None)
     pending_inventory_quantity_clarification.pop(chat_id, None)
+    pending_inventory_representation_clarification.pop(chat_id, None)
     pending_add_destination_clarification.pop(chat_id, None)
     pending_undo_action.pop(chat_id, None)
 
@@ -2824,6 +2890,30 @@ def _handle_household_router_result(chat_id, kind, payload, household_id, user_d
             reply_markup=keyboard,
         )
         return True
+    if kind == "clarify_representation":
+        # Inventory Representation Clarification V2: a structured count row
+        # conflicts with an explicit incoming mass/volume quantity for the
+        # same product — block the whole compound preview, nothing is
+        # written, and start its own continuation state instead of a
+        # dead-end message, so the next reply (a button choice, then
+        # optionally a total-quantity number) can safely continue THIS
+        # command.
+        pending_inventory_representation_clarification[chat_id] = {
+            "household_id": household_id, "user_db_id": user_db_id, "origin": origin,
+            "stage": "choice",
+            "conflict": payload["conflict"],
+            "queue": payload["queue"],
+            "add_shopping_items": payload["add_shopping_items"],
+            "add_inventory_items": payload["add_inventory_items"],
+            "inventory_merge_targets": payload["inventory_merge_targets"],
+            "consume_changes": payload["consume_changes"],
+            "new_expenses": payload["new_expenses"],
+            "new_expense": payload["new_expense"],
+            "delete_expense": payload["delete_expense"],
+            "representation_resolutions": [],
+        }
+        _send_representation_v2_choice_message(chat_id, payload["conflict"])
+        return True
     # kind == "ok"
     inventory_targets = _snapshot_targets(payload["consume_changes"]) + payload["inventory_merge_targets"]
     pending_global_household[chat_id] = {
@@ -3249,6 +3339,157 @@ def _continue_inventory_quantity_clarification(chat_id, text):
         send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
 
 
+def _send_representation_v2_choice_message(chat_id, conflict):
+    """Sends Flow A's or Flow B's first question (see household_router.py's
+    "INVENTORY REPRESENTATION CLARIFICATION V2" section), matching the
+    choice keyboard to the conflict's kind."""
+    if conflict["kind"] == "consume":
+        send_message(
+            chat_id, household_router.format_representation_v2_consume_choice_message(conflict),
+            reply_markup=REPRESENTATION_V2_CONSUME_CHOICE_KEYBOARD,
+        )
+    else:
+        send_message(
+            chat_id, household_router.format_representation_v2_add_choice_message(conflict),
+            reply_markup=REPRESENTATION_V2_ADD_CHOICE_KEYBOARD,
+        )
+
+
+def _advance_representation_v2_queue(chat_id, data, resolution, extra_consume_change=None):
+    """Shared tail for every Inventory Representation Clarification V2
+    choice: records the resolution (if any) and the extra consume_change
+    (if any — tagged "_from_representation_resolution" so format_preview's
+    normal consume_changes loop skips it, since it's already rendered via
+    inventory_representation_resolutions), then either asks about the NEXT
+    queued conflict or — once the queue is empty — re-validates every
+    resolved target against a FRESH inventory snapshot and builds the final
+    combined Global preview. Never re-calls Gemini."""
+    origin = data.get("origin", "global")
+    keyboard = household_router.origin_keyboard(origin)
+
+    if resolution is not None:
+        data["representation_resolutions"] = data["representation_resolutions"] + [resolution]
+    if extra_consume_change is not None:
+        extra_consume_change = dict(extra_consume_change)
+        extra_consume_change["_from_representation_resolution"] = True
+        data["consume_changes"] = data["consume_changes"] + [extra_consume_change]
+
+    queue = data["queue"]
+    if queue:
+        data["conflict"] = queue[0]
+        data["queue"] = queue[1:]
+        data["stage"] = "choice"
+        pending_inventory_representation_clarification[chat_id] = data
+        _send_representation_v2_choice_message(chat_id, data["conflict"])
+        return
+
+    household_id = data["household_id"]
+    try:
+        fresh_inventory_items = get_inventory_items(household_id)
+    except Exception:
+        pending_inventory_representation_clarification.pop(chat_id, None)
+        send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+        return
+
+    if not household_router.representation_v2_targets_still_fresh(
+        data["representation_resolutions"], fresh_inventory_items,
+    ):
+        pending_inventory_representation_clarification.pop(chat_id, None)
+        send_message(chat_id, _REPRESENTATION_V2_STALE_MSG, reply_markup=keyboard)
+        return
+
+    pending_inventory_representation_clarification.pop(chat_id, None)
+    payload = {
+        "add_shopping_items": data["add_shopping_items"],
+        "add_inventory_items": data["add_inventory_items"],
+        "consume_changes": data["consume_changes"],
+        "new_expenses": data["new_expenses"],
+        "new_expense": data["new_expense"],
+        "delete_expense": data["delete_expense"],
+        "inventory_representation_resolutions": data["representation_resolutions"],
+    }
+    inventory_targets = _snapshot_targets(payload["consume_changes"]) + data["inventory_merge_targets"]
+    pending_global_household[chat_id] = {
+        "add_shopping_items": payload["add_shopping_items"],
+        "add_inventory_items": payload["add_inventory_items"],
+        "consume_changes": payload["consume_changes"],
+        "inventory_targets": inventory_targets,
+        "new_expenses": payload["new_expenses"],
+        "new_expense": payload["new_expense"],
+        "delete_expense": payload["delete_expense"],
+        "inventory_representation_resolutions": payload["inventory_representation_resolutions"],
+        "household_id": household_id,
+        "user_db_id": data["user_db_id"],
+        "origin": origin,
+    }
+    send_message(chat_id, household_router.format_preview(payload), reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+
+
+def _continue_inventory_representation_clarification(chat_id, text):
+    """Handle a plain-text reply while pending_inventory_representation_
+    clarification is active for this chat (Inventory Representation
+    Clarification V2). Never re-calls Gemini and never hand-builds a
+    sentence to send back through the router — works entirely off the
+    structured payload captured when the clarification started. Always
+    returns having fully handled the message (the caller must not fall
+    through to anything else)."""
+    data = pending_inventory_representation_clarification[chat_id]
+    origin = data.get("origin", "global")
+    keyboard = household_router.origin_keyboard(origin)
+    conflict = data["conflict"]
+
+    try:
+        if data["stage"] == "awaiting_total":
+            value, unit = _parse_explicit_clarification_quantity(text)
+            if value is None or unit is None:
+                send_message(chat_id, _REPRESENTATION_V2_TOTAL_QUANTITY_INVALID_MSG)
+                return
+            kind, remaining, remaining_unit = household_router.validate_representation_v2_total_quantity(
+                conflict, value, unit,
+            )
+            if kind != "ok":
+                send_message(chat_id, _REPRESENTATION_V2_TOTAL_QUANTITY_INVALID_MSG)
+                return
+            resolution, consume_change = household_router.resolve_representation_v2_consume_relabel(
+                conflict, value, unit, remaining, remaining_unit,
+            )
+            _advance_representation_v2_queue(chat_id, data, resolution, extra_consume_change=consume_change)
+            return
+
+        # stage == "choice"
+        if conflict["kind"] == "consume":
+            choice = household_router.parse_representation_v2_consume_choice(text)
+            if choice is None:
+                send_message(chat_id, REPRESENTATION_V2_PREVIEW_GUARD_MSG)
+                return
+            if choice == "part_of_existing":
+                data["stage"] = "awaiting_total"
+                pending_inventory_representation_clarification[chat_id] = data
+                send_message(chat_id, household_router.format_representation_v2_total_quantity_question(conflict))
+                return
+            # choice == "separate_product"
+            resolution = household_router.resolve_representation_v2_consume_skip(conflict)
+            _advance_representation_v2_queue(chat_id, data, resolution)
+            return
+
+        # conflict["kind"] == "add"
+        choice = household_router.parse_representation_v2_add_choice(text)
+        if choice is None:
+            send_message(chat_id, REPRESENTATION_V2_PREVIEW_GUARD_MSG)
+            return
+        if choice == "separate_package":
+            item = household_router.resolve_representation_v2_add_separate(conflict)
+            data["add_inventory_items"] = data["add_inventory_items"] + [item]
+            _advance_representation_v2_queue(chat_id, data, resolution=None)
+            return
+        # choice == "relabel_existing"
+        resolution, consume_change = household_router.resolve_representation_v2_add_relabel(conflict)
+        _advance_representation_v2_queue(chat_id, data, resolution, extra_consume_change=consume_change)
+    except Exception:
+        pending_inventory_representation_clarification.pop(chat_id, None)
+        send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+
+
 @app.route("/")
 def home():
     return "Bot is running"
@@ -3430,6 +3671,10 @@ def webhook():
             send_message(chat_id, "Зміни скасовано.", reply_markup=household_router.origin_keyboard(origin))
         elif chat_id in pending_inventory_quantity_clarification:
             data = pending_inventory_quantity_clarification.pop(chat_id, None)
+            origin = (data or {}).get("origin", "global")
+            send_message(chat_id, "Уточнення скасовано.", reply_markup=household_router.origin_keyboard(origin))
+        elif chat_id in pending_inventory_representation_clarification:
+            data = pending_inventory_representation_clarification.pop(chat_id, None)
             origin = (data or {}).get("origin", "global")
             send_message(chat_id, "Уточнення скасовано.", reply_markup=household_router.origin_keyboard(origin))
         elif chat_id in pending_add_destination_clarification:
@@ -4353,6 +4598,18 @@ def webhook():
         # this might eventually produce are handled earlier, before this
         # chain, same as every other pending-state branch here.
         _continue_inventory_quantity_clarification(chat_id, text)
+        _preview_intercepted = True
+
+    elif chat_id in pending_inventory_representation_clarification:
+        # Inventory Representation Clarification V2: a structured count row
+        # conflicts with an explicit incoming mass/volume quantity for the
+        # same product — this reply (a button choice, then optionally a
+        # total-quantity number) continues that ORIGINAL command instead of
+        # reaching the router gate below, legacy flows, the database, or
+        # general AI-chat. The confirm/cancel button texts for a preview
+        # this might eventually produce are handled earlier, before this
+        # chain, same as every other pending-state branch here.
+        _continue_inventory_representation_clarification(chat_id, text)
         _preview_intercepted = True
 
     elif chat_id in pending_global_household:
