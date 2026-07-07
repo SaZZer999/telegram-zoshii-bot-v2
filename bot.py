@@ -1596,6 +1596,31 @@ def _parse_explicit_clarification_quantity(text):
     return value, unit
 
 
+def _parse_representation_v2_total_quantity_reply(text, requested_unit):
+    """Parse a reply to Inventory Representation Clarification V2's "скільки
+    важив/було увесь наявний запас?" substage (see
+    pending_inventory_representation_clarification's "awaiting_total"
+    stage) — the ONE place a bare number (no unit) is accepted, since the
+    unit is unambiguous here: it's always the SAME unit as the already-known
+    consume request (`requested_unit`), never just its mass/volume group
+    (e.g. consuming "200 г" and replying bare "300" means "300 г", never
+    "0.3 кг"). Every explicit form (_parse_explicit_clarification_quantity)
+    is tried first and still works unchanged; this only adds a fallback for
+    a bare number, and ONLY here — _parse_explicit_clarification_quantity
+    itself, used by every other clarification flow, is untouched."""
+    value, unit = _parse_explicit_clarification_quantity(text)
+    if value is not None and unit is not None:
+        return value, unit
+    stripped = (text or "").strip().replace(",", ".")
+    try:
+        bare_value = Decimal(stripped)
+    except InvalidOperation:
+        return None, None
+    if bare_value <= 0:
+        return None, None
+    return bare_value, requested_unit
+
+
 def normalize_item_quantity(name, quantity_text, quantity_value=None, quantity_unit=None, allow_default_unit=False, alias_map=None):
     """Compute name/canonical_name/quantity_value/quantity_unit/quantity_inferred/quantity_text for an item.
 
@@ -3440,7 +3465,7 @@ def _continue_inventory_representation_clarification(chat_id, text):
 
     try:
         if data["stage"] == "awaiting_total":
-            value, unit = _parse_explicit_clarification_quantity(text)
+            value, unit = _parse_representation_v2_total_quantity_reply(text, conflict["requested_unit"])
             if value is None or unit is None:
                 send_message(chat_id, _REPRESENTATION_V2_TOTAL_QUANTITY_INVALID_MSG)
                 return

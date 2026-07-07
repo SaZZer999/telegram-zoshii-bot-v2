@@ -34,6 +34,7 @@ os.environ.setdefault('ALLOWED_USER_IDS', '')
 
 import bot  # noqa: E402 — import side effect wires household_router.configure(...)
 import household_router  # noqa: E402
+import inventory  # noqa: E402
 from bot import (  # noqa: E402
     pending_global_household,
     pending_inventory_representation_clarification,
@@ -211,10 +212,13 @@ class TestConsumeFlowAPartOfExisting(_BaseGlobalRouterTestCase):
             for t in texts
         ))
 
-    # #5: 200 г, 150 г, 1 шт., 500 мл, and a bare "250" are all rejected as
-    # a total quantity for a 200 г consume request.
+    # #5: 200 г, 150 г, 1 шт., 500 мл, and a bare "200" (equal to what's
+    # being consumed — not strictly greater) are all rejected as a total
+    # quantity for a 200 г consume request. A bare number IS now accepted
+    # in this substage (see TestBareNumberTotalQuantity below) — but only
+    # when its magnitude is strictly greater than the consumed amount.
     def test_invalid_totals_are_rejected(self):
-        for i, bad_total in enumerate(("200 г", "150 г", "1 шт.", "500 мл", "250")):
+        for i, bad_total in enumerate(("200 г", "150 г", "1 шт.", "500 мл", "200")):
             chat_id = 810010 + i
             with self.subTest(bad_total=bad_total):
                 self._seed_consume_clarification(chat_id)
@@ -452,6 +456,252 @@ class TestNeverTriggersOutsideExactShape(unittest.TestCase):
         kind, payload = household_router._validate_operations(router_result, [yogurt_row], [], NOW)
         self.assertEqual(kind, "ok")
         self.assertEqual(payload["add_inventory_items"][0]["_representation_outcome"], "separate")
+
+
+# =========================
+# UX fix #1 — bare number accepted in the "awaiting_total" substage,
+# contextual to the unit of the ORIGINAL consume request.
+# =========================
+class TestBareNumberTotalQuantity(_BaseGlobalRouterTestCase):
+    # #1: bare "300" after "З'їв 200 г сиру" means "300 г".
+    def test_bare_number_means_same_unit_as_consumed_mass(self):
+        chat_id = 810090
+        self._seed_consume_clarification(chat_id, requested_value=200.0, requested_unit="г")
+        _call_webhook(_make_update(810000090, chat_id, "⚖️ Це частина наявного запасу"))
+        with patch.object(bot, "get_inventory_items", return_value=[_cheese_1pc_row()]):
+            _call_webhook(_make_update(810000091, chat_id, "300"))
+        self.assertNotIn(chat_id, pending_inventory_representation_clarification)
+        self.assertIn(chat_id, pending_global_household)
+        data = pending_global_household[chat_id]
+        self.assertEqual(data["consume_changes"][0]["new_unit"], "г")
+        texts = self._sent_texts()
+        self.assertTrue(any("Сир — 1 шт. → 300 г" in t and "буде 100 г" in t for t in texts))
+
+    # #2: bare "1" after "З'їв 0,5 кг сиру" means "1 кг" (checked via the
+    # resolution's own resolved_unit — consume_changes' new_unit is always
+    # expressed in the group's canonical display unit ("г"/"л"), same
+    # pre-existing behavior as every other partial consumption, unrelated
+    # to what unit the bare reply was interpreted as).
+    def test_bare_number_means_same_unit_as_consumed_mass_kg(self):
+        chat_id = 810091
+        self._seed_consume_clarification(chat_id, requested_value=0.5, requested_unit="кг")
+        _call_webhook(_make_update(810000092, chat_id, "⚖️ Це частина наявного запасу"))
+        with patch.object(bot, "get_inventory_items", return_value=[_cheese_1pc_row()]):
+            _call_webhook(_make_update(810000093, chat_id, "1"))
+        self.assertNotIn(chat_id, pending_inventory_representation_clarification)
+        self.assertIn(chat_id, pending_global_household)
+        data = pending_global_household[chat_id]
+        resolution = data["inventory_representation_resolutions"][0]
+        self.assertEqual(resolution["resolved_value"], Decimal("1"))
+        self.assertEqual(resolution["resolved_unit"], "кг")
+
+    # #2b: bare "1000" after "Використав 500 мл" means "1000 мл"; bare "2"
+    # after consuming "1 л" means "2 л".
+    def test_bare_number_means_same_unit_as_consumed_volume(self):
+        for i, (requested_value, requested_unit, bare_reply, expected_unit, chat_id) in enumerate((
+            (500.0, "мл", "1000", "мл", 810093),
+            (1.0, "л", "2", "л", 810094),
+        )):
+            with self.subTest(requested_unit=requested_unit, bare_reply=bare_reply):
+                self._seed_consume_clarification(chat_id, requested_value=requested_value, requested_unit=requested_unit)
+                _call_webhook(_make_update(810000200 + i * 2, chat_id, "⚖️ Це частина наявного запасу"))
+                with patch.object(bot, "get_inventory_items", return_value=[_cheese_1pc_row()]):
+                    _call_webhook(_make_update(810000201 + i * 2, chat_id, bare_reply))
+                self.assertIn(chat_id, pending_global_household)
+                data = pending_global_household[chat_id]
+                resolution = data["inventory_representation_resolutions"][0]
+                self.assertEqual(resolution["resolved_value"], Decimal(bare_reply))
+                self.assertEqual(resolution["resolved_unit"], expected_unit)
+
+    # Still-supported explicit forms alongside the new bare-number allowance
+    # — each paired with a compatible SAME-unit consume request, exactly
+    # like every explicit-form total quantity already worked before this fix.
+    def test_explicit_forms_still_accepted(self):
+        cases = (
+            ("300 г", "г", 200.0),
+            ("300ГРАМ", "г", 200.0),
+            ("0,3 кг", "кг", 0.2),
+            ("1 л", "л", 0.5),
+            ("500 мл", "мл", 200.0),
+        )
+        for i, (total_text, requested_unit, requested_value) in enumerate(cases):
+            chat_id = 810100 + i
+            with self.subTest(total_text=total_text):
+                self._seed_consume_clarification(chat_id, requested_value=requested_value, requested_unit=requested_unit)
+                _call_webhook(_make_update(810000300 + i * 2, chat_id, "⚖️ Це частина наявного запасу"))
+                with patch.object(bot, "get_inventory_items", return_value=[_cheese_1pc_row()]):
+                    _call_webhook(_make_update(810000301 + i * 2, chat_id, total_text))
+                self.assertIn(chat_id, pending_global_household)
+
+    # #3: a bare number OUTSIDE the representation total substage still
+    # never becomes a valid quantity — the general parser is untouched.
+    def test_bare_number_rejected_outside_representation_substage(self):
+        value, unit = bot._parse_explicit_clarification_quantity("300")
+        self.assertIsNone(value)
+        self.assertIsNone(unit)
+
+    def test_bare_number_still_rejected_in_v1_quantity_clarification(self):
+        chat_id = 810110
+        bot.pending_inventory_quantity_clarification[chat_id] = {
+            "household_id": 1, "user_db_id": 10, "origin": "global",
+            "item_name": "Молоко", "canonical_name": "молоко", "category": "Молочне та яйця",
+            "add_shopping_items": [], "add_inventory_items": [{
+                "name": "Молоко", "category": "Молочне та яйця", "canonical_name": "молоко",
+                "quantity_value": 1.0, "quantity_unit": "шт.", "quantity_text": "1 шт.",
+                "quantity_inferred": True, "was_corrected": False,
+            }],
+            "consume_changes": [], "new_expenses": [], "new_expense": None, "delete_expense": None,
+        }
+        try:
+            _call_webhook(_make_update(810000110, chat_id, "300"))
+            texts = self._sent_texts()
+            self.assertTrue(any("Потрібна точна кількість з одиницею." in t for t in texts))
+        finally:
+            bot.pending_inventory_quantity_clarification.pop(chat_id, None)
+
+    # #4: a bare number is rejected when its magnitude isn't strictly
+    # greater than what's being consumed.
+    def test_bare_number_rejected_when_not_strictly_greater(self):
+        for bare_reply in ("200", "150"):
+            chat_id = 810120 + int(bare_reply)
+            with self.subTest(bare_reply=bare_reply):
+                self._seed_consume_clarification(chat_id, requested_value=200.0, requested_unit="г")
+                _call_webhook(_make_update(810000400 + chat_id, chat_id, "⚖️ Це частина наявного запасу"))
+                _call_webhook(_make_update(810000401 + chat_id, chat_id, bare_reply))
+                self.assertIn(chat_id, pending_inventory_representation_clarification)
+                self.assertNotIn(chat_id, pending_global_household)
+
+
+# =========================
+# UX fix #2 — legacy identity matching in Flow B (add side)
+# =========================
+def _legacy_ser_1pc_row():
+    return {
+        "id": 501, "name": "ser", "category": "Молочне та яйця", "canonical_name": "ser",
+        "quantity_value": 1.0, "quantity_unit": "шт.", "quantity_text": "1 шт.", "quantity_inferred": False,
+    }
+
+
+class TestLegacyNormalizedMatchingPure(unittest.TestCase):
+    # #5/#9: exactly one legacy candidate is found via canonical_name
+    # normalization; two legacy candidates are never silently chosen.
+    def test_legacy_row_found_via_canonical_name_normalization(self):
+        existing = inventory.detect_add_representation_v2_conflict(
+            [_legacy_ser_1pc_row()], "сир", "Молочне та яйця", 250.0, "г", False,
+            name_normalizer=bot.canonicalize_name,
+        )
+        self.assertIsNotNone(existing)
+        self.assertEqual(existing["id"], 501)
+
+    def test_legacy_row_found_via_name_when_canonical_name_missing(self):
+        row = {"id": 503, "name": "ser", "category": "Молочне та яйця", "canonical_name": None,
+               "quantity_value": 1.0, "quantity_unit": "шт.", "quantity_text": "1 шт."}
+        existing = inventory.detect_add_representation_v2_conflict(
+            [row], "сир", "Молочне та яйця", 250.0, "г", False,
+            name_normalizer=bot.canonicalize_name,
+        )
+        self.assertIsNotNone(existing)
+        self.assertEqual(existing["id"], 503)
+
+    def test_two_legacy_candidates_are_not_silently_chosen(self):
+        row_a = dict(_legacy_ser_1pc_row())
+        row_b = dict(_legacy_ser_1pc_row())
+        row_b["id"] = 502
+        existing = inventory.detect_add_representation_v2_conflict(
+            [row_a, row_b], "сир", "Молочне та яйця", 250.0, "г", False,
+            name_normalizer=bot.canonicalize_name,
+        )
+        self.assertIsNone(existing)
+
+    # #10: an already-canonical row is found exactly as before — the
+    # legacy fallback is never even consulted when the exact match succeeds.
+    def test_exact_canonical_match_unaffected_by_normalizer(self):
+        existing = inventory.detect_add_representation_v2_conflict(
+            [_cheese_1pc_row()], "сир", "Молочне та яйця", 250.0, "г", False,
+            name_normalizer=bot.canonicalize_name,
+        )
+        self.assertIsNotNone(existing)
+        self.assertEqual(existing["id"], 401)
+
+    # No normalizer given (legacy callers) -> behaves exactly as before this fix.
+    def test_no_normalizer_means_no_legacy_fallback(self):
+        existing = inventory.detect_add_representation_v2_conflict(
+            [_legacy_ser_1pc_row()], "сир", "Молочне та яйця", 250.0, "г", False,
+        )
+        self.assertIsNone(existing)
+
+
+class TestLegacyIdentityMatchingAddFlow(_BaseGlobalRouterTestCase):
+    # #5: "ser — 1 шт." + "Купив 250 г сиру" triggers the add clarification,
+    # never a silent separate-row insert.
+    def test_legacy_ser_row_triggers_add_clarification_not_silent_insert(self):
+        chat_id = 810130
+        with patch.object(bot, "get_inventory_items", return_value=[_legacy_ser_1pc_row()]):
+            self.mock_hr.return_value = _add_cheese_250g_router_result()
+            _call_webhook(_make_update(810000130, chat_id, "Купив 250 г сиру"))
+        self.assertIn(chat_id, pending_inventory_representation_clarification)
+        self.assertNotIn(chat_id, pending_global_household)
+        self.mock_apply.assert_not_called()
+        # #6: user-facing message shows the resolved readable name "Сир",
+        # never the legacy technical label "ser".
+        texts = self._sent_texts()
+        self.assertTrue(any(
+            "У запасах уже є «Сир — 1 шт.», а нова кількість — 250 г." in t
+            and "Що означають ці 250 г?" in t
+            for t in texts
+        ))
+        self.assertFalse(any("ser" in t for t in texts))
+        # #6 (target snapshot): the conflict's existing target is still the
+        # EXACT legacy row — same id, same stored unit, never rewritten.
+        conflict = pending_inventory_representation_clarification[chat_id]["conflict"]
+        self.assertEqual(conflict["existing"]["item_id"], 501)
+        self.assertEqual(conflict["existing"]["quantity_unit"], "шт.")
+
+    def _seed_legacy_add_clarification(self, chat_id):
+        incoming_item = {
+            "name": "Сир", "category": "Молочне та яйця", "canonical_name": "сир",
+            "quantity_value": 250.0, "quantity_unit": "г", "quantity_text": "250 г",
+            "quantity_inferred": False, "was_corrected": False,
+        }
+        conflict = household_router._build_add_representation_conflict(incoming_item, _legacy_ser_1pc_row())
+        pending_inventory_representation_clarification[chat_id] = {
+            "household_id": 1, "user_db_id": 10, "origin": "global",
+            "stage": "choice", "conflict": conflict, "queue": [],
+            "add_shopping_items": [], "add_inventory_items": [], "inventory_merge_targets": [],
+            "consume_changes": [], "new_expenses": [], "new_expense": None,
+            "delete_expense": None, "representation_resolutions": [],
+        }
+
+    # #7: "вага наявного запису" transforms exactly the legacy target row,
+    # no new row created.
+    def test_relabel_choice_targets_exact_legacy_row_no_new_row(self):
+        chat_id = 810131
+        self._seed_legacy_add_clarification(chat_id)
+        with patch.object(bot, "get_inventory_items", return_value=[_legacy_ser_1pc_row()]):
+            _call_webhook(_make_update(810000131, chat_id, "⚖️ Це вага наявного запису — уточнити його"))
+        self.assertIn(chat_id, pending_global_household)
+        data = pending_global_household[chat_id]
+        self.assertEqual(data["add_inventory_items"], [])
+        self.assertEqual(len(data["consume_changes"]), 1)
+        self.assertEqual(data["consume_changes"][0]["item_id"], 501)
+        resolutions = data["inventory_representation_resolutions"]
+        self.assertEqual(resolutions[0]["mode"], "relabel_existing")
+        self.assertEqual(resolutions[0]["item_id"], 501)
+        texts = self._sent_texts()
+        self.assertTrue(any("Сир — 1 шт. → 250 г (уточнено, без додавання нового товару)" in t for t in texts))
+
+    # #8: "окрема упаковка" does not touch the legacy target at all.
+    def test_separate_package_choice_does_not_touch_legacy_row(self):
+        chat_id = 810132
+        self._seed_legacy_add_clarification(chat_id)
+        with patch.object(bot, "get_inventory_items", return_value=[_legacy_ser_1pc_row()]):
+            _call_webhook(_make_update(810000132, chat_id, "📦 Це окрема упаковка — додати окремо"))
+        self.assertIn(chat_id, pending_global_household)
+        data = pending_global_household[chat_id]
+        self.assertEqual(data["consume_changes"], [])
+        self.assertEqual(data["inventory_representation_resolutions"], [])
+        self.assertEqual(len(data["add_inventory_items"]), 1)
+        self.assertEqual(data["add_inventory_items"][0]["_representation_outcome"], "separate")
 
 
 # =========================

@@ -152,15 +152,50 @@ def detect_count_vs_mass_volume_conflict(existing_value, existing_unit, incoming
     return True
 
 
+def find_legacy_normalized_matches(inventory_items, canonical_name, category, name_normalizer):
+    """Fallback for a legacy row whose STORED canonical_name/name predates
+    today's built-in synonym normalization (e.g. canonical_name="ser" for
+    what the same trusted synonym rules would now canonicalize to "сир") —
+    only ever consulted by the caller when the plain exact-canonical_name
+    match (find_inventory_representation_matches) already found nothing, so
+    this never changes behavior for any row whose canonical_name is already
+    up to date. Re-normalizes each candidate row's OWN canonical_name
+    (falling back to its raw name) through `name_normalizer` — the SAME
+    trusted built-in synonym rules the incoming item's canonical_name
+    already went through — and matches against that. Never fuzzy matching,
+    never stemming, never AI, never mutates the row: purely a smarter READ.
+    Same category-compatibility rule as find_inventory_representation_matches.
+    """
+    matches = []
+    for item in inventory_items:
+        item_category = item.get("category")
+        if not (item_category == category or item_category == DEFAULT_CATEGORY or category == DEFAULT_CATEGORY):
+            continue
+        legacy_identity = name_normalizer(item.get("canonical_name") or "")
+        if legacy_identity != canonical_name:
+            legacy_identity = name_normalizer(item.get("name") or "")
+        if legacy_identity == canonical_name:
+            matches.append(item)
+    matches.sort(key=lambda it: it["id"])
+    return matches
+
+
 def detect_add_representation_v2_conflict(inventory_items, canonical_name, category,
-                                           incoming_value, incoming_unit, incoming_inferred):
+                                           incoming_value, incoming_unit, incoming_inferred,
+                                           name_normalizer=None):
     """Add-side (Flow B) conflict detection: returns the single existing
     "шт." row this incoming item conflicts with, or None. Only ever returns
     a row when there is EXACTLY ONE existing candidate sharing this
     canonical_name/category — several candidates falls through to the
     existing guard's own handling, untouched, per the "complex incompatible
-    rows" carve-out above."""
+    rows" carve-out above. If the plain exact match finds nothing and
+    `name_normalizer` is given, also tries find_legacy_normalized_matches —
+    still only ever acting on exactly one match; two or more legacy
+    candidates are left alone (never guessed at) exactly like two or more
+    exact candidates already are."""
     candidates = find_inventory_representation_matches(inventory_items, canonical_name, category)
+    if not candidates and name_normalizer is not None:
+        candidates = find_legacy_normalized_matches(inventory_items, canonical_name, category, name_normalizer)
     if len(candidates) != 1:
         return None
     existing = candidates[0]

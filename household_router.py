@@ -10,7 +10,7 @@ since bot.py imports this module). Wherever this module needs a piece of
 normalize_item_quantity, STRUCTURED_UNITS, _resolve_consumption,
 VALID_CATEGORIES, DEFAULT_CATEGORY, _auto_merge_in_place,
 _validate_selected_numbers, _effective_quantity, format_quantity_display,
-the keyboards — it goes through the live `_bot` module reference handed in
+canonicalize_name, the keyboards — it goes through the live `_bot` module reference handed in
 via configure(), never a snapshotted import (mirrors expenses.py's own
 `_bot` indirection, for the same reason).
 
@@ -868,6 +868,7 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
         existing = _bot.detect_add_representation_v2_conflict(
             inventory_items, item.get("canonical_name"), item.get("category"),
             item.get("quantity_value"), item.get("quantity_unit"), item.get("quantity_inferred", False),
+            name_normalizer=_bot.canonicalize_name,
         )
         if existing is not None:
             add_representation_conflicts.append(_build_add_representation_conflict(item, existing))
