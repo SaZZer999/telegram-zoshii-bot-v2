@@ -2273,6 +2273,52 @@ def _format_reconciliation_unit_clarify_question(ambiguous_group):
     return "\n".join(lines)
 
 
+def _continue_inventory_reconciliation_clarification(chat_id, text):
+    """Continuation for pending_inventory_reconciliation_clarify — moved out
+    of webhook()'s inline elif body unchanged so message_dispatcher.py can
+    call it as a thin injected callback (Dispatcher V2A route 8) without
+    duplicating this business logic or touching the database/Gemini
+    directly itself."""
+    clarify_data = pending_inventory_reconciliation_clarify[chat_id]
+    kind, resolved = _resolve_reconciliation_unit_clarification(clarify_data["ambiguous_group"], text)
+    if kind == "invalid":
+        send_message(chat_id, _format_reconciliation_unit_clarify_question(clarify_data["ambiguous_group"]))
+        return
+    pending_inventory_reconciliation_clarify.pop(chat_id, None)
+    combined = clarify_data["rest"] + (resolved if kind == "merged" else clarify_data["ambiguous_group"])
+    household_id = clarify_data["household_id"]
+    user_db_id = clarify_data["user_db_id"]
+    try:
+        list_items = get_inventory_items(household_id)
+        next_ambiguous = _find_ambiguous_unit_group(combined)
+        if next_ambiguous is not None:
+            ids = {id(it) for it in next_ambiguous}
+            rest2 = [it for it in combined if id(it) not in ids]
+            pending_inventory_reconciliation_clarify[chat_id] = {
+                "ambiguous_group": next_ambiguous, "rest": rest2,
+                "household_id": household_id, "user_db_id": user_db_id,
+            }
+            send_message(chat_id, _format_reconciliation_unit_clarify_question(next_ambiguous))
+        else:
+            alias_map = get_household_alias_map(household_id)
+            kind2, payload2 = _validate_reconcile_snapshot(combined, [], list_items, alias_map=alias_map)
+            if kind2 == "ok":
+                pending_inventory_reconciliation[chat_id] = {
+                    "updates": payload2["updates"], "additions": payload2["additions"],
+                    "deletes": payload2["deletes"], "household_id": household_id, "user_db_id": user_db_id,
+                }
+                send_message(
+                    chat_id, _format_reconciliation_preview(payload2), reply_markup=RECONCILIATION_PREVIEW_KEYBOARD
+                )
+            else:
+                send_message(
+                    chat_id,
+                    "Не зміг безпечно завершити звіряння запасів. Спробуй ще раз, надіславши повний список.",
+                )
+    except Exception:
+        send_message(chat_id, INVENTORY_ERROR_MSG)
+
+
 def _validate_quick_add_items(raw_items, alias_map=None):
     """Validate Gemini quick_add_to_inventory items for an empty shopping list.
 
@@ -3391,13 +3437,42 @@ _interaction_state_deps = interaction_state.InteractionStateDeps(
     clear_list_context=lambda *a, **kw: clear_list_context(*a, **kw),
 )
 
-# Message Dispatcher V1 — message_dispatcher.py owns the ordered navigation/
-# menu/mode-text dispatch slice (old Phase A2/A3/B); it has no import of
+# Dispatcher V2A — message_dispatcher.py owns the ordered priority of the ten
+# highest-priority pending-state/clarification/undo routes (old Phase C
+# routes 6-15); state dicts stay owned exactly where they already live
+# (legacy_shopping_flow.py/legacy_inventory_flow.py/expenses.py/bot.py —
+# referenced directly here, never copied). Continuation callbacks are
+# lambda-forwards for the same patch.object(bot, ...) reason as every other
+# callback in this file.
+_pending_route_deps = message_dispatcher.PendingRouteDeps(
+    pending_batch=pending_batch,
+    pending_inventory_batch=pending_inventory_batch,
+    pending_inventory_reconciliation_clarify=pending_inventory_reconciliation_clarify,
+    expense_delete_selection=expense_delete_selection,
+    pending_inventory_quantity_clarification=pending_inventory_quantity_clarification,
+    pending_inventory_representation_clarification=pending_inventory_representation_clarification,
+    pending_global_household=pending_global_household,
+    pending_add_destination_clarification=pending_add_destination_clarification,
+    pending_undo_action=pending_undo_action,
+    has_active_expense_preview=lambda *a, **kw: _has_active_expense_preview(*a, **kw),
+    handle_expense_delete_selection_text=lambda *a, **kw: _handle_expense_delete_selection_text(*a, **kw),
+    continue_inventory_reconciliation_clarification=lambda *a, **kw: _continue_inventory_reconciliation_clarification(*a, **kw),
+    continue_inventory_quantity_clarification=lambda *a, **kw: _continue_inventory_quantity_clarification(*a, **kw),
+    continue_inventory_representation_clarification=lambda *a, **kw: _continue_inventory_representation_clarification(*a, **kw),
+    continue_add_destination_clarification=lambda *a, **kw: _continue_add_destination_clarification(*a, **kw),
+    start_undo_flow=lambda *a, **kw: _start_undo_flow(*a, **kw),
+    expense_preview_guard_msg=EXPENSE_PREVIEW_GUARD_MSG,
+    global_household_preview_guard_msg=GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG,
+)
+
+# Message Dispatcher V1/V2A — message_dispatcher.py owns the ordered
+# navigation/menu/mode-text dispatch slice (old Phase A2/A3/B) plus the
+# pending-route slice above (Phase C routes 6-15); it has no import of
 # bot.py, so everything it needs is passed once via this injected dependency
 # container, which simply nests the already-built _shopping_deps/
-# _inventory_deps instead of re-declaring their fields. Same lambda-forward
-# reasoning as those two containers — patch.object(bot, "send_message"/
-# "clear_interaction_state") keeps working through here too.
+# _inventory_deps/_pending_route_deps instead of re-declaring their fields.
+# Same lambda-forward reasoning as those containers — patch.object(bot,
+# "send_message"/"clear_interaction_state") keeps working through here too.
 _dispatcher_deps = message_dispatcher.DispatcherDeps(
     send_message=lambda *a, **kw: send_message(*a, **kw),
     clear_interaction_state=lambda *a, **kw: clear_interaction_state(*a, **kw),
@@ -3412,6 +3487,7 @@ _dispatcher_deps = message_dispatcher.DispatcherDeps(
     ),
     shopping_deps=_shopping_deps,
     inventory_deps=_inventory_deps,
+    pending_routes=_pending_route_deps,
 )
 
 
@@ -3994,161 +4070,42 @@ def webhook():
         return "ok"
 
     # =========================
-    # MESSAGE DISPATCHER V1 (message_dispatcher.py)
+    # MESSAGE DISPATCHER V2A (message_dispatcher.py)
     # Navigation (/start, /menu, /help, "⬅️ Головне меню"), shopping/inventory
-    # menu buttons, then shopping_mode/inventory_mode text dispatch — exact
-    # same priority order as the old inline Phase A2/A3/B branches above.
+    # menu buttons, shopping_mode/inventory_mode text dispatch, then the
+    # highest-priority pending/clarification/undo routes: pending_batch,
+    # pending_inventory_batch, pending_inventory_reconciliation_clarify,
+    # expense_delete_selection, active expense preview guard, inventory
+    # quantity clarification, inventory representation clarification,
+    # pending_global_household guard, add-destination clarification, undo —
+    # exact same priority order as the old inline Phase A2/A3/B/C(6-15)
+    # branches this replaces.
     # =========================
     if message_dispatcher.dispatch(_dispatcher_deps, chat_id, user_id, display_name, text):
         return "ok"
 
     # =========================
-    # PENDING PREVIEW ROUTER
-    # Intercepts text when a pending add preview is active (shopping or inventory).
-    # Priority: edit_preview → apply + show preview; merge_duplicates → local merge;
-    # none → fall through to AI chat.
-    # No DB writes until ✅ Додати все.
-    # Saved list context (3rd branch): only merge_duplicates, unchanged.
+    # PENDING PREVIEW ROUTER (remaining Phase C routes, unchanged)
+    # Routes 6-15 (every pending-state/clarification/undo branch that used to
+    # open this chain) now live in message_dispatcher.py, handled by the same
+    # dispatch() call above. Everything below is reached only when none of
+    # those states/commands matched.
     # =========================
     _preview_intercepted = False
 
-    if chat_id in pending_batch:
-        _preview_intercepted = legacy_shopping_flow.handle_pending_batch_edit_text(_shopping_deps, chat_id, text)
-
-    elif chat_id in pending_inventory_batch:
-        _preview_intercepted = legacy_inventory_flow.handle_pending_inventory_batch_edit_text(_inventory_deps, chat_id, text)
-
-    elif chat_id in pending_inventory_reconciliation_clarify:
-        clarify_data = pending_inventory_reconciliation_clarify[chat_id]
-        kind, resolved = _resolve_reconciliation_unit_clarification(clarify_data["ambiguous_group"], text)
-        if kind == "invalid":
-            send_message(chat_id, _format_reconciliation_unit_clarify_question(clarify_data["ambiguous_group"]))
-            _preview_intercepted = True
-        else:
-            pending_inventory_reconciliation_clarify.pop(chat_id, None)
-            combined = clarify_data["rest"] + (resolved if kind == "merged" else clarify_data["ambiguous_group"])
-            household_id = clarify_data["household_id"]
-            user_db_id = clarify_data["user_db_id"]
-            try:
-                list_items = get_inventory_items(household_id)
-                next_ambiguous = _find_ambiguous_unit_group(combined)
-                if next_ambiguous is not None:
-                    ids = {id(it) for it in next_ambiguous}
-                    rest2 = [it for it in combined if id(it) not in ids]
-                    pending_inventory_reconciliation_clarify[chat_id] = {
-                        "ambiguous_group": next_ambiguous, "rest": rest2,
-                        "household_id": household_id, "user_db_id": user_db_id,
-                    }
-                    send_message(chat_id, _format_reconciliation_unit_clarify_question(next_ambiguous))
-                else:
-                    alias_map = get_household_alias_map(household_id)
-                    kind2, payload2 = _validate_reconcile_snapshot(combined, [], list_items, alias_map=alias_map)
-                    if kind2 == "ok":
-                        pending_inventory_reconciliation[chat_id] = {
-                            "updates": payload2["updates"], "additions": payload2["additions"],
-                            "deletes": payload2["deletes"], "household_id": household_id, "user_db_id": user_db_id,
-                        }
-                        send_message(
-                            chat_id, _format_reconciliation_preview(payload2), reply_markup=RECONCILIATION_PREVIEW_KEYBOARD
-                        )
-                    else:
-                        send_message(
-                            chat_id,
-                            "Не зміг безпечно завершити звіряння запасів. Спробуй ще раз, надіславши повний список.",
-                        )
-            except Exception:
-                send_message(chat_id, INVENTORY_ERROR_MSG)
-            _preview_intercepted = True
-
-    elif chat_id in expense_delete_selection:
-        # Dedicated "pick which expense to delete" mode — a numbered list is
-        # already on screen (button press, or an earlier ambiguous global-gate
-        # attempt), so ANY text here (a bare number or another phrase) is
-        # resolved against that SAME stored list, never a fresh one. Checked
-        # ahead of everything else, same priority as pending_batch/
-        # pending_inventory_batch above.
-        _handle_expense_delete_selection_text(chat_id, text)
-        _preview_intercepted = True
-
-    elif _has_active_expense_preview(chat_id):
-        # An expense add-preview or delete-preview is awaiting confirm/cancel
-        # (the matching "✅ Так, додати"/"✅ Так, видалити"/"❌ Скасувати"
-        # button texts are already handled earlier, before this router chain
-        # — reaching here means the text is something else). Checked ahead of
-        # every gate/submenu branch below so it can never start a new expense
-        # router, replace the pending preview, touch the database, or reach
-        # general AI-chat — the preview must be confirmed or cancelled first.
-        send_message(chat_id, EXPENSE_PREVIEW_GUARD_MSG)
-        _preview_intercepted = True
-
-    elif chat_id in pending_inventory_quantity_clarification:
-        # Inventory Quantity Clarification v1: the Global Household Router
-        # blocked the original command because an inferred quantity
-        # conflicted with every existing representation of that product —
-        # this reply (e.g. "1Л") continues that ORIGINAL command instead of
-        # reaching the router gate below, legacy flows, the database, or
-        # general AI-chat. The confirm/cancel button texts for a preview
-        # this might eventually produce are handled earlier, before this
-        # chain, same as every other pending-state branch here.
-        _continue_inventory_quantity_clarification(chat_id, text)
-        _preview_intercepted = True
-
-    elif chat_id in pending_inventory_representation_clarification:
-        # Inventory Representation Clarification V2: a structured count row
-        # conflicts with an explicit incoming mass/volume quantity for the
-        # same product — this reply (a button choice, then optionally a
-        # total-quantity number) continues that ORIGINAL command instead of
-        # reaching the router gate below, legacy flows, the database, or
-        # general AI-chat. The confirm/cancel button texts for a preview
-        # this might eventually produce are handled earlier, before this
-        # chain, same as every other pending-state branch here.
-        _continue_inventory_representation_clarification(chat_id, text)
-        _preview_intercepted = True
-
-    elif chat_id in pending_global_household:
-        # A combined Global Household Router preview is awaiting confirm/
-        # cancel (the matching "✅ Так, застосувати"/"❌ Скасувати" button
-        # texts are already handled earlier, before this router chain —
-        # reaching here means the text is something else). Checked ahead of
-        # the household_router gate below (and every other gate) so no new
-        # text — including one that would otherwise match household_router.
-        # gate(text) — can start a new global router pass, replace the
-        # pending preview, touch the database, or reach general AI-chat
-        # while a plan of changes is still awaiting confirmation.
-        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
-        _preview_intercepted = True
-
-    elif chat_id in pending_add_destination_clarification:
-        # Global Bare Add v1: a bare "Додай молоко" (no destination phrase,
-        # active menu didn't already imply one) is awaiting a "До покупок"/
-        # "У запаси" reply (the matching "❌ Скасувати" button text is
-        # already handled earlier, before this router chain — reaching here
-        # means the text is something else). Checked ahead of explicit add/
-        # the household_router gate/every legacy gate below so no new text
-        # can start a new preview, touch the database, or reach general
-        # AI-chat while this question is unanswered — an invalid reply just
-        # re-asks the same question instead of falling through anywhere.
-        _continue_add_destination_clarification(chat_id, text)
-        _preview_intercepted = True
-
-    elif chat_id in pending_undo_action or action_history.is_undo_command(text):
-        # Action History + Safe Undo v1 — checked after every other active
-        # preview/selection/clarification state above (none of them are
-        # active here, or a higher elif would already have matched) and
-        # ahead of the ambiguous-add guard/Global Household Router/every
-        # legacy gate/general AI-chat below, so "Скасувати останню дію"
-        # (or the matching button) never reaches Gemini, the household
-        # router, or general AI-chat. While pending_undo_action is already
-        # set, ANY other text here is intercepted too (never replaces the
-        # pending undo, never touches the database, never calls Gemini) —
-        # only the confirm/cancel button texts (handled earlier, before
-        # this chain) can resolve it.
-        if chat_id in pending_undo_action:
-            send_message(chat_id, action_history.PENDING_UNDO_MSG)
-        else:
-            _start_undo_flow(chat_id, user_id, display_name)
-        _preview_intercepted = True
-
+    if chat_id in pending_batch or chat_id in pending_inventory_batch:
+        # Dispatcher V2A's routes 6/7 already ran this chat's pending_batch/
+        # pending_inventory_batch edit-router (legacy_shopping_flow.handle_
+        # pending_batch_edit_text/legacy_inventory_flow.handle_pending_
+        # inventory_batch_edit_text) and returned False here specifically
+        # because Gemini's intent was "none" — in the original single elif
+        # chain, matching either dict already claimed the message (whether
+        # or not it ended up setting _preview_intercepted), so none of the
+        # remaining Phase C routes below ever saw it; it fell straight
+        # through to cooking-mode/general AI-chat. This reproduces that
+        # exact fall-through instead of letting those routes re-evaluate a
+        # message a second time that a higher-priority route already owns.
+        pass
     elif _is_ambiguous_add_with_price(text):
         # Ambiguous "Додай ... за суму" guard — checked after every active
         # preview/selection/clarification state above (none of them are
