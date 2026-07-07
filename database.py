@@ -1507,7 +1507,7 @@ def _restore_bucket_in_tx(cur, table, household_id, actor_user_id, current_rows,
 def apply_global_household_operations(household_id, user_db_id, add_shopping_items=None,
                                        add_inventory_items=None, consume_updates=None,
                                        consume_delete_ids=None, inventory_targets=None,
-                                       new_expense=None, delete_expense_id=None,
+                                       new_expense=None, new_expenses=None, delete_expense_id=None,
                                        delete_expense_snapshot=None):
     """Apply the Global Household Router's combined preview (up to five kinds
     of operations: add_shopping, add_inventory, consume_inventory,
@@ -1527,8 +1527,12 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
     consume_updates and consume_delete_ids) — verified for staleness inside
     this same transaction (same guard as apply_compound_inventory_operations)
     before anything is written.
-    new_expense (optional): {amount, currency, category, description,
-    expense_date} — plain insert, needs no staleness check.
+    new_expenses (optional): list of {amount, currency, category,
+    description, expense_date} — plain inserts, in order, needs no
+    staleness check. new_expense (optional, singular, deprecated): kept for
+    backward compatibility with callers/tests predating Multi-Expense Batch
+    v1 — normalized into a one-element new_expenses list at the top of this
+    function; everything below only ever works off new_expenses.
     delete_expense_id / delete_expense_snapshot (optional): re-verified
     inside this same transaction (row locked FOR UPDATE, same rule as
     delete_expense()) before being deleted — raises StaleSnapshotError if the
@@ -1545,12 +1549,17 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
 
     Returns a dict: {"shopping_added": n, "inventory_added": n,
     "inventory_updated": n, "inventory_removed": n, "expense_added_id":
-    id_or_None, "expense_deleted": bool}.
+    id_or_None (the first inserted expense, back-compat), "expense_added_ids":
+    [id, ...] (every inserted expense, in order), "expense_deleted": bool}.
     """
     add_shopping_items = add_shopping_items or []
     add_inventory_items = add_inventory_items or []
     consume_updates = consume_updates or []
     consume_delete_ids = consume_delete_ids or []
+    if new_expenses is None:
+        new_expenses = [new_expense] if new_expense is not None else []
+    else:
+        new_expenses = list(new_expenses)
 
     inventory_updated = 0
     inventory_removed = 0
@@ -1658,8 +1667,8 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
                     quantity_inferred=item.get("quantity_inferred", False),
                 )
 
-            new_expense_after = None
-            if new_expense is not None:
+            new_expenses_after = []
+            for expense in new_expenses:
                 cur.execute(
                     """
                     INSERT INTO expenses
@@ -1667,17 +1676,19 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
-                    (household_id, new_expense["amount"], new_expense["currency"], new_expense["category"],
-                     new_expense.get("description") or None, new_expense["expense_date"], user_db_id)
+                    (household_id, expense["amount"], expense["currency"], expense["category"],
+                     expense.get("description") or None, expense["expense_date"], user_db_id)
                 )
-                expense_added_id = cur.fetchone()[0]
-                new_expense_after = {
-                    "id": expense_added_id, "household_id": household_id,
-                    "amount": str(new_expense["amount"]), "currency": new_expense["currency"],
-                    "category": new_expense["category"], "description": new_expense.get("description") or None,
-                    "expense_date": new_expense["expense_date"].isoformat(),
+                new_expense_id = cur.fetchone()[0]
+                new_expenses_after.append({
+                    "id": new_expense_id, "household_id": household_id,
+                    "amount": str(expense["amount"]), "currency": expense["currency"],
+                    "category": expense["category"], "description": expense.get("description") or None,
+                    "expense_date": expense["expense_date"].isoformat(),
                     "created_by_user_id": user_db_id,
-                }
+                })
+            expense_added_ids = [e["id"] for e in new_expenses_after]
+            expense_added_id = expense_added_ids[0] if expense_added_ids else None
 
             if delete_expense_id is not None:
                 cur.execute(
@@ -1706,20 +1717,20 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
             post_action_snapshot = {
                 "inventory_buckets": after_inventory_buckets,
                 "shopping_buckets": after_shopping_buckets,
-                "expense_add": new_expense_after,
+                "expense_adds": new_expenses_after,
             }
             forward_payload = action_history.json_safe({
                 "add_shopping_items": add_shopping_items,
                 "add_inventory_items": add_inventory_items,
                 "consume_updates": consume_updates,
                 "consume_delete_ids": list(consume_delete_ids),
-                "new_expense": new_expense,
+                "new_expenses": new_expenses,
                 "delete_expense_id": delete_expense_id,
             })
             inverse_payload = {
                 "restore_inventory_canonical_names": sorted(inventory_canonical_names),
                 "restore_shopping_canonical_names": sorted(shopping_canonical_names),
-                "delete_expense_id": expense_added_id,
+                "delete_expense_ids": expense_added_ids,
                 "restore_expense": delete_expense_before,
             }
             summary = action_history.build_operation_summary(before_snapshot, post_action_snapshot)
@@ -1743,6 +1754,7 @@ def apply_global_household_operations(household_id, user_db_id, add_shopping_ite
         "inventory_updated": inventory_updated,
         "inventory_removed": inventory_removed,
         "expense_added_id": expense_added_id,
+        "expense_added_ids": expense_added_ids,
         "expense_deleted": expense_deleted,
     }
 
@@ -1786,11 +1798,12 @@ def apply_undo_action(action_id, household_id, actor_user_id):
     - every canonical-name bucket the forward action touched still matches
       its post_action_snapshot exactly (raises StaleSnapshotError, whole
       transaction rolled back, if anything changed since);
-    - the added expense (if any) still exists and is unchanged, and the
-      deleted expense (if any) is still absent.
+    - every added expense (if any — one or several, see Multi-Expense Batch
+      v1) still exists and is unchanged, and the deleted expense (if any) is
+      still absent.
 
     Only if every check passes does it restore shopping_items/inventory_items
-    rows to their before_snapshot values, delete the expense the forward
+    rows to their before_snapshot values, delete every expense the forward
     action added, and/or reinsert the expense the forward action deleted —
     then mark the journal row 'undone'. Never calls Gemini. Never partial:
     any failed check aborts the whole transaction before any write.
@@ -1828,8 +1841,18 @@ def apply_undo_action(action_id, household_id, actor_user_id):
                     raise StaleSnapshotError()
                 shopping_current[cname] = rows
 
-            expense_add_snapshot = post_action_snapshot.get("expense_add")
-            if expense_add_snapshot is not None:
+            # "expense_adds" (list) is the current shape written by
+            # apply_global_household_operations for every forward action —
+            # "expense_add" (singular) is only ever read here, never written,
+            # kept so a journal row from before Multi-Expense Batch v1 is
+            # still undoable.
+            expense_add_snapshots = post_action_snapshot.get("expense_adds")
+            if expense_add_snapshots is None:
+                legacy_expense_add = post_action_snapshot.get("expense_add")
+                expense_add_snapshots = [legacy_expense_add] if legacy_expense_add is not None else []
+            else:
+                expense_add_snapshots = list(expense_add_snapshots)
+            for expense_add_snapshot in expense_add_snapshots:
                 cur.execute(
                     "SELECT amount, currency, category, description, expense_date "
                     "FROM expenses WHERE id=%s AND household_id=%s FOR UPDATE",
@@ -1869,7 +1892,7 @@ def apply_undo_action(action_id, household_id, actor_user_id):
                     current_rows, shopping_before.get(cname, []), is_shopping=True,
                 )
 
-            if expense_add_snapshot is not None:
+            for expense_add_snapshot in expense_add_snapshots:
                 cur.execute(
                     "DELETE FROM expenses WHERE id=%s AND household_id=%s",
                     (expense_add_snapshot["id"], household_id)

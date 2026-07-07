@@ -2814,6 +2814,7 @@ def _handle_household_router_result(chat_id, kind, payload, household_id, user_d
             "add_shopping_items": payload["add_shopping_items"],
             "add_inventory_items": payload["add_inventory_items"],
             "consume_changes": payload["consume_changes"],
+            "new_expenses": payload["new_expenses"],
             "new_expense": payload["new_expense"],
             "delete_expense": payload["delete_expense"],
         }
@@ -2830,6 +2831,7 @@ def _handle_household_router_result(chat_id, kind, payload, household_id, user_d
         "add_inventory_items": payload["add_inventory_items"],
         "consume_changes": payload["consume_changes"],
         "inventory_targets": inventory_targets,
+        "new_expenses": payload["new_expenses"],
         "new_expense": payload["new_expense"],
         "delete_expense": payload["delete_expense"],
         "household_id": household_id,
@@ -3062,7 +3064,15 @@ def _apply_global_household_confirm(chat_id):
         for c in consume_changes if not c["will_remove"]
     ]
     consume_delete_ids = [c["item_id"] for c in consume_changes if c["will_remove"]]
-    new_expense = data["new_expense"]
+    # Boundary normalization: a pending_global_household entry built (or
+    # hand-seeded in a test) before Multi-Expense Batch v1 only ever carries
+    # the legacy singular "new_expense" key — normalize that into a
+    # one-element list here so everything below only ever deals with
+    # new_expenses (the list), never a mix of both shapes.
+    new_expenses = data.get("new_expenses")
+    if new_expenses is None:
+        legacy_new_expense = data.get("new_expense")
+        new_expenses = [legacy_new_expense] if legacy_new_expense else []
     delete_expense_data = data["delete_expense"]
     try:
         apply_global_household_operations(
@@ -3072,10 +3082,10 @@ def _apply_global_household_confirm(chat_id):
             consume_updates=consume_updates,
             consume_delete_ids=consume_delete_ids,
             inventory_targets=data["inventory_targets"],
-            new_expense=(
-                {k: v for k, v in new_expense.items() if k != "category_was_defaulted"}
-                if new_expense else None
-            ),
+            new_expenses=[
+                {k: v for k, v in ne.items() if k != "category_was_defaulted"}
+                for ne in new_expenses
+            ],
             delete_expense_id=delete_expense_data["expense_id"] if delete_expense_data else None,
             delete_expense_snapshot=delete_expense_data["snapshot"] if delete_expense_data else None,
         )
@@ -3137,6 +3147,16 @@ def _continue_inventory_quantity_clarification(chat_id, text):
         send_message(chat_id, _GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG)
         return
 
+    # Boundary normalization: this state may have been seeded with only the
+    # legacy singular "new_expense" key (pre-Multi-Expense-Batch-v1 shape) —
+    # normalize once here so every branch below only ever carries the list
+    # forward, deriving the backward-compat singular key from it.
+    new_expenses = data.get("new_expenses")
+    if new_expenses is None:
+        legacy_new_expense = data.get("new_expense")
+        new_expenses = [legacy_new_expense] if legacy_new_expense else []
+    legacy_new_expense = new_expenses[0] if len(new_expenses) == 1 else None
+
     household_id = data["household_id"]
     keyboard = household_router.origin_keyboard(data.get("origin", "global"))
     canonical_name = data["canonical_name"]
@@ -3186,7 +3206,8 @@ def _continue_inventory_quantity_clarification(chat_id, text):
                 "add_shopping_items": data["add_shopping_items"],
                 "add_inventory_items": updated_items,
                 "consume_changes": data["consume_changes"],
-                "new_expense": data["new_expense"],
+                "new_expenses": new_expenses,
+                "new_expense": legacy_new_expense,
                 "delete_expense": data["delete_expense"],
             }
             send_message(
@@ -3204,7 +3225,8 @@ def _continue_inventory_quantity_clarification(chat_id, text):
             "add_shopping_items": data["add_shopping_items"],
             "add_inventory_items": final_items,
             "consume_changes": data["consume_changes"],
-            "new_expense": data["new_expense"],
+            "new_expenses": new_expenses,
+            "new_expense": legacy_new_expense,
             "delete_expense": data["delete_expense"],
             "inventory_merge_targets": inventory_merge_targets,
         }
@@ -3214,6 +3236,7 @@ def _continue_inventory_quantity_clarification(chat_id, text):
             "add_inventory_items": payload["add_inventory_items"],
             "consume_changes": payload["consume_changes"],
             "inventory_targets": inventory_targets,
+            "new_expenses": payload["new_expenses"],
             "new_expense": payload["new_expense"],
             "delete_expense": payload["delete_expense"],
             "household_id": household_id,

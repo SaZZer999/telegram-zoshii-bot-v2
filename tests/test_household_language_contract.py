@@ -235,6 +235,38 @@ class TestGlobalHouseholdCommandsWorkFromAnywhere(HouseholdLanguageContractTestC
         self.assertEqual(payload["add_shopping_items"], [])
         self.assertEqual(len(payload["add_inventory_items"]), 1)
 
+    # Scenario 5b (Multi-Expense Batch v1): two purchases-with-price plus a
+    # plain inventory add, all in one message -> ONE combined preview with
+    # BOTH new expenses, never a "лише одну витрату" error, never a general
+    # AI fallback.
+    def test_multiple_purchases_with_price_build_one_combined_preview(self):
+        chat_id = 700020
+        self.mock_hr.return_value = {
+            "intent": "household_operations",
+            "operations": [
+                {"type": "add_inventory", "name": "Молоко", "quantity_text": "1 л", "category": "Молочне та яйця"},
+                {"type": "add_expense", "amount": "8", "currency": "PLN", "category": "Продукти",
+                 "description": "Молоко", "expense_date": "2020-01-01"},
+                {"type": "add_inventory", "name": "Хліб", "quantity_text": "", "category": "Хліб і випічка"},
+                {"type": "add_expense", "amount": "5", "currency": "PLN", "category": "Продукти",
+                 "description": "Хліб", "expense_date": "2020-01-01"},
+                {"type": "add_inventory", "name": "Сосиски", "quantity_text": "пару", "category": "М'ясо та риба"},
+            ],
+            "unresolved_fragments": [],
+        }
+        _call_webhook(_make_update(
+            700000020, chat_id,
+            "Купив 1 л молока за 8 zł\nКупив хліб за 5 zł\nДодай до запасів пару сосисок",
+        ))
+        self.assertIn(chat_id, pending_global_household)
+        payload = pending_global_household[chat_id]
+        self.assertEqual(len(payload["new_expenses"]), 2)
+        self.assertEqual(len(payload["add_inventory_items"]), 3)
+        texts = self._sent_texts()
+        self.assertTrue(any("🧊 Запаси" in t and "💸 Витрати" in t for t in texts))
+        self.assertFalse(any("лише одну нову витрату" in t for t in texts))
+        self.mock_call_gemini.assert_not_called()
+
 
 # =========================
 # Contextual bare add — same "Додай молоко" resolves differently by menu

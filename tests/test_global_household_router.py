@@ -191,7 +191,12 @@ class TestValidateOperations(unittest.TestCase):
         self.assertEqual(kind, "unresolved")
         self.assertEqual(fragments, ["щось незрозуміле"])
 
-    def test_more_than_one_add_expense_is_invalid(self):
+    def test_more_than_one_add_expense_is_accepted_as_a_batch(self):
+        """Multi-Expense Batch v1: several add_expense operations in one
+        message are no longer rejected — they all land in new_expenses, in
+        the same order Gemini returned them, and the legacy singular
+        new_expense stays None since there's no longer a single "the"
+        expense to show under that back-compat key."""
         router_result = {
             "intent": "household_operations",
             "operations": [
@@ -202,9 +207,12 @@ class TestValidateOperations(unittest.TestCase):
             ],
             "unresolved_fragments": [],
         }
-        kind, reasons = household_router._validate_operations(router_result, [], [], NOW)
-        self.assertEqual(kind, "invalid")
-        self.assertTrue(reasons)
+        kind, payload = household_router._validate_operations(router_result, [], [], NOW)
+        self.assertEqual(kind, "ok")
+        self.assertEqual(len(payload["new_expenses"]), 2)
+        self.assertEqual(payload["new_expenses"][0]["description"], "A")
+        self.assertEqual(payload["new_expenses"][1]["description"], "B")
+        self.assertIsNone(payload["new_expense"])
 
     def test_empty_operations_list_is_none(self):
         router_result = {"intent": "household_operations", "operations": [], "unresolved_fragments": []}

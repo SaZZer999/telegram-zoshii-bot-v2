@@ -173,7 +173,10 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "округлюй і не вигадуй суму, якої немає в тексті), currency (завжди «PLN»), category — одна з фіксованих "
     "категорій витрат нижче (якщо не впевнений — «Інше»), description (короткий опис без суми й категорії "
     "всередині), expense_date (YYYY-MM-DD; якщо дата не вказана явно — сьогоднішня дата з наданого "
-    "контексту; ніколи не в майбутньому). Максимум одна операція add_expense на повідомлення.\n"
+    "контексту; ніколи не в майбутньому). Повідомлення може описувати КІЛЬКА окремих покупок із сумою "
+    "(напр. «Купив молоко за 8 zł. Купив хліб за 5 zł») — тоді додай по ОДНІЙ операції add_expense на кожну "
+    "таку покупку, у тому самому порядку, як вони згадані в тексті; ніколи не підсумовуй кілька сум в одну "
+    "операцію.\n"
     "6. «delete_expense» — людина каже, що ВИПАДКОВО чи ПОМИЛКОВО додала витрату і хоче її прибрати (напр. "
     "«Булочку до витрат я додав випадково», «Помилково записав ту витрату»). Повертай це ЛИШЕ якщо рівно "
     "ОДНА позиція з наданого списку останніх витрат явно відповідає опису; якщо жодна або кілька можуть "
@@ -381,6 +384,17 @@ def apply_inventory_representation_guard(add_inventory_items, inventory_items):
     return "ok", (updated_items, inventory_merge_targets)
 
 
+def _legacy_single_expense(new_expenses):
+    """Backward-compat derived value for the "new_expense" (singular) payload
+    key every pre-Multi-Expense-Batch caller/test still reads: the one
+    expense dict when new_expenses has exactly one entry, else None (0 or
+    2+ entries — a multi-expense batch has no single "the" expense to show
+    under the old key). Never the other way around: new_expenses (the list)
+    is always the authoritative value; this is purely a read-only view onto
+    it, so the two can never drift out of sync."""
+    return new_expenses[0] if len(new_expenses) == 1 else None
+
+
 def _validate_operations_detailed(router_result, inventory_items, recent_expenses, now, alias_map=None):
     """Same validation as _validate_operations, but the "clarify" outcome
     carries full structured detail instead of a formatted message — used by
@@ -432,8 +446,7 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
     add_inventory_raw = []
     consume_changes = []
     used_inventory_numbers = set()
-    new_expense = None
-    new_expense_count = 0
+    new_expenses = []
     delete_expense = None
     delete_expense_count = 0
 
@@ -512,10 +525,6 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             })
 
         elif op_type == "add_expense":
-            new_expense_count += 1
-            if new_expense_count > 1:
-                reasons.append("Можна додати лише одну нову витрату за раз.")
-                continue
             currency = op.get("currency")
             if currency not in (None, "PLN"):
                 reasons.append("Не можу безпечно визначити валюту витрати.")
@@ -530,11 +539,11 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
                 continue
             category, category_was_defaulted = expenses._validate_expense_category(op.get("category"))
             description = expenses._clean_expense_description(op.get("description"))
-            new_expense = {
+            new_expenses.append({
                 "amount": amount, "currency": "PLN", "category": category,
                 "category_was_defaulted": category_was_defaulted, "description": description,
                 "expense_date": expense_date,
-            }
+            })
 
         elif op_type == "delete_expense":
             delete_expense_count += 1
@@ -574,19 +583,21 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             "add_shopping_items": add_shopping_items,
             "add_inventory_items": add_inventory_items,
             "consume_changes": consume_changes,
-            "new_expense": new_expense,
+            "new_expenses": new_expenses,
+            "new_expense": _legacy_single_expense(new_expenses),
             "delete_expense": delete_expense,
         }
     add_inventory_items, inventory_merge_targets = guard_result
 
-    if not add_shopping_items and not add_inventory_items and not consume_changes and not new_expense and not delete_expense:
+    if not add_shopping_items and not add_inventory_items and not consume_changes and not new_expenses and not delete_expense:
         return "invalid", ["Не знайшов жодної дії для виконання."]
 
     return "ok", {
         "add_shopping_items": add_shopping_items,
         "add_inventory_items": add_inventory_items,
         "consume_changes": consume_changes,
-        "new_expense": new_expense,
+        "new_expenses": new_expenses,
+        "new_expense": _legacy_single_expense(new_expenses),
         "delete_expense": delete_expense,
         "inventory_merge_targets": inventory_merge_targets,
     }
@@ -664,16 +675,27 @@ def format_preview(payload):
             else:
                 lines.append(f"• {label} → {c['name']} — {c['new_display']}")
 
-    new_expense = payload["new_expense"]
+    new_expenses = payload.get("new_expenses")
+    if new_expenses is None:
+        legacy_new_expense = payload.get("new_expense")
+        new_expenses = [legacy_new_expense] if legacy_new_expense else []
     delete_expense = payload["delete_expense"]
-    if new_expense or delete_expense:
+    if new_expenses or delete_expense:
         lines.append("")
         lines.append("💸 Витрати")
-        if new_expense:
-            amount_display = expenses._format_expense_amount(new_expense["amount"])
-            desc = new_expense["description"] or new_expense["category"]
+        if len(new_expenses) == 1:
+            # Unchanged single-expense formatting — every existing caller/
+            # test of the one-expense shape keeps seeing exactly this.
+            ne = new_expenses[0]
+            amount_display = expenses._format_expense_amount(ne["amount"])
+            desc = ne["description"] or ne["category"]
             lines.append(f"• Додати {desc} — {amount_display}")
-            lines.append(f"• Категорія: {new_expense['category']}")
+            lines.append(f"• Категорія: {ne['category']}")
+        else:
+            for ne in new_expenses:
+                amount_display = expenses._format_expense_amount(ne["amount"])
+                desc = ne["description"] or ne["category"]
+                lines.append(f"• {desc} — {amount_display}")
         if delete_expense:
             lines.append(f"• Видалити {delete_expense['display']} — {delete_expense['amount_display']}")
 
@@ -856,6 +878,7 @@ def build_add_preview_from_items(destination, validated_items, inventory_items):
             "add_shopping_items": add_shopping_items,
             "add_inventory_items": [],
             "consume_changes": [],
+            "new_expenses": [],
             "new_expense": None,
             "delete_expense": None,
             "inventory_merge_targets": [],
@@ -870,6 +893,7 @@ def build_add_preview_from_items(destination, validated_items, inventory_items):
             "add_shopping_items": [],
             "add_inventory_items": add_inventory_items,
             "consume_changes": [],
+            "new_expenses": [],
             "new_expense": None,
             "delete_expense": None,
         }
@@ -878,6 +902,7 @@ def build_add_preview_from_items(destination, validated_items, inventory_items):
         "add_shopping_items": [],
         "add_inventory_items": add_inventory_items,
         "consume_changes": [],
+        "new_expenses": [],
         "new_expense": None,
         "delete_expense": None,
         "inventory_merge_targets": inventory_merge_targets,

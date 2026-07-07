@@ -152,18 +152,27 @@ def build_operation_summary(before_snapshot, post_action_snapshot):
     for cname in sorted(set(shopping_before) | set(shopping_post)):
         shopping_entries.extend(diff_bucket(shopping_before.get(cname), shopping_post.get(cname)))
 
-    expense_add = post_action_snapshot.get("expense_add")
+    expense_adds = post_action_snapshot.get("expense_adds")
+    if expense_adds is None:
+        legacy_expense_add = post_action_snapshot.get("expense_add")
+        expense_adds = [legacy_expense_add] if legacy_expense_add else []
+    expenses_added = [
+        {
+            "amount": e["amount"], "currency": e["currency"],
+            "category": e["category"], "description": e.get("description"),
+        }
+        for e in expense_adds
+    ]
     expense_delete = before_snapshot.get("expense_delete")
     return {
         "inventory": inventory_entries,
         "shopping": shopping_entries,
-        "expense_added": (
-            {
-                "amount": expense_add["amount"], "currency": expense_add["currency"],
-                "category": expense_add["category"], "description": expense_add.get("description"),
-            }
-            if expense_add else None
-        ),
+        "expenses_added": expenses_added,
+        # Backward-compat singular view for pre-Multi-Expense-Batch-v1
+        # readers — only ever populated for the single-expense case, same as
+        # this field always behaved before batches of several expenses
+        # existed.
+        "expense_added": expenses_added[0] if len(expenses_added) == 1 else None,
         "expense_deleted": (
             {
                 "amount": expense_delete["amount"], "currency": expense_delete["currency"],
@@ -215,11 +224,16 @@ def format_undo_preview(summary):
         lines.append("🛒 Покупки")
         lines.extend(_format_bucket_line(e) for e in summary["shopping"])
 
-    if summary.get("expense_added") or summary.get("expense_deleted"):
+    expenses_added = summary.get("expenses_added")
+    if expenses_added is None:
+        legacy_expense_added = summary.get("expense_added")
+        expenses_added = [legacy_expense_added] if legacy_expense_added else []
+
+    if expenses_added or summary.get("expense_deleted"):
         lines.append("")
         lines.append("💸 Витрати")
-        if summary.get("expense_added"):
-            lines.append(f"• Видалити витрату: {_format_expense_label(summary['expense_added'])}")
+        for expense_added in expenses_added:
+            lines.append(f"• Видалити витрату: {_format_expense_label(expense_added)}")
         if summary.get("expense_deleted"):
             lines.append(f"• Відновити витрату: {_format_expense_label(summary['expense_deleted'])}")
 
