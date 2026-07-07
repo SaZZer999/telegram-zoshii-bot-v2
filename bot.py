@@ -78,6 +78,7 @@ import list_editing
 from list_editing import _compute_merged_quantity, _apply_pending_merge
 import legacy_shopping_flow
 import legacy_inventory_flow
+import message_dispatcher
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -3486,6 +3487,29 @@ _inventory_deps = legacy_inventory_flow.InventoryFlowDeps(
     selection_error_msg=SELECTION_ERROR_MSG,
 )
 
+# Message Dispatcher V1 — message_dispatcher.py owns the ordered navigation/
+# menu/mode-text dispatch slice (old Phase A2/A3/B); it has no import of
+# bot.py, so everything it needs is passed once via this injected dependency
+# container, which simply nests the already-built _shopping_deps/
+# _inventory_deps instead of re-declaring their fields. Same lambda-forward
+# reasoning as those two containers — patch.object(bot, "send_message"/
+# "clear_interaction_state") keeps working through here too.
+_dispatcher_deps = message_dispatcher.DispatcherDeps(
+    send_message=lambda *a, **kw: send_message(*a, **kw),
+    clear_interaction_state=lambda *a, **kw: clear_interaction_state(*a, **kw),
+    main_keyboard=MAIN_KEYBOARD,
+    help_text=(
+        "ℹ️ Як користуватися ботом:\n\n"
+        "🛒 Покупки — спільний список покупок\n"
+        "🧊 Запаси — що є вдома\n"
+        "🍽️ Що приготувати — ідеї страв на основі запасів\n"
+        "ℹ️ Допомога — ця інструкція\n\n"
+        "Будь-яке звичайне повідомлення надсилається AI і ти отримаєш відповідь."
+    ),
+    shopping_deps=_shopping_deps,
+    inventory_deps=_inventory_deps,
+)
+
 
 @app.route("/")
 def home():
@@ -4005,60 +4029,17 @@ def webhook():
         return "ok"
 
     # =========================
-    # NAVIGATION BUTTONS
+    # NAVIGATION / MENU BUTTONS still owned by bot.py — aliases/expenses/
+    # cooking-mode/help buttons are NOT part of Dispatcher V1's scope (see
+    # message_dispatcher.py's docstring). /start, /menu, /help, "⬅️ Головне
+    # меню" and every shopping/inventory menu button now live in
+    # message_dispatcher.py (called once, below, after these five) — moving
+    # them there doesn't change observable behavior since every branch here
+    # is an exact, mutually-exclusive text match: only their position
+    # relative to the mode-text dispatch (which consumes ANY free text)
+    # actually matters, and that invariant — every literal button check
+    # before mode-text dispatch — is preserved exactly.
     # =========================
-
-    if text == "/start":
-        clear_interaction_state(chat_id)
-        send_message(
-            chat_id,
-            "Привіт! Я твій домашній помічник 🏠\n\n"
-            "Обери дію на клавіатурі або напиши будь-яке запитання — я відповім за допомогою AI.",
-            reply_markup=MAIN_KEYBOARD
-        )
-        return "ok"
-
-    if text == "/menu":
-        clear_interaction_state(chat_id)
-        send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
-        return "ok"
-
-    if text == "/help":
-        send_message(
-            chat_id,
-            "ℹ️ Як користуватися ботом:\n\n"
-            "🛒 Покупки — спільний список покупок\n"
-            "🧊 Запаси — що є вдома\n"
-            "🍽️ Що приготувати — ідеї страв на основі запасів\n"
-            "ℹ️ Допомога — ця інструкція\n\n"
-            "Будь-яке звичайне повідомлення надсилається AI і ти отримаєш відповідь."
-        )
-        return "ok"
-
-    if text == "🛒 Покупки":
-        legacy_shopping_flow.handle_open_shopping_menu(_shopping_deps, chat_id, user_id, display_name)
-        return "ok"
-
-    if text == "➕ Додати товар":
-        legacy_shopping_flow.handle_start_shopping_add(_shopping_deps, chat_id)
-        return "ok"
-
-    if text == "📋 Показати список":
-        legacy_shopping_flow.handle_show_shopping_list(_shopping_deps, chat_id, user_id, display_name)
-        return "ok"
-
-    if text == "✅ Позначити купленим":
-        legacy_shopping_flow.handle_start_mark_bought(_shopping_deps, chat_id, user_id, display_name)
-        return "ok"
-
-    if text == "🗑️ Видалити товар":
-        legacy_shopping_flow.handle_start_delete(_shopping_deps, chat_id, user_id, display_name)
-        return "ok"
-
-    if text == "⬅️ Головне меню":
-        clear_interaction_state(chat_id)
-        send_message(chat_id, "Ось головне меню:", reply_markup=MAIN_KEYBOARD)
-        return "ok"
 
     if text == "🧠 Назви товарів":
         waiting_for_ingredients.pop(chat_id, None)
@@ -4089,22 +4070,6 @@ def webhook():
         send_message(chat_id, EXPENSES_INTRO_TEXT, reply_markup=EXPENSES_KEYBOARD)
         return "ok"
 
-    if text == "🧊 Запаси":
-        legacy_inventory_flow.handle_open_inventory_menu(_inventory_deps, chat_id, user_id, display_name)
-        return "ok"
-
-    if text == "➕ Додати продукти":
-        legacy_inventory_flow.handle_start_inventory_add(_inventory_deps, chat_id)
-        return "ok"
-
-    if text == "📋 Показати запаси":
-        legacy_inventory_flow.handle_show_inventory_list(_inventory_deps, chat_id, user_id, display_name)
-        return "ok"
-
-    if text == "➖ Використати / прибрати":
-        legacy_inventory_flow.handle_start_inventory_remove(_inventory_deps, chat_id, user_id, display_name)
-        return "ok"
-
     if text == "🍽️ Що приготувати":
         active_list_context.pop(chat_id, None)
         clear_shopping_state(chat_id)
@@ -4125,15 +4090,12 @@ def webhook():
         return "ok"
 
     # =========================
-    # SHOPPING MODE (legacy_shopping_flow.py)
+    # MESSAGE DISPATCHER V1 (message_dispatcher.py)
+    # Navigation (/start, /menu, /help, "⬅️ Головне меню"), shopping/inventory
+    # menu buttons, then shopping_mode/inventory_mode text dispatch — exact
+    # same priority order as the old inline Phase A2/A3/B branches above.
     # =========================
-    if legacy_shopping_flow.handle_shopping_mode_text(_shopping_deps, chat_id, user_id, display_name, text):
-        return "ok"
-
-    # =========================
-    # INVENTORY MODE (legacy_inventory_flow.py)
-    # =========================
-    if legacy_inventory_flow.handle_inventory_mode_text(_inventory_deps, chat_id, user_id, display_name, text):
+    if message_dispatcher.dispatch(_dispatcher_deps, chat_id, user_id, display_name, text):
         return "ok"
 
     # =========================
