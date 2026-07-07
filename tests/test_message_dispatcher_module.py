@@ -242,12 +242,13 @@ class TestShoppingModePrecedesInventoryMode(unittest.TestCase):
 
 
 class TestUnhandledTextReturnsFalse(unittest.TestCase):
-    """8. Unrecognized text returns False and never calls send_message."""
+    """8. Unrecognized text returns RouteOutcome.CONTINUE and never calls
+    send_message."""
 
     def test_unknown_text_not_handled(self):
         deps = _make_fake_dispatcher_deps()
-        handled = message_dispatcher.dispatch(deps, 6, 555, "Тест", "яка сьогодні погода?")
-        self.assertFalse(handled)
+        outcome = message_dispatcher.dispatch(deps, 6, 555, "Тест", "яка сьогодні погода?")
+        self.assertEqual(outcome, message_dispatcher.RouteOutcome.CONTINUE)
         deps.send_message.assert_not_called()
 
 
@@ -346,8 +347,9 @@ class TestWebhookIntegration(unittest.TestCase):
         chat_id = 9104
         bot.pending_merge.pop(chat_id, None)
         # No pending state active and no mode set — text falls all the way
-        # through dispatch() (False) into the untouched saved-list/general
-        # AI-chat tail, ending in a plain AI answer via the mocked Gemini.
+        # through dispatch() (RouteOutcome.CONTINUE) into the untouched
+        # saved-list/general AI-chat tail, ending in a plain AI answer via
+        # the mocked Gemini.
         _call_webhook(_make_update(chat_id, "Привіт, як справи?"))
         self.mock_send.assert_called_once()
         sent_text = self.mock_send.call_args.args[1]

@@ -210,24 +210,24 @@ class TestPendingBatchOutranksInventoryBatch(unittest.TestCase):
         with patch.object(legacy_shopping_flow, "handle_pending_batch_edit_text", return_value=True) as mock_shop, \
                 patch.object(legacy_inventory_flow, "handle_pending_inventory_batch_edit_text") as mock_inv:
             result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "щось")
-        self.assertTrue(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
         mock_shop.assert_called_once_with(deps.shopping_deps, chat_id, "щось")
         mock_inv.assert_not_called()
 
 
 class TestPendingInventoryBatchDoesNotFallThroughToGlobalRouter(unittest.TestCase):
     """4. pending_inventory_batch does not let text fall through to any
-    lower route within the same dispatch() call — its own True/False
-    outcome IS the final result."""
+    lower route within the same dispatch() call — intent "none" maps to
+    RouteOutcome.DIRECT_GENERAL_AI_FALLBACK, which IS the final result."""
 
-    def test_intent_none_still_returns_false_without_checking_lower_routes(self):
+    def test_intent_none_returns_direct_general_ai_fallback_without_checking_lower_routes(self):
         chat_id = 2
         deps = _make_fake_dispatcher_deps(
             pending_routes=_make_fake_pending_route_deps(pending_inventory_batch={chat_id: {}}),
         )
         with patch.object(legacy_inventory_flow, "handle_pending_inventory_batch_edit_text", return_value=False) as mock_inv:
             result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "Купив молоко за 10 zł")
-        self.assertFalse(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.DIRECT_GENERAL_AI_FALLBACK)
         mock_inv.assert_called_once()
         deps.pending_routes.continue_inventory_quantity_clarification.assert_not_called()
         deps.pending_routes.start_undo_flow.assert_not_called()
@@ -250,7 +250,7 @@ class TestReconciliationClarifyOutranksLowerRoutes(unittest.TestCase):
             ),
         )
         result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "1 л")
-        self.assertTrue(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
         deps.pending_routes.continue_inventory_reconciliation_clarification.assert_called_once_with(chat_id, "1 л")
         deps.pending_routes.handle_expense_delete_selection_text.assert_not_called()
         deps.send_message.assert_not_called()
@@ -269,7 +269,7 @@ class TestExpenseDeleteSelectionOutranksActiveExpensePreview(unittest.TestCase):
             ),
         )
         result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "2")
-        self.assertTrue(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
         deps.pending_routes.handle_expense_delete_selection_text.assert_called_once_with(chat_id, "2")
         deps.send_message.assert_not_called()
 
@@ -283,7 +283,7 @@ class TestActiveExpensePreviewBlocksUndo(unittest.TestCase):
             pending_routes=_make_fake_pending_route_deps(has_active_expense_preview=MagicMock(return_value=True)),
         )
         result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "Скасувати останню дію")
-        self.assertTrue(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
         deps.send_message.assert_called_once_with(chat_id, "EXPENSE_PREVIEW_GUARD")
         deps.pending_routes.start_undo_flow.assert_not_called()
 
@@ -301,7 +301,7 @@ class TestQuantityClarificationOutranksGlobalHousehold(unittest.TestCase):
             ),
         )
         result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "1Л")
-        self.assertTrue(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
         deps.pending_routes.continue_inventory_quantity_clarification.assert_called_once_with(chat_id, "1Л")
         deps.send_message.assert_not_called()
 
@@ -319,7 +319,7 @@ class TestRepresentationClarificationOutranksGlobalHousehold(unittest.TestCase):
             ),
         )
         result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "окремо")
-        self.assertTrue(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
         deps.pending_routes.continue_inventory_representation_clarification.assert_called_once_with(chat_id, "окремо")
         deps.send_message.assert_not_called()
 
@@ -334,7 +334,7 @@ class TestGlobalHouseholdGuardBlocksNewCommand(unittest.TestCase):
             pending_routes=_make_fake_pending_route_deps(pending_global_household={chat_id: {}}),
         )
         result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "Купив хліб за 20 zł")
-        self.assertTrue(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
         deps.send_message.assert_called_once_with(chat_id, "GLOBAL_HOUSEHOLD_GUARD")
         deps.pending_routes.continue_inventory_quantity_clarification.assert_not_called()
         deps.pending_routes.continue_inventory_representation_clarification.assert_not_called()
@@ -351,7 +351,7 @@ class TestAddDestinationClarificationOutranksUndo(unittest.TestCase):
             pending_routes=_make_fake_pending_route_deps(pending_add_destination_clarification={chat_id: {}}),
         )
         result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "Скасувати останню дію")
-        self.assertTrue(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
         deps.pending_routes.continue_add_destination_clarification.assert_called_once_with(
             chat_id, "Скасувати останню дію"
         )
@@ -369,7 +369,7 @@ class TestUndoRouting(unittest.TestCase):
         )
         with patch.object(message_dispatcher.action_history, "PENDING_UNDO_MSG", "PENDING_UNDO"):
             result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "будь-що")
-        self.assertTrue(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
         deps.send_message.assert_called_once_with(chat_id, "PENDING_UNDO")
         deps.pending_routes.start_undo_flow.assert_not_called()
 
@@ -378,18 +378,18 @@ class TestUndoRouting(unittest.TestCase):
         deps = _make_fake_dispatcher_deps()
         with patch.object(message_dispatcher.action_history, "is_undo_command", return_value=True):
             result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "Скасувати останню дію")
-        self.assertTrue(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
         deps.pending_routes.start_undo_flow.assert_called_once_with(chat_id, 555, "Тест")
 
 
 class TestUnhandledTextReturnsFalse(unittest.TestCase):
-    """13. Unrecognized text returns False (webhook falls through to the
-    old lower router) and never calls send_message."""
+    """13. Unrecognized text returns RouteOutcome.CONTINUE (webhook falls
+    through to the old lower router) and never calls send_message."""
 
     def test_unknown_text_not_handled(self):
         deps = _make_fake_dispatcher_deps()
         result = message_dispatcher.dispatch(deps, 12, 555, "Тест", "яка сьогодні погода?")
-        self.assertFalse(result)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.CONTINUE)
         deps.send_message.assert_not_called()
 
 

@@ -3465,14 +3465,393 @@ _pending_route_deps = message_dispatcher.PendingRouteDeps(
     global_household_preview_guard_msg=GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG,
 )
 
-# Message Dispatcher V1/V2A — message_dispatcher.py owns the ordered
+# =========================
+# DISPATCHER V2B — COMMAND/CONTEXT ROUTE WRAPPERS (old Phase C routes 16-26)
+# Each function below is a thin, self-contained wrapper around already-
+# existing business logic (household router, expense/alias gates, the
+# saved-list router) so message_dispatcher.py can call it without ever
+# importing bot.py, touching the database, or calling Gemini itself. Every
+# one returns True if it fully handled the message, False if it does not
+# apply (dispatcher tries the next route) — except the two active-context
+# routes (aliases/expenses), which return None when the context itself
+# doesn't match (try next route) vs True/False when it does (stop here
+# regardless of the handler's own outcome, exactly like the old elif chain
+# where matching the context already claimed the branch).
+# =========================
+def _route_ambiguous_add(chat_id, user_id, display_name, text):
+    if not _is_ambiguous_add_with_price(text):
+        return False
+    _handle_ambiguous_add_with_price(chat_id)
+    return True
+
+
+def _route_global_explicit_add(chat_id, user_id, display_name, text):
+    if _has_blocking_pending_state_for_reports(chat_id):
+        return False
+    return _try_global_explicit_add(chat_id, user_id, display_name, text)
+
+
+def _route_global_bare_add(chat_id, user_id, display_name, text):
+    if _has_blocking_pending_state_for_reports(chat_id):
+        return False
+    return _try_global_bare_add(chat_id, user_id, display_name, text)
+
+
+def _route_global_household(chat_id, user_id, display_name, text):
+    if _has_blocking_pending_state_for_reports(chat_id):
+        return False
+    if not household_router.gate(text):
+        return False
+    return _try_global_household_router(chat_id, user_id, display_name, text)
+
+
+def _route_expense_report(chat_id, user_id, display_name, text):
+    if _has_blocking_pending_state_for_reports(chat_id):
+        return False
+    kind = _expense_report_gate(text)
+    if not kind:
+        return False
+    _handle_expense_report_command(chat_id, user_id, display_name, kind)
+    return True
+
+
+def _route_expense_delete_command(chat_id, user_id, display_name, text):
+    if _has_blocking_pending_state_for_expense_delete(chat_id):
+        return False
+    if not _expense_delete_command_gate(text):
+        return False
+    if text.strip() == "🗑️ Видалити витрату":
+        _handle_expense_delete_button(chat_id, user_id, display_name)
+    else:
+        _handle_expense_delete_global_command(chat_id, user_id, display_name, text)
+    return True
+
+
+def _route_active_aliases_context(chat_id, user_id, display_name, text):
+    """Returns None if active_list_context isn't "aliases" (try next route);
+    otherwise returns True/False (stop here either way — matching the
+    context already claimed this message in the old elif chain, same as
+    every dict-membership route in Dispatcher V2A)."""
+    if active_list_context.get(chat_id) != "aliases":
+        return None
+    return _handle_alias_command(chat_id, user_id, display_name, text)
+
+
+def _route_global_alias_command(chat_id, user_id, display_name, text):
+    if _has_blocking_pending_state(chat_id):
+        return False
+    if not _alias_command_gate(text):
+        return False
+    _handle_alias_command(chat_id, user_id, display_name, text)
+    return True
+
+
+def _route_active_expenses_context(chat_id, user_id, display_name, text):
+    """Same None/True/False contract as _route_active_aliases_context."""
+    if active_list_context.get(chat_id) != "expenses":
+        return None
+    return _handle_expense_command(chat_id, user_id, display_name, text)
+
+
+def _route_global_expense_command(chat_id, user_id, display_name, text):
+    if _has_blocking_pending_state_for_expense(chat_id):
+        return False
+    if not _expense_command_gate(text):
+        return False
+    _handle_expense_command(chat_id, user_id, display_name, text)
+    return True
+
+
+def _route_saved_list_router(chat_id, user_id, display_name, text):
+    """Old Phase C route 26 (saved-list router), extracted verbatim from
+    webhook()'s final `else` branch. Returns True if this route fully
+    handled the message, False if it did not apply or Gemini's intent was
+    "none" (message_dispatcher.py's dispatch() then returns CONTINUE, and
+    webhook() falls through to the unchanged Phase D)."""
+    ctx = saved_list_context.get(chat_id)
+    if _should_restore_persisted_context(chat_id):
+        # Try restoring the last opened list from PostgreSQL — survives
+        # restart/deploy, TTL 24h.
+        try:
+            household_id, _ = get_household_and_user(user_id, display_name)
+            persisted = get_list_context(chat_id, household_id)
+            if persisted in ("shopping_saved", "inventory_saved"):
+                ctx = persisted
+                saved_list_context[chat_id] = ctx
+        except Exception:
+            pass
+    if ctx in ("shopping_saved", "inventory_saved"):
+        try:
+            household_id, user_db_id = get_household_and_user(user_id, display_name)
+            alias_map = get_household_alias_map(household_id)
+            list_items = (
+                get_active_shopping_items(household_id)
+                if ctx == "shopping_saved"
+                else get_inventory_items(household_id)
+            )
+            if list_items:
+                router_result = _ask_gemini_saved_list_router(text, list_items, ctx)
+                intent = router_result["intent"]
+                if intent == "edit_saved_items":
+                    valid_updates = _validate_saved_updates(router_result["updates"], list_items)
+                    if valid_updates and _saved_edit_text_has_unsafe_package_conversion(text, valid_updates):
+                        send_message(chat_id, _format_package_conversion_blocked_message(text))
+                    elif valid_updates:
+                        real_updates, noop_updates = _split_noop_saved_updates(valid_updates, list_items, alias_map)
+                        if not real_updates:
+                            send_message(chat_id, _format_noop_saved_edit_message(noop_updates, list_items, ctx))
+                        else:
+                            pending_saved_edit[chat_id] = {
+                                "items_snapshot": list_items,
+                                "validated_updates": real_updates,
+                                "household_id": household_id,
+                                "user_db_id": user_db_id,
+                                "context_type": ctx,
+                            }
+                            preview = _format_saved_edit_preview(list_items, real_updates, ctx)
+                            if noop_updates:
+                                note = f"Без змін: {len(noop_updates)} {_pluralize_positions_uk(len(noop_updates))}."
+                                preview = note + "\n\n" + preview
+                            send_message(chat_id, preview, reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD)
+                    else:
+                        send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
+                    return True
+                elif intent == "merge_duplicates":
+                    validated_groups = _compute_saved_merge_groups(router_result["merge_groups"], list_items)
+                    if validated_groups:
+                        pending_merge[chat_id] = {
+                            "groups": validated_groups,
+                            "targets": _merge_snapshot_targets(validated_groups),
+                            "household_id": household_id,
+                            "user_db_id": user_db_id,
+                            "list_type": ctx,
+                        }
+                        send_message(chat_id, _format_merge_preview(validated_groups), reply_markup=MERGE_PREVIEW_KEYBOARD)
+                    else:
+                        send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
+                    return True
+                elif intent == "start_action":
+                    blocked, fragments = _check_unresolved_fragments(router_result)
+                    if blocked:
+                        if fragments:
+                            send_message(chat_id, _format_unresolved_fragments_message(fragments))
+                        else:
+                            send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
+                    else:
+                        selected = _validate_start_action(
+                            router_result.get("action"), router_result.get("selected_numbers"), ctx, list_items
+                        )
+                        if selected is not None:
+                            saved_list_context.pop(chat_id, None)
+                            action = router_result.get("action")
+                            if action == "mark_bought":
+                                legacy_shopping_flow._show_mark_preview(_shopping_deps, chat_id, selected, household_id, user_db_id)
+                            elif action == "delete_shopping":
+                                legacy_shopping_flow._show_delete_preview(_shopping_deps, chat_id, selected, household_id, user_db_id)
+                            elif action == "remove_inventory":
+                                legacy_inventory_flow._show_remove_preview(_inventory_deps, chat_id, selected, household_id, user_db_id)
+                        else:
+                            send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
+                    return True
+                elif intent == "consume_inventory_quantity" and ctx == "inventory_saved":
+                    blocked, fragments = _check_unresolved_fragments(router_result)
+                    if blocked:
+                        if fragments:
+                            send_message(chat_id, _format_unresolved_fragments_message(fragments))
+                        else:
+                            send_message(
+                                chat_id,
+                                "Не можу безпечно визначити, яку саме кількість потрібно списати. Уточни, будь ласка.",
+                            )
+                    else:
+                        kind, payload = _validate_consumptions(router_result.get("consumptions"), list_items)
+                        if kind == "ok":
+                            pending_inventory_consumption[chat_id] = {
+                                "resolved": payload,
+                                "household_id": household_id,
+                                "user_db_id": user_db_id,
+                            }
+                            send_message(
+                                chat_id, _format_consumption_preview(payload), reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD
+                            )
+                        elif kind == "missing_quantity":
+                            send_message(
+                                chat_id,
+                                f"Не можу безпечно відняти частину, бо для «{payload}» не вказана точна кількість. "
+                                "Спочатку відредагуй кількість товару.",
+                            )
+                        elif kind == "insufficient":
+                            name, available, requested = payload
+                            send_message(
+                                chat_id, f"У запасах є лише {available}, а ти вказав {requested}. Уточни кількість."
+                            )
+                        else:
+                            send_message(
+                                chat_id,
+                                "Не можу безпечно визначити, яку саме кількість потрібно списати. Уточни, будь ласка.",
+                            )
+                    return True
+                elif intent == "compound_inventory_operations" and ctx == "inventory_saved":
+                    kind, payload = _validate_compound_operations(
+                        router_result.get("operations"), router_result.get("unresolved_fragments"), list_items,
+                        alias_map=alias_map,
+                    )
+                    if kind == "ok":
+                        pending_compound_inventory[chat_id] = {
+                            "inventory_changes": payload["inventory_changes"],
+                            "add_to_shopping": payload["add_to_shopping"],
+                            "household_id": household_id,
+                            "user_db_id": user_db_id,
+                        }
+                        send_message(
+                            chat_id, _format_compound_preview(payload), reply_markup=COMPOUND_PREVIEW_KEYBOARD
+                        )
+                    elif kind == "unresolved":
+                        lines = [
+                            "Я зрозумів частину повідомлення, але не хочу мовчки пропустити решту.",
+                            "",
+                            "Не зміг зрозуміти:",
+                        ]
+                        for frag in payload:
+                            lines.append(f"• «{frag}»")
+                        lines.append("")
+                        lines.append("Спробуй уточнити все повідомлення.")
+                        send_message(chat_id, "\n".join(lines))
+                    else:
+                        lines = [
+                            "Не зміг безпечно обробити всі зміни. Нічого не було змінено.",
+                            "",
+                            "Не зрозумів або не можу виконати:",
+                        ]
+                        for reason in payload:
+                            lines.append(f"• {reason}")
+                        send_message(chat_id, "\n".join(lines))
+                    return True
+                elif intent == "reconcile_inventory_snapshot" and ctx == "inventory_saved":
+                    kind, payload = _validate_reconcile_snapshot(
+                        router_result.get("items"), router_result.get("unresolved_fragments"), list_items,
+                        alias_map=alias_map,
+                    )
+                    if kind == "ok":
+                        pending_inventory_reconciliation[chat_id] = {
+                            "updates": payload["updates"],
+                            "additions": payload["additions"],
+                            "deletes": payload["deletes"],
+                            "household_id": household_id,
+                            "user_db_id": user_db_id,
+                        }
+                        send_message(
+                            chat_id, _format_reconciliation_preview(payload), reply_markup=RECONCILIATION_PREVIEW_KEYBOARD
+                        )
+                    elif kind == "ambiguous_unit_group":
+                        pending_inventory_reconciliation_clarify[chat_id] = {
+                            "ambiguous_group": payload["ambiguous_group"],
+                            "rest": payload["rest"],
+                            "household_id": household_id,
+                            "user_db_id": user_db_id,
+                        }
+                        send_message(chat_id, _format_reconciliation_unit_clarify_question(payload["ambiguous_group"]))
+                    elif kind == "unresolved":
+                        lines = [
+                            "Я зрозумів частину списку, але не хочу мовчки пропустити решту.",
+                            "",
+                            "Не зміг зрозуміти:",
+                        ]
+                        for frag in payload:
+                            lines.append(f"• «{frag}»")
+                        lines.append("")
+                        lines.append("Спробуй надіслати весь список запасів ще раз.")
+                        send_message(chat_id, "\n".join(lines))
+                    else:
+                        lines = [
+                            "Не зміг безпечно звірити запаси. Нічого не було змінено.",
+                            "",
+                            "Причина:",
+                        ]
+                        for reason in payload:
+                            lines.append(f"• {reason}")
+                        send_message(chat_id, "\n".join(lines))
+                    return True
+                # intent == "none": fall through to AI chat
+            elif ctx == "shopping_saved":
+                router_result = _ask_gemini_saved_list_router(text, [], ctx)
+                if router_result["intent"] == "quick_add_to_inventory":
+                    parsed = _validate_quick_add_items(router_result.get("items"), alias_map=alias_map)
+                    if parsed is not None:
+                        quick_items, ignored_names = parsed
+                        saved_list_context.pop(chat_id, None)
+                        pending_quick_purchase[chat_id] = {
+                            "items": quick_items,
+                            "ignored_items": ignored_names,
+                            "household_id": household_id,
+                            "user_db_id": user_db_id,
+                        }
+                        preview = _format_quick_purchase_preview(quick_items, ignored_names)
+                        send_message(chat_id, preview, reply_markup=QUICK_PURCHASE_KEYBOARD)
+                    else:
+                        send_message(chat_id, "Не зміг безпечно зрозуміти покупку. Спробуй написати інакше.")
+                    return True
+                # intent == "none": fall through to AI chat
+        except Exception:
+            pass
+    return False
+
+
+def _run_general_ai_fallback(chat_id, text):
+    """Exact, unchanged general AI-chat fallback (Gemini 3.1 Flash Lite) —
+    extracted from webhook()'s final block into a named function so it can
+    be invoked directly for RouteOutcome.DIRECT_GENERAL_AI_FALLBACK (which
+    must skip cooking mode entirely) as well as normally at the end of
+    Phase D for RouteOutcome.CONTINUE."""
+    if chat_id not in user_history:
+        user_history[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    user_history[chat_id].append({"role": "user", "content": text})
+    user_history[chat_id] = user_history[chat_id][:1] + user_history[chat_id][-20:]
+
+    gemini_history = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in user_history[chat_id][1:]
+    ]
+    answer = call_gemini(gemini_history, SYSTEM_PROMPT + "\n\n" + get_warsaw_datetime_context())
+
+    if answer is not None:
+        user_history[chat_id].append({"role": "assistant", "content": answer})
+    else:
+        answer = "AI-помічник тимчасово недоступний. Спробуйте ще раз трохи пізніше."
+
+    send_message(chat_id, answer)
+
+
+# Dispatcher V2B — message_dispatcher.py owns the ordered priority of the
+# eleven remaining command/context routes (old Phase C routes 16-26); every
+# callback is a lambda-forward to one of the thin wrapper functions above,
+# same patch.object(bot, ...) reasoning as every other callback container.
+_command_route_deps = message_dispatcher.CommandRouteDeps(
+    ambiguous_add_route=lambda *a, **kw: _route_ambiguous_add(*a, **kw),
+    explicit_global_add=lambda *a, **kw: _route_global_explicit_add(*a, **kw),
+    bare_global_add=lambda *a, **kw: _route_global_bare_add(*a, **kw),
+    global_household_router=lambda *a, **kw: _route_global_household(*a, **kw),
+    expense_report_route=lambda *a, **kw: _route_expense_report(*a, **kw),
+    expense_delete_command_route=lambda *a, **kw: _route_expense_delete_command(*a, **kw),
+    active_aliases_context=lambda *a, **kw: _route_active_aliases_context(*a, **kw),
+    global_alias_command=lambda *a, **kw: _route_global_alias_command(*a, **kw),
+    active_expenses_context=lambda *a, **kw: _route_active_expenses_context(*a, **kw),
+    global_expense_command=lambda *a, **kw: _route_global_expense_command(*a, **kw),
+    saved_list_router=lambda *a, **kw: _route_saved_list_router(*a, **kw),
+    general_ai_fallback=lambda *a, **kw: _run_general_ai_fallback(*a, **kw),
+)
+
+# Message Dispatcher V1/V2A/V2B — message_dispatcher.py owns the ordered
 # navigation/menu/mode-text dispatch slice (old Phase A2/A3/B) plus the
-# pending-route slice above (Phase C routes 6-15); it has no import of
-# bot.py, so everything it needs is passed once via this injected dependency
+# pending-route slice (Phase C routes 6-15) plus the command/context-route
+# slice above (Phase C routes 16-26); it has no import of bot.py, so
+# everything it needs is passed once via this injected dependency
 # container, which simply nests the already-built _shopping_deps/
-# _inventory_deps/_pending_route_deps instead of re-declaring their fields.
-# Same lambda-forward reasoning as those containers — patch.object(bot,
-# "send_message"/"clear_interaction_state") keeps working through here too.
+# _inventory_deps/_pending_route_deps/_command_route_deps instead of
+# re-declaring their fields. Same lambda-forward reasoning as those
+# containers — patch.object(bot, "send_message"/"clear_interaction_state")
+# keeps working through here too.
 _dispatcher_deps = message_dispatcher.DispatcherDeps(
     send_message=lambda *a, **kw: send_message(*a, **kw),
     clear_interaction_state=lambda *a, **kw: clear_interaction_state(*a, **kw),
@@ -3488,6 +3867,7 @@ _dispatcher_deps = message_dispatcher.DispatcherDeps(
     shopping_deps=_shopping_deps,
     inventory_deps=_inventory_deps,
     pending_routes=_pending_route_deps,
+    command_routes=_command_route_deps,
 )
 
 
@@ -4070,384 +4450,29 @@ def webhook():
         return "ok"
 
     # =========================
-    # MESSAGE DISPATCHER V2A (message_dispatcher.py)
-    # Navigation (/start, /menu, /help, "⬅️ Головне меню"), shopping/inventory
-    # menu buttons, shopping_mode/inventory_mode text dispatch, then the
-    # highest-priority pending/clarification/undo routes: pending_batch,
-    # pending_inventory_batch, pending_inventory_reconciliation_clarify,
-    # expense_delete_selection, active expense preview guard, inventory
-    # quantity clarification, inventory representation clarification,
-    # pending_global_household guard, add-destination clarification, undo —
-    # exact same priority order as the old inline Phase A2/A3/B/C(6-15)
-    # branches this replaces.
+    # MESSAGE DISPATCHER V1/V2A/V2B (message_dispatcher.py)
+    # Navigation, shopping/inventory menu buttons, shopping_mode/inventory_
+    # mode text dispatch, the ten pending/clarification/undo routes, then
+    # the eleven remaining command/context routes (ambiguous/explicit/bare
+    # add, Global Household Router, expense reports, expense-delete
+    # command, aliases/expenses context, global alias/expense command,
+    # saved-list router) — exact same priority order as the old inline
+    # Phase A2/A3/B/C(6-26) branches this replaces. Returns a RouteOutcome,
+    # not a bool — see message_dispatcher.RouteOutcome's docstring for why
+    # DIRECT_GENERAL_AI_FALLBACK exists (pending_batch/pending_inventory_
+    # batch matching with Gemini intent "none" must skip every remaining
+    # route below AND cooking mode, landing directly on general AI-chat).
     # =========================
-    if message_dispatcher.dispatch(_dispatcher_deps, chat_id, user_id, display_name, text):
+    _route_outcome = message_dispatcher.dispatch(_dispatcher_deps, chat_id, user_id, display_name, text)
+
+    if _route_outcome == message_dispatcher.RouteOutcome.HANDLED:
         return "ok"
 
-    # =========================
-    # PENDING PREVIEW ROUTER (remaining Phase C routes, unchanged)
-    # Routes 6-15 (every pending-state/clarification/undo branch that used to
-    # open this chain) now live in message_dispatcher.py, handled by the same
-    # dispatch() call above. Everything below is reached only when none of
-    # those states/commands matched.
-    # =========================
-    _preview_intercepted = False
-
-    if chat_id in pending_batch or chat_id in pending_inventory_batch:
-        # Dispatcher V2A's routes 6/7 already ran this chat's pending_batch/
-        # pending_inventory_batch edit-router (legacy_shopping_flow.handle_
-        # pending_batch_edit_text/legacy_inventory_flow.handle_pending_
-        # inventory_batch_edit_text) and returned False here specifically
-        # because Gemini's intent was "none" — in the original single elif
-        # chain, matching either dict already claimed the message (whether
-        # or not it ended up setting _preview_intercepted), so none of the
-        # remaining Phase C routes below ever saw it; it fell straight
-        # through to cooking-mode/general AI-chat. This reproduces that
-        # exact fall-through instead of letting those routes re-evaluate a
-        # message a second time that a higher-priority route already owns.
-        pass
-    elif _is_ambiguous_add_with_price(text):
-        # Ambiguous "Додай ... за суму" guard — checked after every active
-        # preview/selection/clarification state above (none of them are
-        # active here, or a higher elif would already have matched) and
-        # ahead of Explicit Add/Bare Add/the Global Household Router/the
-        # expense gate below, so a bare "Додай молоко за 10 zł" (or an
-        # explicit-destination "Додай в запаси/до покупок ... за суму") can
-        # never fall through into any of them — no preview, no
-        # clarification, no DB write, no Gemini call, no general AI-chat.
-        _handle_ambiguous_add_with_price(chat_id)
-        _preview_intercepted = True
-
-    elif (
-        not _has_blocking_pending_state_for_reports(chat_id)
-        and _try_global_explicit_add(chat_id, user_id, display_name, text)
-    ):
-        # Global Explicit Add v1 — a message with an EXPLICIT destination
-        # phrase ("Додай до покупок ...", "Додай в запаси ...", see
-        # household_router.detect_explicit_add_destination) adds to that
-        # list regardless of which menu is open. Checked ahead of the
-        # household_router gate below so an explicit destination always
-        # wins; _try_global_explicit_add itself returns False when no such
-        # phrase is present at all, falling through to Global Bare Add v1
-        # below exactly as before this route existed.
-        _preview_intercepted = True
-
-    elif (
-        not _has_blocking_pending_state_for_reports(chat_id)
-        and _try_global_bare_add(chat_id, user_id, display_name, text)
-    ):
-        # Global Bare Add v1 — a bare "Додай молоко" with NO destination
-        # phrase at all (see household_router.detect_bare_add). Checked
-        # right after explicit add (which already claimed every destination
-        # phrase) and ahead of the household_router gate below. Builds the
-        # preview directly when the active menu is "shopping"/"inventory",
-        # otherwise starts pending_add_destination_clarification above.
-        # _try_global_bare_add itself returns False when the text isn't a
-        # bare add at all (no "Додай" verb, or it carries an expense-amount
-        # marker), falling through unchanged to every gate below exactly as
-        # before this route existed.
-        _preview_intercepted = True
-
-    elif (
-        not _has_blocking_pending_state_for_reports(chat_id)
-        and household_router.gate(text)
-        and _try_global_household_router(chat_id, user_id, display_name, text)
-    ):
-        # Global Household Router v1 — narrow local gate (no Gemini) checked
-        # first, exactly like every other gate in this chain; only messages
-        # matching household_router.gate(text) even attempt a Gemini call, so
-        # a plain zł-amount or an imperative "видали/скасуй витрату" (already
-        # owned by the legacy gates below) never reaches this branch. If the
-        # gate matches but the router decides intent=="none",
-        # _try_global_household_router returns False and this elif's
-        # condition is False overall — falls through unchanged to the
-        # existing report/delete/alias/expense gates and saved_list_context
-        # router below (priority 5), exactly as before this router existed.
-        _preview_intercepted = True
-
-    elif not _has_blocking_pending_state_for_reports(chat_id) and _expense_report_gate(text):
-        # Expense report gate — narrow, local, no Gemini call here, checked
-        # ahead of everything else in this chain (including the expenses
-        # submenu and the expense-add gate) so "Покажи останні витрати"
-        # never gets sent to the expense-add router. Blocked by ANY pending
-        # preview across the whole bot, expense-add included — a report
-        # request must never silently discard an unconfirmed operation.
-        _handle_expense_report_command(chat_id, user_id, display_name, _expense_report_gate(text))
-        _preview_intercepted = True
-
-    elif not _has_blocking_pending_state_for_expense_delete(chat_id) and _expense_delete_command_gate(text):
-        # Expense-delete gate — narrow, local, no Gemini call for the routing
-        # decision itself. Checked ahead of the aliases/expenses-submenu/
-        # expense-add branches so a phrase like "Скасуй витрату Biedronka
-        # 86,40 zł" (which also matches the add-gate's zł-amount regex) is
-        # never misrouted into creating a NEW expense. Blocked by any other
-        # flow's pending preview, expense-add included; never blocked by its
-        # own two states (selection mode / delete preview already in progress).
-        if text.strip() == "🗑️ Видалити витрату":
-            _handle_expense_delete_button(chat_id, user_id, display_name)
-        else:
-            _handle_expense_delete_global_command(chat_id, user_id, display_name, text)
-        _preview_intercepted = True
-
-    elif active_list_context.get(chat_id) == "aliases":
-        if _handle_alias_command(chat_id, user_id, display_name, text):
-            _preview_intercepted = True
-        # else: intent was "none" — fall through to AI chat, same as every other router here.
-
-    elif not _has_blocking_pending_state(chat_id) and _alias_command_gate(text):
-        # Global alias command gate — narrow, local, no Gemini call here. Fires
-        # from anywhere (main menu, help, open shopping/inventory lists) but
-        # never overrides an active preview/confirm/mode and never touches
-        # saved_list_context. _handle_alias_command derives the precise
-        # origin (main menu vs open shopping/inventory list) itself.
-        _handle_alias_command(chat_id, user_id, display_name, text)
-        _preview_intercepted = True
-
-    elif active_list_context.get(chat_id) == "expenses":
-        if _handle_expense_command(chat_id, user_id, display_name, text):
-            _preview_intercepted = True
-        # else: intent was "none" — fall through to AI chat, same as every other router here.
-
-    elif not _has_blocking_pending_state_for_expense(chat_id) and _expense_command_gate(text):
-        # Global expense command gate — narrow, local, no Gemini call here.
-        # Fires from anywhere but never overrides an active preview/confirm
-        # from ANY other flow, aliases included (aliases has priority over a
-        # new expense command per spec). _handle_expense_command derives the
-        # precise origin (expenses submenu vs main menu) itself.
-        _handle_expense_command(chat_id, user_id, display_name, text)
-        _preview_intercepted = True
-
-    else:
-        ctx = saved_list_context.get(chat_id)
-        if _should_restore_persisted_context(chat_id):
-            # Try restoring the last opened list from PostgreSQL — survives
-            # restart/deploy, TTL 24h.
-            try:
-                household_id, _ = get_household_and_user(user_id, display_name)
-                persisted = get_list_context(chat_id, household_id)
-                if persisted in ("shopping_saved", "inventory_saved"):
-                    ctx = persisted
-                    saved_list_context[chat_id] = ctx
-            except Exception:
-                pass
-        if ctx in ("shopping_saved", "inventory_saved"):
-            try:
-                household_id, user_db_id = get_household_and_user(user_id, display_name)
-                alias_map = get_household_alias_map(household_id)
-                list_items = (
-                    get_active_shopping_items(household_id)
-                    if ctx == "shopping_saved"
-                    else get_inventory_items(household_id)
-                )
-                if list_items:
-                    router_result = _ask_gemini_saved_list_router(text, list_items, ctx)
-                    intent = router_result["intent"]
-                    if intent == "edit_saved_items":
-                        valid_updates = _validate_saved_updates(router_result["updates"], list_items)
-                        if valid_updates and _saved_edit_text_has_unsafe_package_conversion(text, valid_updates):
-                            send_message(chat_id, _format_package_conversion_blocked_message(text))
-                        elif valid_updates:
-                            real_updates, noop_updates = _split_noop_saved_updates(valid_updates, list_items, alias_map)
-                            if not real_updates:
-                                send_message(chat_id, _format_noop_saved_edit_message(noop_updates, list_items, ctx))
-                            else:
-                                pending_saved_edit[chat_id] = {
-                                    "items_snapshot": list_items,
-                                    "validated_updates": real_updates,
-                                    "household_id": household_id,
-                                    "user_db_id": user_db_id,
-                                    "context_type": ctx,
-                                }
-                                preview = _format_saved_edit_preview(list_items, real_updates, ctx)
-                                if noop_updates:
-                                    note = f"Без змін: {len(noop_updates)} {_pluralize_positions_uk(len(noop_updates))}."
-                                    preview = note + "\n\n" + preview
-                                send_message(chat_id, preview, reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD)
-                        else:
-                            send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
-                        _preview_intercepted = True
-                    elif intent == "merge_duplicates":
-                        validated_groups = _compute_saved_merge_groups(router_result["merge_groups"], list_items)
-                        if validated_groups:
-                            pending_merge[chat_id] = {
-                                "groups": validated_groups,
-                                "targets": _merge_snapshot_targets(validated_groups),
-                                "household_id": household_id,
-                                "user_db_id": user_db_id,
-                                "list_type": ctx,
-                            }
-                            send_message(chat_id, _format_merge_preview(validated_groups), reply_markup=MERGE_PREVIEW_KEYBOARD)
-                        else:
-                            send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
-                        _preview_intercepted = True
-                    elif intent == "start_action":
-                        blocked, fragments = _check_unresolved_fragments(router_result)
-                        if blocked:
-                            if fragments:
-                                send_message(chat_id, _format_unresolved_fragments_message(fragments))
-                            else:
-                                send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
-                        else:
-                            selected = _validate_start_action(
-                                router_result.get("action"), router_result.get("selected_numbers"), ctx, list_items
-                            )
-                            if selected is not None:
-                                saved_list_context.pop(chat_id, None)
-                                action = router_result.get("action")
-                                if action == "mark_bought":
-                                    legacy_shopping_flow._show_mark_preview(_shopping_deps, chat_id, selected, household_id, user_db_id)
-                                elif action == "delete_shopping":
-                                    legacy_shopping_flow._show_delete_preview(_shopping_deps, chat_id, selected, household_id, user_db_id)
-                                elif action == "remove_inventory":
-                                    legacy_inventory_flow._show_remove_preview(_inventory_deps, chat_id, selected, household_id, user_db_id)
-                            else:
-                                send_message(chat_id, "Не зміг безпечно зрозуміти дію. Спробуй написати інакше.")
-                        _preview_intercepted = True
-                    elif intent == "consume_inventory_quantity" and ctx == "inventory_saved":
-                        blocked, fragments = _check_unresolved_fragments(router_result)
-                        if blocked:
-                            if fragments:
-                                send_message(chat_id, _format_unresolved_fragments_message(fragments))
-                            else:
-                                send_message(
-                                    chat_id,
-                                    "Не можу безпечно визначити, яку саме кількість потрібно списати. Уточни, будь ласка.",
-                                )
-                        else:
-                            kind, payload = _validate_consumptions(router_result.get("consumptions"), list_items)
-                            if kind == "ok":
-                                pending_inventory_consumption[chat_id] = {
-                                    "resolved": payload,
-                                    "household_id": household_id,
-                                    "user_db_id": user_db_id,
-                                }
-                                send_message(
-                                    chat_id, _format_consumption_preview(payload), reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD
-                                )
-                            elif kind == "missing_quantity":
-                                send_message(
-                                    chat_id,
-                                    f"Не можу безпечно відняти частину, бо для «{payload}» не вказана точна кількість. "
-                                    "Спочатку відредагуй кількість товару.",
-                                )
-                            elif kind == "insufficient":
-                                name, available, requested = payload
-                                send_message(
-                                    chat_id, f"У запасах є лише {available}, а ти вказав {requested}. Уточни кількість."
-                                )
-                            else:
-                                send_message(
-                                    chat_id,
-                                    "Не можу безпечно визначити, яку саме кількість потрібно списати. Уточни, будь ласка.",
-                                )
-                        _preview_intercepted = True
-                    elif intent == "compound_inventory_operations" and ctx == "inventory_saved":
-                        kind, payload = _validate_compound_operations(
-                            router_result.get("operations"), router_result.get("unresolved_fragments"), list_items,
-                            alias_map=alias_map,
-                        )
-                        if kind == "ok":
-                            pending_compound_inventory[chat_id] = {
-                                "inventory_changes": payload["inventory_changes"],
-                                "add_to_shopping": payload["add_to_shopping"],
-                                "household_id": household_id,
-                                "user_db_id": user_db_id,
-                            }
-                            send_message(
-                                chat_id, _format_compound_preview(payload), reply_markup=COMPOUND_PREVIEW_KEYBOARD
-                            )
-                        elif kind == "unresolved":
-                            lines = [
-                                "Я зрозумів частину повідомлення, але не хочу мовчки пропустити решту.",
-                                "",
-                                "Не зміг зрозуміти:",
-                            ]
-                            for frag in payload:
-                                lines.append(f"• «{frag}»")
-                            lines.append("")
-                            lines.append("Спробуй уточнити все повідомлення.")
-                            send_message(chat_id, "\n".join(lines))
-                        else:
-                            lines = [
-                                "Не зміг безпечно обробити всі зміни. Нічого не було змінено.",
-                                "",
-                                "Не зрозумів або не можу виконати:",
-                            ]
-                            for reason in payload:
-                                lines.append(f"• {reason}")
-                            send_message(chat_id, "\n".join(lines))
-                        _preview_intercepted = True
-                    elif intent == "reconcile_inventory_snapshot" and ctx == "inventory_saved":
-                        kind, payload = _validate_reconcile_snapshot(
-                            router_result.get("items"), router_result.get("unresolved_fragments"), list_items,
-                            alias_map=alias_map,
-                        )
-                        if kind == "ok":
-                            pending_inventory_reconciliation[chat_id] = {
-                                "updates": payload["updates"],
-                                "additions": payload["additions"],
-                                "deletes": payload["deletes"],
-                                "household_id": household_id,
-                                "user_db_id": user_db_id,
-                            }
-                            send_message(
-                                chat_id, _format_reconciliation_preview(payload), reply_markup=RECONCILIATION_PREVIEW_KEYBOARD
-                            )
-                        elif kind == "ambiguous_unit_group":
-                            pending_inventory_reconciliation_clarify[chat_id] = {
-                                "ambiguous_group": payload["ambiguous_group"],
-                                "rest": payload["rest"],
-                                "household_id": household_id,
-                                "user_db_id": user_db_id,
-                            }
-                            send_message(chat_id, _format_reconciliation_unit_clarify_question(payload["ambiguous_group"]))
-                        elif kind == "unresolved":
-                            lines = [
-                                "Я зрозумів частину списку, але не хочу мовчки пропустити решту.",
-                                "",
-                                "Не зміг зрозуміти:",
-                            ]
-                            for frag in payload:
-                                lines.append(f"• «{frag}»")
-                            lines.append("")
-                            lines.append("Спробуй надіслати весь список запасів ще раз.")
-                            send_message(chat_id, "\n".join(lines))
-                        else:
-                            lines = [
-                                "Не зміг безпечно звірити запаси. Нічого не було змінено.",
-                                "",
-                                "Причина:",
-                            ]
-                            for reason in payload:
-                                lines.append(f"• {reason}")
-                            send_message(chat_id, "\n".join(lines))
-                        _preview_intercepted = True
-                    # intent == "none": fall through to AI chat
-                elif ctx == "shopping_saved":
-                    router_result = _ask_gemini_saved_list_router(text, [], ctx)
-                    if router_result["intent"] == "quick_add_to_inventory":
-                        parsed = _validate_quick_add_items(router_result.get("items"), alias_map=alias_map)
-                        if parsed is not None:
-                            quick_items, ignored_names = parsed
-                            saved_list_context.pop(chat_id, None)
-                            pending_quick_purchase[chat_id] = {
-                                "items": quick_items,
-                                "ignored_items": ignored_names,
-                                "household_id": household_id,
-                                "user_db_id": user_db_id,
-                            }
-                            preview = _format_quick_purchase_preview(quick_items, ignored_names)
-                            send_message(chat_id, preview, reply_markup=QUICK_PURCHASE_KEYBOARD)
-                        else:
-                            send_message(chat_id, "Не зміг безпечно зрозуміти покупку. Спробуй написати інакше.")
-                        _preview_intercepted = True
-                    # intent == "none": fall through to AI chat
-            except Exception:
-                pass
-
-    if _preview_intercepted:
+    if _route_outcome == message_dispatcher.RouteOutcome.DIRECT_GENERAL_AI_FALLBACK:
+        _run_general_ai_fallback(chat_id, text)
         return "ok"
 
+    # RouteOutcome.CONTINUE falls through to Phase D, unchanged.
     # =========================
     # COOKING MODE
     # =========================
@@ -4464,24 +4489,7 @@ def webhook():
     # =========================
     # AI CHAT (Gemini 3.1 Flash Lite)
     # =========================
-    if chat_id not in user_history:
-        user_history[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    user_history[chat_id].append({"role": "user", "content": text})
-    user_history[chat_id] = user_history[chat_id][:1] + user_history[chat_id][-20:]
-
-    gemini_history = [
-        {"role": msg["role"], "content": msg["content"]}
-        for msg in user_history[chat_id][1:]
-    ]
-    answer = call_gemini(gemini_history, SYSTEM_PROMPT + "\n\n" + get_warsaw_datetime_context())
-
-    if answer is not None:
-        user_history[chat_id].append({"role": "assistant", "content": answer})
-    else:
-        answer = "AI-помічник тимчасово недоступний. Спробуйте ще раз трохи пізніше."
-
-    send_message(chat_id, answer)
+    _run_general_ai_fallback(chat_id, text)
     return "ok"
 
 
