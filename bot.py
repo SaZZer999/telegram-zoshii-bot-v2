@@ -76,6 +76,7 @@ from inventory import (
 )
 import list_editing
 from list_editing import _compute_merged_quantity, _apply_pending_merge
+import legacy_shopping_flow
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -114,10 +115,13 @@ GEMINI_COOKING_URL = "https://generativelanguage.googleapis.com/v1beta/models/ge
 user_history = {}
 waiting_for_ingredients = {}
 active_list_context = {}      # chat_id -> "shopping" | "inventory"
-shopping_mode = {}            # chat_id -> "adding" | "marking" | "deleting" | "editing_number" | "editing_text"
-pending_batch = {}            # chat_id -> {items, ignored_items, household_id, user_db_id}
-pending_mark_batch = {}       # chat_id -> {items, household_id, user_db_id}
-pending_delete_batch = {}     # chat_id -> {items, household_id, user_db_id}
+# shopping_mode/pending_batch/pending_mark_batch/pending_delete_batch now live in
+# legacy_shopping_flow.py — re-exported below (same dict objects, not copies) so
+# every existing test that does `from bot import shopping_mode` etc. keeps working.
+shopping_mode = legacy_shopping_flow.shopping_mode
+pending_batch = legacy_shopping_flow.pending_batch
+pending_mark_batch = legacy_shopping_flow.pending_mark_batch
+pending_delete_batch = legacy_shopping_flow.pending_delete_batch
 pending_merge = {}            # chat_id -> {groups, household_id, user_db_id, list_type}
 inventory_mode = {}           # chat_id -> "adding" | "removing"
 pending_inventory_batch = {}  # chat_id -> {items, ignored_items, household_id, user_db_id}
@@ -2711,24 +2715,6 @@ def _ask_gemini_for_selection(user_text, items, list_label, action_label):
         return "invalid", None
     return "ok", selected
 
-def _show_mark_preview(chat_id, items, household_id, user_db_id):
-    pending_mark_batch[chat_id] = {
-        "items": items,
-        "household_id": household_id,
-        "user_db_id": user_db_id,
-    }
-    preview = format_grouped_list(items, f"🛒 Буде позначено купленими: {len(items)}")
-    send_message(chat_id, preview + "\n\nЩо зробити з цими товарами?", reply_markup=MARK_PREVIEW_KEYBOARD)
-
-def _show_delete_preview(chat_id, items, household_id, user_db_id):
-    pending_delete_batch[chat_id] = {
-        "items": items,
-        "household_id": household_id,
-        "user_db_id": user_db_id,
-    }
-    preview = format_grouped_list(items, f"🗑️ Буде видалено зі списку покупок: {len(items)}")
-    send_message(chat_id, preview, reply_markup=DELETE_PREVIEW_KEYBOARD)
-
 def _show_remove_preview(chat_id, items, household_id, user_db_id):
     pending_remove_batch[chat_id] = {
         "items": items,
@@ -2738,49 +2724,8 @@ def _show_remove_preview(chat_id, items, household_id, user_db_id):
     preview = format_grouped_list(items, f"🧊 Буде прибрано із запасів: {len(items)}")
     send_message(chat_id, preview, reply_markup=REMOVE_PREVIEW_KEYBOARD)
 
-def parse_shopping_list_with_gemini(text, alias_map=None):
-    history = [{"role": "user", "content": text}]
-    raw = call_gemini(history, SHOPPING_PARSE_PROMPT, temperature=0.1)
-    if not raw:
-        return None
-    cleaned = raw.strip()
-    if "```" in cleaned:
-        match = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
-        if match:
-            cleaned = match.group(1).strip()
-    try:
-        data = json.loads(cleaned)
-        raw_items = data.get("items")
-        if not isinstance(raw_items, list):
-            return None
-        ignored = list(data.get("ignored_items") or [])
-        consumable = []
-        for item in raw_items:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("name", "").strip()
-            if not name:
-                continue
-            if not item.get("is_consumable", True):
-                ignored.append(name)
-                continue
-            cat = item.get("category", "").strip()
-            if cat not in VALID_CATEGORIES:
-                cat = DEFAULT_CATEGORY
-            normalized = normalize_item_quantity(name, item.get("quantity_text", "").strip(), allow_default_unit=True, alias_map=alias_map)
-            entry = {
-                "name": name,
-                "category": cat,
-                "was_corrected": bool(item.get("was_corrected", False)),
-            }
-            entry.update(normalized)
-            consumable.append(entry)
-        if not consumable and not ignored:
-            return None
-        return {"items": consumable, "ignored_items": ignored}
-    except (json.JSONDecodeError, AttributeError, TypeError):
-        return None
-
+# parse_shopping_list_with_gemini now lives in legacy_shopping_flow.py (called
+# via _shopping_deps below); its inventory mirror stays here.
 
 # Narrow whitelist mirror of household_router.py's identical
 # _LEAKED_QUANTITY_PREFIX_RE/_looks_like_leaked_quantity_phrase — duplicated
@@ -3515,6 +3460,54 @@ def _continue_inventory_representation_clarification(chat_id, text):
         send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
 
 
+# Legacy Shopping Flow V1 — legacy_shopping_flow.py owns shopping_mode/
+# pending_batch/pending_mark_batch/pending_delete_batch and the shopping-only
+# handlers; it has no import of bot.py, so everything it needs from here is
+# passed once via this injected dependency container.
+#
+# Every function-valued field below is a thin `lambda *a, **kw: name(*a, **kw)`
+# forward rather than a direct reference. That's deliberate, not decoration:
+# these lambdas live in bot.py's module namespace, so `name` inside each one
+# is resolved fresh against bot.py's globals on every call — exactly like a
+# plain top-level call in bot.py already worked before this extraction.
+# Passing the bare function object instead would freeze in the pre-patch
+# reference at import time, silently breaking every existing test that does
+# `patch.object(bot, "send_message"/"call_gemini"/"get_household_and_user"/...)`.
+_shopping_deps = legacy_shopping_flow.ShoppingFlowDeps(
+    send_message=lambda *a, **kw: send_message(*a, **kw),
+    get_household_and_user=lambda *a, **kw: get_household_and_user(*a, **kw),
+    get_household_alias_map=lambda *a, **kw: get_household_alias_map(*a, **kw),
+    get_active_shopping_items=lambda *a, **kw: get_active_shopping_items(*a, **kw),
+    save_list_context=lambda *a, **kw: save_list_context(*a, **kw),
+    normalize_item_quantity=lambda *a, **kw: normalize_item_quantity(*a, **kw),
+    parse_item_text=lambda *a, **kw: parse_item_text(*a, **kw),
+    call_gemini=lambda *a, **kw: call_gemini(*a, **kw),
+    ask_gemini_for_selection=lambda *a, **kw: _ask_gemini_for_selection(*a, **kw),
+    ask_gemini_preview_edit_router=lambda *a, **kw: _ask_gemini_preview_edit_router(*a, **kw),
+    validate_preview_updates=lambda *a, **kw: _validate_preview_updates(*a, **kw),
+    apply_preview_updates=lambda *a, **kw: _apply_preview_updates(*a, **kw),
+    auto_merge_in_place=lambda *a, **kw: _auto_merge_in_place(*a, **kw),
+    format_shopping_list=lambda *a, **kw: format_shopping_list(*a, **kw),
+    format_batch_preview=lambda *a, **kw: format_batch_preview(*a, **kw),
+    format_grouped_list=lambda *a, **kw: format_grouped_list(*a, **kw),
+    format_unresolved_fragments_message=lambda *a, **kw: _format_unresolved_fragments_message(*a, **kw),
+    clear_shopping_state=lambda *a, **kw: clear_shopping_state(*a, **kw),
+    clear_inventory_state=lambda *a, **kw: clear_inventory_state(*a, **kw),
+    active_list_context=active_list_context,
+    saved_list_context=saved_list_context,
+    waiting_for_ingredients=waiting_for_ingredients,
+    shopping_keyboard=SHOPPING_KEYBOARD,
+    add_preview_keyboard=ADD_PREVIEW_KEYBOARD,
+    mark_preview_keyboard=MARK_PREVIEW_KEYBOARD,
+    delete_preview_keyboard=DELETE_PREVIEW_KEYBOARD,
+    shopping_parse_prompt=SHOPPING_PARSE_PROMPT,
+    default_category=DEFAULT_CATEGORY,
+    valid_categories=VALID_CATEGORIES,
+    db_error_msg=DB_ERROR_MSG,
+    selection_error_msg=SELECTION_ERROR_MSG,
+)
+
+
 @app.route("/")
 def home():
     return "Bot is running"
@@ -4064,68 +4057,23 @@ def webhook():
         return "ok"
 
     if text == "🛒 Покупки":
-        waiting_for_ingredients.pop(chat_id, None)
-        active_list_context[chat_id] = "shopping"
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        saved_list_context[chat_id] = "shopping_saved"
-        try:
-            household_id, _ = get_household_and_user(user_id, display_name)
-            save_list_context(chat_id, household_id, "shopping_saved")
-            items = get_active_shopping_items(household_id)
-            send_message(chat_id, format_shopping_list(items), reply_markup=SHOPPING_KEYBOARD)
-        except Exception:
-            send_message(chat_id, DB_ERROR_MSG, reply_markup=SHOPPING_KEYBOARD)
+        legacy_shopping_flow.handle_open_shopping_menu(_shopping_deps, chat_id, user_id, display_name)
         return "ok"
 
     if text == "➕ Додати товар":
-        active_list_context[chat_id] = "shopping"
-        clear_shopping_state(chat_id)
-        shopping_mode[chat_id] = "adding"
-        send_message(chat_id, "Надішли один товар або список товарів. Можна кожен товар з нового рядка.")
+        legacy_shopping_flow.handle_start_shopping_add(_shopping_deps, chat_id)
         return "ok"
 
     if text == "📋 Показати список":
-        active_list_context[chat_id] = "shopping"
-        clear_shopping_state(chat_id)
-        saved_list_context[chat_id] = "shopping_saved"
-        try:
-            household_id, _ = get_household_and_user(user_id, display_name)
-            save_list_context(chat_id, household_id, "shopping_saved")
-            items = get_active_shopping_items(household_id)
-            send_message(chat_id, format_shopping_list(items))
-        except Exception:
-            send_message(chat_id, DB_ERROR_MSG)
+        legacy_shopping_flow.handle_show_shopping_list(_shopping_deps, chat_id, user_id, display_name)
         return "ok"
 
     if text == "✅ Позначити купленим":
-        active_list_context[chat_id] = "shopping"
-        clear_shopping_state(chat_id)
-        try:
-            household_id, _ = get_household_and_user(user_id, display_name)
-            items = get_active_shopping_items(household_id)
-            if not items:
-                send_message(chat_id, "Список покупок поки порожній.")
-            else:
-                send_message(chat_id, format_shopping_list(items) + "\n\nНапиши, що купив:")
-                shopping_mode[chat_id] = "marking"
-        except Exception:
-            send_message(chat_id, DB_ERROR_MSG)
+        legacy_shopping_flow.handle_start_mark_bought(_shopping_deps, chat_id, user_id, display_name)
         return "ok"
 
     if text == "🗑️ Видалити товар":
-        active_list_context[chat_id] = "shopping"
-        clear_shopping_state(chat_id)
-        try:
-            household_id, _ = get_household_and_user(user_id, display_name)
-            items = get_active_shopping_items(household_id)
-            if not items:
-                send_message(chat_id, "Список покупок поки порожній.")
-            else:
-                send_message(chat_id, format_shopping_list(items) + "\n\nНапиши, що видалити:")
-                shopping_mode[chat_id] = "deleting"
-        except Exception:
-            send_message(chat_id, DB_ERROR_MSG)
+        legacy_shopping_flow.handle_start_delete(_shopping_deps, chat_id, user_id, display_name)
         return "ok"
 
     if text == "⬅️ Головне меню":
@@ -4235,125 +4183,9 @@ def webhook():
         return "ok"
 
     # =========================
-    # SHOPPING MODE
+    # SHOPPING MODE (legacy_shopping_flow.py)
     # =========================
-    mode = shopping_mode.pop(chat_id, None)
-
-    if mode == "adding":
-        try:
-            household_id, user_db_id = get_household_and_user(user_id, display_name)
-            alias_map = get_household_alias_map(household_id)
-        except Exception:
-            shopping_mode[chat_id] = "adding"
-            send_message(chat_id, DB_ERROR_MSG)
-            return "ok"
-        result = parse_shopping_list_with_gemini(text, alias_map=alias_map)
-        if result is None:
-            shopping_mode[chat_id] = "adding"
-            send_message(
-                chat_id,
-                "Не зміг точно розібрати список. Надішли товари ще раз, бажано кожен з нового рядка."
-            )
-            return "ok"
-        items = result["items"]
-        if not items:
-            shopping_mode[chat_id] = "adding"
-            ignored = result["ignored_items"]
-            msg = "Не знайшов їстівних товарів у списку. Надішли ще раз."
-            if ignored:
-                msg += "\n\nНе додано: " + ", ".join(ignored)
-            send_message(chat_id, msg)
-            return "ok"
-        items = _auto_merge_in_place(items)
-        try:
-            pending_batch[chat_id] = {
-                "items": items,
-                "ignored_items": result["ignored_items"],
-                "household_id": household_id,
-                "user_db_id": user_db_id,
-            }
-            preview = format_batch_preview(items, result["ignored_items"])
-            send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
-        except Exception:
-            send_message(chat_id, DB_ERROR_MSG)
-        return "ok"
-
-    if mode == "editing_number":
-        batch = pending_batch.get(chat_id)
-        if not batch:
-            return "ok"
-        try:
-            num = int(text.strip())
-            if num < 1 or num > len(batch["items"]):
-                shopping_mode[chat_id] = "editing_number"
-                send_message(chat_id, f"Такого номера немає. Напиши число від 1 до {len(batch['items'])}:")
-                return "ok"
-            batch["edit_index"] = num - 1
-            shopping_mode[chat_id] = "editing_text"
-            send_message(chat_id, "Надішли нову назву або «назва — кількість»:")
-        except ValueError:
-            shopping_mode[chat_id] = "editing_number"
-            send_message(chat_id, "Напиши номер позиції (числом):")
-        return "ok"
-
-    if mode == "editing_text":
-        batch = pending_batch.get(chat_id)
-        if not batch:
-            return "ok"
-        idx = batch.pop("edit_index", None)
-        if idx is None or idx >= len(batch["items"]):
-            return "ok"
-        name, quantity_text = parse_item_text(text)
-        batch["items"][idx]["name"] = name
-        batch["items"][idx]["was_corrected"] = False
-        try:
-            alias_map = get_household_alias_map(batch["household_id"])
-        except Exception:
-            alias_map = {}
-        normalized = normalize_item_quantity(name, quantity_text or "", allow_default_unit=True, alias_map=alias_map)
-        batch["items"][idx].update(normalized)
-        preview = format_batch_preview(batch["items"], batch.get("ignored_items"))
-        send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
-        return "ok"
-
-    if mode == "marking":
-        try:
-            household_id, user_db_id = get_household_and_user(user_id, display_name)
-            items = get_active_shopping_items(household_id)
-            if not items:
-                send_message(chat_id, "Список покупок поки порожній.")
-                return "ok"
-            kind, payload = _ask_gemini_for_selection(text, items, "Список покупок", "позначити купленими")
-            if kind == "ok":
-                _show_mark_preview(chat_id, payload, household_id, user_db_id)
-            elif kind == "unresolved":
-                send_message(chat_id, _format_unresolved_fragments_message(payload))
-                shopping_mode[chat_id] = "marking"
-            else:
-                send_message(chat_id, SELECTION_ERROR_MSG)
-                shopping_mode[chat_id] = "marking"
-        except Exception:
-            send_message(chat_id, DB_ERROR_MSG)
-        return "ok"
-
-    if mode == "deleting":
-        try:
-            household_id, user_db_id = get_household_and_user(user_id, display_name)
-            items = get_active_shopping_items(household_id)
-            if not items:
-                send_message(chat_id, "Список покупок поки порожній.")
-                return "ok"
-            kind, payload = _ask_gemini_for_selection(text, items, "Список покупок", "видалити зі списку")
-            if kind == "ok":
-                _show_delete_preview(chat_id, payload, household_id, user_db_id)
-            elif kind == "unresolved":
-                send_message(chat_id, _format_unresolved_fragments_message(payload))
-                shopping_mode[chat_id] = "deleting"
-            else:
-                send_message(chat_id, SELECTION_ERROR_MSG)
-                shopping_mode[chat_id] = "deleting"
-        except Exception:
-            send_message(chat_id, DB_ERROR_MSG)
+    if legacy_shopping_flow.handle_shopping_mode_text(_shopping_deps, chat_id, user_id, display_name, text):
         return "ok"
 
     # =========================
@@ -4493,33 +4325,7 @@ def webhook():
     _preview_intercepted = False
 
     if chat_id in pending_batch:
-        batch = pending_batch[chat_id]
-        try:
-            router_result = _ask_gemini_preview_edit_router(text, batch["items"], "shopping_pending_add")
-            intent = router_result["intent"]
-            if intent == "edit_preview":
-                valid_updates = _validate_preview_updates(router_result["updates"], batch["items"])
-                if valid_updates:
-                    alias_map = get_household_alias_map(batch["household_id"])
-                    batch["items"] = _apply_preview_updates(batch["items"], valid_updates, alias_map=alias_map)
-                    preview = format_batch_preview(batch["items"], batch.get("ignored_items"))
-                    send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
-                else:
-                    send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
-                _preview_intercepted = True
-            elif intent == "merge_duplicates":
-                merged = _auto_merge_in_place(batch["items"])
-                if len(merged) < len(batch["items"]):
-                    batch["items"] = merged
-                    preview = format_batch_preview(merged, batch.get("ignored_items"))
-                    send_message(chat_id, preview, reply_markup=ADD_PREVIEW_KEYBOARD)
-                else:
-                    send_message(chat_id, "Не знайшов безпечних дублікатів для об'єднання.")
-                _preview_intercepted = True
-            # intent == "none": fall through to AI chat
-        except Exception:
-            send_message(chat_id, "Не зміг безпечно зрозуміти зміну. Спробуй написати інакше.")
-            _preview_intercepted = True
+        _preview_intercepted = legacy_shopping_flow.handle_pending_batch_edit_text(_shopping_deps, chat_id, text)
 
     elif chat_id in pending_inventory_batch:
         batch = pending_inventory_batch[chat_id]
@@ -4870,9 +4676,9 @@ def webhook():
                                 saved_list_context.pop(chat_id, None)
                                 action = router_result.get("action")
                                 if action == "mark_bought":
-                                    _show_mark_preview(chat_id, selected, household_id, user_db_id)
+                                    legacy_shopping_flow._show_mark_preview(_shopping_deps, chat_id, selected, household_id, user_db_id)
                                 elif action == "delete_shopping":
-                                    _show_delete_preview(chat_id, selected, household_id, user_db_id)
+                                    legacy_shopping_flow._show_delete_preview(_shopping_deps, chat_id, selected, household_id, user_db_id)
                                 elif action == "remove_inventory":
                                     _show_remove_preview(chat_id, selected, household_id, user_db_id)
                             else:
