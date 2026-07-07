@@ -3898,97 +3898,16 @@ def _try_handle_cooking_mode(chat_id, user_id, display_name, text):
     return True
 
 
-# Dispatcher V2B — message_dispatcher.py owns the ordered priority of the
-# eleven remaining command/context routes (old Phase C routes 16-26); every
-# callback is a lambda-forward to one of the thin wrapper functions above,
-# same patch.object(bot, ...) reasoning as every other callback container.
-_command_route_deps = message_dispatcher.CommandRouteDeps(
-    ambiguous_add_route=lambda *a, **kw: _route_ambiguous_add(*a, **kw),
-    explicit_global_add=lambda *a, **kw: _route_global_explicit_add(*a, **kw),
-    bare_global_add=lambda *a, **kw: _route_global_bare_add(*a, **kw),
-    global_household_router=lambda *a, **kw: _route_global_household(*a, **kw),
-    expense_report_route=lambda *a, **kw: _route_expense_report(*a, **kw),
-    expense_delete_command_route=lambda *a, **kw: _route_expense_delete_command(*a, **kw),
-    active_aliases_context=lambda *a, **kw: _route_active_aliases_context(*a, **kw),
-    global_alias_command=lambda *a, **kw: _route_global_alias_command(*a, **kw),
-    active_expenses_context=lambda *a, **kw: _route_active_expenses_context(*a, **kw),
-    global_expense_command=lambda *a, **kw: _route_global_expense_command(*a, **kw),
-    saved_list_router=lambda *a, **kw: _route_saved_list_router(*a, **kw),
-    general_ai_fallback=lambda *a, **kw: _run_general_ai_fallback(*a, **kw),
-)
-
-# Message Dispatcher V1/V2A/V2B/V3A — message_dispatcher.py owns the
-# ordered navigation/special-button/menu/mode-text dispatch slice (old
-# Phase A2/A3/B plus special buttons) plus the pending-route slice (Phase C
-# routes 6-15) plus the command/context-route slice (Phase C routes 16-26)
-# plus Phase D (cooking mode, then general AI fallback); it has no import
-# of bot.py, so everything it needs is passed once via this injected
-# dependency container, which simply nests the already-built _shopping_
-# deps/_inventory_deps/_pending_route_deps/_command_route_deps instead of
-# re-declaring their fields. Same lambda-forward reasoning as those
-# containers — patch.object(bot, "send_message"/"clear_interaction_state"/
-# "_try_handle_special_button"/"_try_handle_cooking_mode") keeps working
-# through here too.
-_dispatcher_deps = message_dispatcher.DispatcherDeps(
-    send_message=lambda *a, **kw: send_message(*a, **kw),
-    clear_interaction_state=lambda *a, **kw: clear_interaction_state(*a, **kw),
-    main_keyboard=MAIN_KEYBOARD,
-    help_text=(
-        "ℹ️ Як користуватися ботом:\n\n"
-        "🛒 Покупки — спільний список покупок\n"
-        "🧊 Запаси — що є вдома\n"
-        "🍽️ Що приготувати — ідеї страв на основі запасів\n"
-        "ℹ️ Допомога — ця інструкція\n\n"
-        "Будь-яке звичайне повідомлення надсилається AI і ти отримаєш відповідь."
-    ),
-    shopping_deps=_shopping_deps,
-    inventory_deps=_inventory_deps,
-    pending_routes=_pending_route_deps,
-    command_routes=_command_route_deps,
-    special_button=lambda *a, **kw: _try_handle_special_button(*a, **kw),
-    cooking_mode=lambda *a, **kw: _try_handle_cooking_mode(*a, **kw),
-)
-
-
-@app.route("/")
-def home():
-    return "Bot is running"
-
-@app.route(f"/webhook/{TOKEN}", methods=["POST"])
-def webhook():
-    data = request.get_json()
-
-    if _is_duplicate_update(data.get("update_id")):
-        return "ok"
-
-    message = data.get("message")
-    if not message:
-        return "ok"
-
-    chat_id = message["chat"]["id"]
-    text = message.get("text", "")
-
-    if not text:
-        return "ok"
-
-    user_id = message.get("from", {}).get("id")
-    display_name = message.get("from", {}).get("first_name")
-
-    if text == "/myid":
-        send_message(chat_id, f"Твій Telegram ID: {user_id}")
-        return "ok"
-
-    # =========================
-    # ACCESS CHECK
-    # =========================
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        send_message(chat_id, "Цей бот приватний і доступний лише для дозволених користувачів.")
-        return "ok"
-
-    # =========================
-    # BUTTON HANDLERS
-    # =========================
-
+def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
+    """Dispatcher V3B confirm/cancel route — encapsulates all 20 exact
+    confirm/cancel button texts 1:1 with their old inline webhook() bodies
+    (same DB calls, same StaleSnapshotError handling, same messages, same
+    pop()/clear_*() order, same behavior for a stale button with no active
+    pending state). Returns True the moment `text` matches one of the 20
+    exact texts — even when the matching branch finds no pending state and
+    only sends a "nothing to confirm" message, exactly like the old inline
+    `return "ok"` did regardless of whether anything actually changed.
+    Returns False for any other text."""
     if text == "✅ Об'єднати":
         if chat_id in pending_merge:
             merge_data = pending_merge.pop(chat_id)
@@ -4025,7 +3944,7 @@ def webhook():
                     send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=INVENTORY_KEYBOARD)
                 except Exception:
                     send_message(chat_id, "Не вдалося виконати об'єднання. Спробуйте ще раз.", reply_markup=INVENTORY_KEYBOARD)
-        return "ok"
+        return True
 
     if text == "✅ Додати все":
         if chat_id in pending_inventory_batch:
@@ -4053,7 +3972,7 @@ def webhook():
                 send_message(chat_id, f"✅ Додано товарів: {count}", reply_markup=SHOPPING_KEYBOARD)
             except Exception:
                 send_message(chat_id, DB_ERROR_MSG)
-        return "ok"
+        return True
 
     if text == "✏️ Надіслати інший список":
         if chat_id in pending_inventory_batch:
@@ -4064,7 +3983,7 @@ def webhook():
             pending_batch.pop(chat_id, None)
             shopping_mode[chat_id] = "adding"
             send_message(chat_id, "Надішли один товар або список товарів. Можна кожен товар з нового рядка.")
-        return "ok"
+        return True
 
     if text == "❌ Скасувати":
         if chat_id in pending_merge:
@@ -4147,14 +4066,14 @@ def webhook():
         else:
             clear_shopping_state(chat_id)
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
-        return "ok"
+        return True
 
     if text == "✏️ Виправити позицію":
         if chat_id in pending_batch:
             n = len(pending_batch[chat_id]["items"])
             shopping_mode[chat_id] = "editing_number"
             send_message(chat_id, f"Напиши номер позиції для виправлення (1–{n}):")
-        return "ok"
+        return True
 
     if text == "✅ Куплено + додати в запаси":
         if chat_id in pending_mark_batch:
@@ -4180,7 +4099,7 @@ def webhook():
                 send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=SHOPPING_KEYBOARD)
             except Exception:
                 send_message(chat_id, "Не вдалося завершити покупку. Спробуйте ще раз трохи пізніше.")
-        return "ok"
+        return True
 
     if text == "✅ Куплено, без запасів":
         if chat_id in pending_mark_batch:
@@ -4194,7 +4113,7 @@ def webhook():
                 send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=SHOPPING_KEYBOARD)
             except Exception:
                 send_message(chat_id, "Не вдалося завершити покупку. Спробуйте ще раз трохи пізніше.")
-        return "ok"
+        return True
 
     if text == "✅ Так, видалити":
         if chat_id in pending_delete_batch:
@@ -4236,7 +4155,7 @@ def webhook():
             expenses.handle_delete_confirm(chat_id)
         else:
             send_message(chat_id, "Немає активної дії для підтвердження.")
-        return "ok"
+        return True
 
     if text == "✅ Так, запам'ятати":
         if chat_id in pending_alias_action:
@@ -4252,7 +4171,7 @@ def webhook():
                 send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
         else:
             send_message(chat_id, "Немає активної дії для підтвердження.")
-        return "ok"
+        return True
 
     if text == "✅ Так, змінити":
         if chat_id in pending_alias_action:
@@ -4268,19 +4187,19 @@ def webhook():
                 send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
         else:
             send_message(chat_id, "Немає активної дії для підтвердження.")
-        return "ok"
+        return True
 
     if text == "✅ Так, додати":
         expenses.handle_add_confirm(chat_id)
-        return "ok"
+        return True
 
     if text == "✅ Так, застосувати":
         _apply_global_household_confirm(chat_id)
-        return "ok"
+        return True
 
     if text == "✅ Так, скасувати":
         _apply_undo_confirm(chat_id)
-        return "ok"
+        return True
 
     if text == "✅ Так, прибрати":
         if chat_id in pending_remove_batch:
@@ -4294,7 +4213,7 @@ def webhook():
                 send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=INVENTORY_KEYBOARD)
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
-        return "ok"
+        return True
 
     if text == "✅ Додати до запасів":
         if chat_id in pending_quick_purchase:
@@ -4308,14 +4227,14 @@ def webhook():
                 send_message(chat_id, f"✅ Додано до запасів: {count}", reply_markup=SHOPPING_KEYBOARD)
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
-        return "ok"
+        return True
 
     if text == "✏️ Змінити список":
         if chat_id in pending_quick_purchase:
             pending_quick_purchase.pop(chat_id, None)
             saved_list_context[chat_id] = "shopping_saved"
             send_message(chat_id, "Напиши, які товари ти купив:")
-        return "ok"
+        return True
 
     if text == "✅ Підтвердити зміни":
         if chat_id in pending_saved_edit:
@@ -4356,7 +4275,7 @@ def webhook():
                 send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=INVENTORY_KEYBOARD)
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
-        return "ok"
+        return True
 
     if text == "✅ Підтвердити всі зміни":
         if chat_id in pending_compound_inventory:
@@ -4397,7 +4316,7 @@ def webhook():
                 send_message(chat_id, "Список змінився з іншого пристрою. Онови запаси й повтори дію.", reply_markup=INVENTORY_KEYBOARD)
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
-        return "ok"
+        return True
 
     if text == "✅ Підтвердити звіряння":
         if chat_id in pending_inventory_reconciliation:
@@ -4429,7 +4348,7 @@ def webhook():
                 )
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
-        return "ok"
+        return True
 
     if text == "✏️ Змінити вибір":
         if chat_id in pending_mark_batch:
@@ -4465,22 +4384,117 @@ def webhook():
                     send_message(chat_id, format_inventory_list(items) + "\n\nНапиши, що прибрати із запасів:")
             except Exception:
                 send_message(chat_id, INVENTORY_ERROR_MSG)
+        return True
+
+    return False
+
+
+# Dispatcher V2B — message_dispatcher.py owns the ordered priority of the
+# eleven remaining command/context routes (old Phase C routes 16-26); every
+# callback is a lambda-forward to one of the thin wrapper functions above,
+# same patch.object(bot, ...) reasoning as every other callback container.
+_command_route_deps = message_dispatcher.CommandRouteDeps(
+    ambiguous_add_route=lambda *a, **kw: _route_ambiguous_add(*a, **kw),
+    explicit_global_add=lambda *a, **kw: _route_global_explicit_add(*a, **kw),
+    bare_global_add=lambda *a, **kw: _route_global_bare_add(*a, **kw),
+    global_household_router=lambda *a, **kw: _route_global_household(*a, **kw),
+    expense_report_route=lambda *a, **kw: _route_expense_report(*a, **kw),
+    expense_delete_command_route=lambda *a, **kw: _route_expense_delete_command(*a, **kw),
+    active_aliases_context=lambda *a, **kw: _route_active_aliases_context(*a, **kw),
+    global_alias_command=lambda *a, **kw: _route_global_alias_command(*a, **kw),
+    active_expenses_context=lambda *a, **kw: _route_active_expenses_context(*a, **kw),
+    global_expense_command=lambda *a, **kw: _route_global_expense_command(*a, **kw),
+    saved_list_router=lambda *a, **kw: _route_saved_list_router(*a, **kw),
+    general_ai_fallback=lambda *a, **kw: _run_general_ai_fallback(*a, **kw),
+)
+
+# Message Dispatcher V1/V2A/V2B/V3A/V3B — message_dispatcher.py owns the
+# confirm/cancel route (highest priority) plus the ordered navigation/
+# special-button/menu/mode-text dispatch slice (old Phase A2/A3/B plus
+# special buttons) plus the pending-route slice (Phase C routes 6-15) plus
+# the command/context-route slice (Phase C routes 16-26) plus Phase D
+# (cooking mode, then general AI fallback); it has no import of bot.py, so
+# everything it needs is passed once via this injected dependency
+# container, which simply nests the already-built _shopping_deps/
+# _inventory_deps/_pending_route_deps/_command_route_deps instead of
+# re-declaring their fields. Same lambda-forward reasoning as those
+# containers — patch.object(bot, "send_message"/"clear_interaction_state"/
+# "_try_handle_special_button"/"_try_handle_cooking_mode"/
+# "_try_handle_confirm_or_cancel") keeps working through here too.
+_dispatcher_deps = message_dispatcher.DispatcherDeps(
+    send_message=lambda *a, **kw: send_message(*a, **kw),
+    clear_interaction_state=lambda *a, **kw: clear_interaction_state(*a, **kw),
+    main_keyboard=MAIN_KEYBOARD,
+    help_text=(
+        "ℹ️ Як користуватися ботом:\n\n"
+        "🛒 Покупки — спільний список покупок\n"
+        "🧊 Запаси — що є вдома\n"
+        "🍽️ Що приготувати — ідеї страв на основі запасів\n"
+        "ℹ️ Допомога — ця інструкція\n\n"
+        "Будь-яке звичайне повідомлення надсилається AI і ти отримаєш відповідь."
+    ),
+    shopping_deps=_shopping_deps,
+    inventory_deps=_inventory_deps,
+    pending_routes=_pending_route_deps,
+    command_routes=_command_route_deps,
+    special_button=lambda *a, **kw: _try_handle_special_button(*a, **kw),
+    cooking_mode=lambda *a, **kw: _try_handle_cooking_mode(*a, **kw),
+    confirm_or_cancel=lambda *a, **kw: _try_handle_confirm_or_cancel(*a, **kw),
+)
+
+
+@app.route("/")
+def home():
+    return "Bot is running"
+
+@app.route(f"/webhook/{TOKEN}", methods=["POST"])
+def webhook():
+    data = request.get_json()
+
+    if _is_duplicate_update(data.get("update_id")):
+        return "ok"
+
+    message = data.get("message")
+    if not message:
+        return "ok"
+
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "")
+
+    if not text:
+        return "ok"
+
+    user_id = message.get("from", {}).get("id")
+    display_name = message.get("from", {}).get("first_name")
+
+    if text == "/myid":
+        send_message(chat_id, f"Твій Telegram ID: {user_id}")
         return "ok"
 
     # =========================
-    # MESSAGE DISPATCHER V1/V2A/V2B/V3A (message_dispatcher.py)
-    # Navigation, special buttons (aliases/expenses/cooking-mode/help menu
-    # entries), shopping/inventory menu buttons, shopping_mode/inventory_
-    # mode text dispatch, the ten pending/clarification/undo routes, the
-    # eleven command/context routes (ambiguous/explicit/bare add, Global
-    # Household Router, expense reports, expense-delete command, aliases/
-    # expenses context, global alias/expense command, saved-list router),
-    # then Phase D (cooking mode, then general AI fallback) — exact same
-    # priority order and behavior as the old inline branches this replaces.
-    # dispatch() now owns Phase D itself (see message_dispatcher.
-    # RouteOutcome's docstring): DIRECT_GENERAL_AI_FALLBACK skips cooking
-    # mode entirely, CONTINUE tries cooking mode first, then the fallback —
-    # either way general AI fallback runs at most once, and webhook() no
+    # ACCESS CHECK
+    # =========================
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        send_message(chat_id, "Цей бот приватний і доступний лише для дозволених користувачів.")
+        return "ok"
+
+    # =========================
+    # MESSAGE DISPATCHER V1/V2A/V2B/V3A/V3B (message_dispatcher.py)
+    # Confirm/cancel (all 20 exact button texts), navigation, special
+    # buttons (aliases/expenses/cooking-mode/help menu entries), shopping/
+    # inventory menu buttons, shopping_mode/inventory_mode text dispatch,
+    # the ten pending/clarification/undo routes, the eleven command/context
+    # routes (ambiguous/explicit/bare add, Global Household Router, expense
+    # reports, expense-delete command, aliases/expenses context, global
+    # alias/expense command, saved-list router), then Phase D (cooking
+    # mode, then general AI fallback) — exact same priority order and
+    # behavior as the old inline branches this replaces. Confirm/cancel is
+    # now the dispatcher's own top-priority route (see message_dispatcher.
+    # RouteOutcome's docstring): if it matches, nothing else below it ever
+    # runs for that message. dispatch() owns Phase D itself too:
+    # DIRECT_GENERAL_AI_FALLBACK skips cooking mode entirely, CONTINUE
+    # tries cooking mode first, then the fallback — either way general AI
+    # fallback runs at most once, and webhook() no
     # longer needs to branch on the outcome at all.
     # =========================
     message_dispatcher.dispatch(_dispatcher_deps, chat_id, user_id, display_name, text)

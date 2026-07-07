@@ -1,4 +1,4 @@
-"""Message Dispatcher V1/V2A/V2B/V3A.
+"""Message Dispatcher V1/V2A/V2B/V3A/V3B.
 
 The explicit, ordered routing layer for incoming Telegram text. Owns
 NOTHING new — it only formalizes the priority order bot.py's webhook()
@@ -25,6 +25,14 @@ V3A: the five exact special buttons (aliases intro, alias list, expenses
     V3A, bot.py's webhook() branched on `dispatch()`'s return value to run
     Phase D itself; now `dispatch()` runs it internally and webhook() just
     calls dispatch() once and returns "ok".
+V3B: the highest-priority route of all — the shared confirm/cancel button
+    block (all 20 exact texts: merge/add-all/mark-bought/delete/undo/alias/
+    expense/reconciliation confirm-or-cancel buttons). Checked before
+    everything else in `_resolve_route_outcome`, exactly where it used to
+    sit as webhook()'s BUTTON HANDLERS section, above navigation. After
+    V3B, webhook() contains no application routing at all — only update
+    parsing, deduplication, `/myid`, the access check, and the single
+    `dispatch(...)` call.
 
 Route contract: `dispatch(...)` returns a `RouteOutcome` — kept for the
 pre-V3A test suite and for `_resolve_route_outcome`'s own internal
@@ -44,12 +52,12 @@ No pending state, no keyboards, no Gemini prompts live here; everything it
 needs from the outside world is passed in via a `DispatcherDeps` container
 built and owned by bot.py.
 
-Deliberately NOT here (still bot.py-owned, unchanged): the shared confirm/
-cancel button block (still above the dispatcher call in webhook()),
-confirm handlers that write to the DB, the special buttons'/cooking
-mode's/general AI fallback's own business logic (only called through here
-as injected callbacks), interaction_state.py's own facade scope, and every
-state dict's ownership.
+Deliberately NOT here (still bot.py-owned, unchanged): every confirm/
+cancel/special-button/cooking-mode/general-AI-fallback business-logic
+implementation — all DB writes, StaleSnapshotError handling, messages,
+state pop()/clear() order — only ever called through here as thin injected
+callbacks; interaction_state.py's own facade scope; and every state dict's
+ownership.
 
 No import of bot.py, database.py, Flask, Telegram, psycopg or any Gemini
 SDK — legacy_shopping_flow.py/legacy_inventory_flow.py/action_history.py are
@@ -160,16 +168,30 @@ class DispatcherDeps:
     help_text: str
     shopping_deps: legacy_shopping_flow.ShoppingFlowDeps
     inventory_deps: legacy_inventory_flow.InventoryFlowDeps
-    # Optional so DispatcherDeps built before Dispatcher V2A/V2B/V3A existed
-    # (fake test deps that only exercise a subset of the routing chain)
-    # keep working unchanged — see the None-guards in _dispatch_pending_
-    # routes/_dispatch_command_routes/_dispatch_special_buttons and in
-    # dispatch() itself (cooking_mode is None -> Phase D stays bot.py-owned,
-    # exactly like before V3A).
+    # Optional so DispatcherDeps built before Dispatcher V2A/V2B/V3A/V3B
+    # existed (fake test deps that only exercise a subset of the routing
+    # chain) keep working unchanged — see the None-guards in _dispatch_
+    # pending_routes/_dispatch_command_routes/_dispatch_special_buttons/
+    # _dispatch_confirm_or_cancel and in dispatch() itself (cooking_mode is
+    # None -> Phase D stays bot.py-owned, exactly like before V3A).
     pending_routes: PendingRouteDeps = None
     command_routes: CommandRouteDeps = None
     special_button: Callable = None
     cooking_mode: Callable = None
+    confirm_or_cancel: Callable = None
+
+
+def _dispatch_confirm_or_cancel(deps, chat_id, user_id, display_name, text):
+    """Dispatcher V3B confirm/cancel route — one thin callback covering all
+    20 exact confirm/cancel button texts. Checked FIRST, ahead of
+    navigation, special buttons, menu buttons, mode dispatch, pending
+    routes and command routes: an exact confirm/cancel text always wins,
+    regardless of any other active state, exactly like the old inline
+    button block that used to open webhook()'s BUTTON HANDLERS section
+    before anything else ever ran."""
+    if deps.confirm_or_cancel is None:
+        return False
+    return deps.confirm_or_cancel(chat_id, user_id, display_name, text)
 
 
 def _dispatch_navigation(deps, chat_id, text):
@@ -415,17 +437,24 @@ def _resolve_route_outcome(deps, chat_id, user_id, display_name, text):
     Phase D itself (cooking mode / general AI fallback). `dispatch()`
     (below) is the public entrypoint that completes Phase D exactly once
     based on this result. Exact internal order — mirrors old Phase A2/A3/
-    B/C(6-26) plus V3A's special buttons: navigation, special buttons,
-    shopping menu, inventory menu, shopping_mode text, inventory_mode text,
-    the ten pending/clarification/undo routes, then the eleven command/
-    context routes. Navigation is checked first so /start, /menu, /help and
-    "⬅️ Головне меню" always work even while a shopping_mode/inventory_mode
-    or any pending state is active; special buttons are checked right after
+    B/C(6-26) plus V3A's special buttons plus V3B's confirm/cancel:
+    confirm/cancel, navigation, special buttons, shopping menu, inventory
+    menu, shopping_mode text, inventory_mode text, the ten pending/
+    clarification/undo routes, then the eleven command/context routes.
+    Confirm/cancel is checked FIRST — an exact confirm/cancel text always
+    wins over everything else in this chain, same as the old inline BUTTON
+    HANDLERS section that used to open webhook() before anything else ever
+    ran. Navigation is checked next so /start, /menu, /help and "⬅️ Головне
+    меню" always work even while a shopping_mode/inventory_mode or any
+    pending state is active; special buttons are checked right after
     navigation so they always win over an active shopping_mode/inventory_
     mode too. If shopping_mode and inventory_mode were ever both active for
     the same chat_id, shopping_mode wins — same as before this module
     existed.
     """
+    if _dispatch_confirm_or_cancel(deps, chat_id, user_id, display_name, text):
+        return RouteOutcome.HANDLED
+
     if _dispatch_navigation(deps, chat_id, text):
         return RouteOutcome.HANDLED
 

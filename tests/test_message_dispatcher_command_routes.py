@@ -527,14 +527,19 @@ class TestWebhookIntegration(unittest.TestCase):
         bot.pending_global_household.clear()
         bot.waiting_for_ingredients.clear()
 
-    def test_confirm_cancel_button_never_reaches_dispatch(self):
+    def test_confirm_cancel_button_reaches_dispatch_exactly_once(self):
+        # As of Dispatcher V3B, confirm/cancel is routed THROUGH dispatch()
+        # (its own top-priority route) rather than being intercepted by an
+        # inline webhook() branch before dispatch() is ever called — see
+        # test_message_dispatcher_confirm_cancel.py for the dedicated V3B
+        # contract tests.
         chat_id = 9301
         bot.pending_merge[chat_id] = {
             "groups": [], "household_id": 1, "user_db_id": 10, "list_type": "shopping_saved",
         }
         with patch.object(message_dispatcher, "dispatch") as mock_dispatch:
             _call_webhook(_make_update(chat_id, "✅ Об'єднати"))
-            mock_dispatch.assert_not_called()
+            mock_dispatch.assert_called_once_with(bot._dispatcher_deps, chat_id, 555, "Тест", "✅ Об'єднати")
 
     def test_special_button_above_dispatcher_never_reaches_command_routes(self):
         chat_id = 9302

@@ -477,14 +477,19 @@ class TestWebhookIntegration(unittest.TestCase):
         self.mock_send.assert_called_once_with(chat_id, bot.GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
         self.mock_gemini.assert_not_called()
 
-    def test_confirm_cancel_button_never_reaches_dispatch(self):
+    def test_confirm_cancel_button_reaches_dispatch_exactly_once(self):
+        # As of Dispatcher V3B, confirm/cancel is routed THROUGH dispatch()
+        # (its own top-priority route) rather than being intercepted by an
+        # inline webhook() branch before dispatch() is ever called — see
+        # test_message_dispatcher_confirm_cancel.py for the dedicated V3B
+        # contract tests.
         chat_id = 9202
         bot.pending_merge[chat_id] = {
             "groups": [], "household_id": 1, "user_db_id": 10, "list_type": "shopping_saved",
         }
         with patch.object(message_dispatcher, "dispatch") as mock_dispatch:
             _call_webhook(_make_update(chat_id, "✅ Об'єднати"))
-            mock_dispatch.assert_not_called()
+            mock_dispatch.assert_called_once_with(bot._dispatcher_deps, chat_id, 555, "Тест", "✅ Об'єднати")
 
     def test_undo_command_reaches_dispatch_and_starts_undo_flow(self):
         chat_id = 9203
