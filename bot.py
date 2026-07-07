@@ -3823,6 +3823,81 @@ def _run_general_ai_fallback(chat_id, text):
     send_message(chat_id, answer)
 
 
+def _try_handle_special_button(chat_id, user_id, display_name, text):
+    """Dispatcher V3A special-button route — encapsulates the five exact
+    menu-entry buttons (aliases intro, alias list, expenses intro,
+    cooking-mode start, help) 1:1 with their old inline webhook() bodies.
+    Returns True if `text` matched one of them (state already cleared/
+    updated, message already sent), False otherwise."""
+    if text == "🧠 Назви товарів":
+        waiting_for_ingredients.pop(chat_id, None)
+        active_list_context[chat_id] = "aliases"
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        clear_alias_state(chat_id)
+        send_message(chat_id, ALIAS_INTRO_TEXT, reply_markup=ALIASES_KEYBOARD)
+        return True
+
+    if text == "📋 Показати назви":
+        active_list_context[chat_id] = "aliases"
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        try:
+            household_id, _ = get_household_and_user(user_id, display_name)
+            send_message(chat_id, format_alias_list(list_household_aliases(household_id)), reply_markup=ALIASES_KEYBOARD)
+        except Exception:
+            send_message(chat_id, "Не вдалося показати домашні назви. Спробуй ще раз трохи пізніше.", reply_markup=ALIASES_KEYBOARD)
+        return True
+
+    if text == "💸 Витрати":
+        waiting_for_ingredients.pop(chat_id, None)
+        active_list_context[chat_id] = "expenses"
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        clear_expense_state(chat_id)
+        send_message(chat_id, EXPENSES_INTRO_TEXT, reply_markup=EXPENSES_KEYBOARD)
+        return True
+
+    if text == "🍽️ Що приготувати":
+        active_list_context.pop(chat_id, None)
+        clear_shopping_state(chat_id)
+        waiting_for_ingredients[chat_id] = True
+        send_message(chat_id, "Напиши, які продукти зараз є вдома, і я запропоную кілька страв.")
+        return True
+
+    if text == "ℹ️ Допомога":
+        send_message(
+            chat_id,
+            "ℹ️ Як користуватися ботом:\n\n"
+            "🛒 Покупки — спільний список покупок\n"
+            "🧊 Запаси — що є вдома\n"
+            "🍽️ Що приготувати — ідеї страв на основі запасів\n"
+            "ℹ️ Допомога — ця інструкція\n\n"
+            "Будь-яке звичайне повідомлення надсилається AI і ти отримаєш відповідь."
+        )
+        return True
+
+    return False
+
+
+def _try_handle_cooking_mode(chat_id, user_id, display_name, text):
+    """Dispatcher V3A cooking-mode route — encapsulates the old inline
+    COOKING MODE webhook() branch 1:1. Returns True if cooking mode was
+    active for this chat_id (already popped here) and handled the message,
+    False otherwise (so dispatch() then falls through to the general AI
+    fallback exactly once)."""
+    if not waiting_for_ingredients.pop(chat_id, False):
+        return False
+    cooking_history = [{"role": "user", "content": text}]
+    answer = call_gemini(cooking_history, COOKING_SYSTEM_PROMPT, temperature=0.4, model_url=GEMINI_COOKING_URL)
+    if answer is None:
+        answer = call_gemini(cooking_history, COOKING_SYSTEM_PROMPT, temperature=0.4, model_url=GEMINI_CHAT_URL)
+    if answer is None:
+        answer = "AI-помічник тимчасово недоступний. Спробуйте ще раз трохи пізніше."
+    send_message(chat_id, answer)
+    return True
+
+
 # Dispatcher V2B — message_dispatcher.py owns the ordered priority of the
 # eleven remaining command/context routes (old Phase C routes 16-26); every
 # callback is a lambda-forward to one of the thin wrapper functions above,
@@ -3842,16 +3917,18 @@ _command_route_deps = message_dispatcher.CommandRouteDeps(
     general_ai_fallback=lambda *a, **kw: _run_general_ai_fallback(*a, **kw),
 )
 
-# Message Dispatcher V1/V2A/V2B — message_dispatcher.py owns the ordered
-# navigation/menu/mode-text dispatch slice (old Phase A2/A3/B) plus the
-# pending-route slice (Phase C routes 6-15) plus the command/context-route
-# slice above (Phase C routes 16-26); it has no import of bot.py, so
-# everything it needs is passed once via this injected dependency
-# container, which simply nests the already-built _shopping_deps/
-# _inventory_deps/_pending_route_deps/_command_route_deps instead of
+# Message Dispatcher V1/V2A/V2B/V3A — message_dispatcher.py owns the
+# ordered navigation/special-button/menu/mode-text dispatch slice (old
+# Phase A2/A3/B plus special buttons) plus the pending-route slice (Phase C
+# routes 6-15) plus the command/context-route slice (Phase C routes 16-26)
+# plus Phase D (cooking mode, then general AI fallback); it has no import
+# of bot.py, so everything it needs is passed once via this injected
+# dependency container, which simply nests the already-built _shopping_
+# deps/_inventory_deps/_pending_route_deps/_command_route_deps instead of
 # re-declaring their fields. Same lambda-forward reasoning as those
-# containers — patch.object(bot, "send_message"/"clear_interaction_state")
-# keeps working through here too.
+# containers — patch.object(bot, "send_message"/"clear_interaction_state"/
+# "_try_handle_special_button"/"_try_handle_cooking_mode") keeps working
+# through here too.
 _dispatcher_deps = message_dispatcher.DispatcherDeps(
     send_message=lambda *a, **kw: send_message(*a, **kw),
     clear_interaction_state=lambda *a, **kw: clear_interaction_state(*a, **kw),
@@ -3868,6 +3945,8 @@ _dispatcher_deps = message_dispatcher.DispatcherDeps(
     inventory_deps=_inventory_deps,
     pending_routes=_pending_route_deps,
     command_routes=_command_route_deps,
+    special_button=lambda *a, **kw: _try_handle_special_button(*a, **kw),
+    cooking_mode=lambda *a, **kw: _try_handle_cooking_mode(*a, **kw),
 )
 
 
@@ -4389,107 +4468,22 @@ def webhook():
         return "ok"
 
     # =========================
-    # NAVIGATION / MENU BUTTONS still owned by bot.py — aliases/expenses/
-    # cooking-mode/help buttons are NOT part of Dispatcher V1's scope (see
-    # message_dispatcher.py's docstring). /start, /menu, /help, "⬅️ Головне
-    # меню" and every shopping/inventory menu button now live in
-    # message_dispatcher.py (called once, below, after these five) — moving
-    # them there doesn't change observable behavior since every branch here
-    # is an exact, mutually-exclusive text match: only their position
-    # relative to the mode-text dispatch (which consumes ANY free text)
-    # actually matters, and that invariant — every literal button check
-    # before mode-text dispatch — is preserved exactly.
+    # MESSAGE DISPATCHER V1/V2A/V2B/V3A (message_dispatcher.py)
+    # Navigation, special buttons (aliases/expenses/cooking-mode/help menu
+    # entries), shopping/inventory menu buttons, shopping_mode/inventory_
+    # mode text dispatch, the ten pending/clarification/undo routes, the
+    # eleven command/context routes (ambiguous/explicit/bare add, Global
+    # Household Router, expense reports, expense-delete command, aliases/
+    # expenses context, global alias/expense command, saved-list router),
+    # then Phase D (cooking mode, then general AI fallback) — exact same
+    # priority order and behavior as the old inline branches this replaces.
+    # dispatch() now owns Phase D itself (see message_dispatcher.
+    # RouteOutcome's docstring): DIRECT_GENERAL_AI_FALLBACK skips cooking
+    # mode entirely, CONTINUE tries cooking mode first, then the fallback —
+    # either way general AI fallback runs at most once, and webhook() no
+    # longer needs to branch on the outcome at all.
     # =========================
-
-    if text == "🧠 Назви товарів":
-        waiting_for_ingredients.pop(chat_id, None)
-        active_list_context[chat_id] = "aliases"
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        clear_alias_state(chat_id)
-        send_message(chat_id, ALIAS_INTRO_TEXT, reply_markup=ALIASES_KEYBOARD)
-        return "ok"
-
-    if text == "📋 Показати назви":
-        active_list_context[chat_id] = "aliases"
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        try:
-            household_id, _ = get_household_and_user(user_id, display_name)
-            send_message(chat_id, format_alias_list(list_household_aliases(household_id)), reply_markup=ALIASES_KEYBOARD)
-        except Exception:
-            send_message(chat_id, "Не вдалося показати домашні назви. Спробуй ще раз трохи пізніше.", reply_markup=ALIASES_KEYBOARD)
-        return "ok"
-
-    if text == "💸 Витрати":
-        waiting_for_ingredients.pop(chat_id, None)
-        active_list_context[chat_id] = "expenses"
-        clear_shopping_state(chat_id)
-        clear_inventory_state(chat_id)
-        clear_expense_state(chat_id)
-        send_message(chat_id, EXPENSES_INTRO_TEXT, reply_markup=EXPENSES_KEYBOARD)
-        return "ok"
-
-    if text == "🍽️ Що приготувати":
-        active_list_context.pop(chat_id, None)
-        clear_shopping_state(chat_id)
-        waiting_for_ingredients[chat_id] = True
-        send_message(chat_id, "Напиши, які продукти зараз є вдома, і я запропоную кілька страв.")
-        return "ok"
-
-    if text == "ℹ️ Допомога":
-        send_message(
-            chat_id,
-            "ℹ️ Як користуватися ботом:\n\n"
-            "🛒 Покупки — спільний список покупок\n"
-            "🧊 Запаси — що є вдома\n"
-            "🍽️ Що приготувати — ідеї страв на основі запасів\n"
-            "ℹ️ Допомога — ця інструкція\n\n"
-            "Будь-яке звичайне повідомлення надсилається AI і ти отримаєш відповідь."
-        )
-        return "ok"
-
-    # =========================
-    # MESSAGE DISPATCHER V1/V2A/V2B (message_dispatcher.py)
-    # Navigation, shopping/inventory menu buttons, shopping_mode/inventory_
-    # mode text dispatch, the ten pending/clarification/undo routes, then
-    # the eleven remaining command/context routes (ambiguous/explicit/bare
-    # add, Global Household Router, expense reports, expense-delete
-    # command, aliases/expenses context, global alias/expense command,
-    # saved-list router) — exact same priority order as the old inline
-    # Phase A2/A3/B/C(6-26) branches this replaces. Returns a RouteOutcome,
-    # not a bool — see message_dispatcher.RouteOutcome's docstring for why
-    # DIRECT_GENERAL_AI_FALLBACK exists (pending_batch/pending_inventory_
-    # batch matching with Gemini intent "none" must skip every remaining
-    # route below AND cooking mode, landing directly on general AI-chat).
-    # =========================
-    _route_outcome = message_dispatcher.dispatch(_dispatcher_deps, chat_id, user_id, display_name, text)
-
-    if _route_outcome == message_dispatcher.RouteOutcome.HANDLED:
-        return "ok"
-
-    if _route_outcome == message_dispatcher.RouteOutcome.DIRECT_GENERAL_AI_FALLBACK:
-        _run_general_ai_fallback(chat_id, text)
-        return "ok"
-
-    # RouteOutcome.CONTINUE falls through to Phase D, unchanged.
-    # =========================
-    # COOKING MODE
-    # =========================
-    if waiting_for_ingredients.pop(chat_id, False):
-        cooking_history = [{"role": "user", "content": text}]
-        answer = call_gemini(cooking_history, COOKING_SYSTEM_PROMPT, temperature=0.4, model_url=GEMINI_COOKING_URL)
-        if answer is None:
-            answer = call_gemini(cooking_history, COOKING_SYSTEM_PROMPT, temperature=0.4, model_url=GEMINI_CHAT_URL)
-        if answer is None:
-            answer = "AI-помічник тимчасово недоступний. Спробуйте ще раз трохи пізніше."
-        send_message(chat_id, answer)
-        return "ok"
-
-    # =========================
-    # AI CHAT (Gemini 3.1 Flash Lite)
-    # =========================
-    _run_general_ai_fallback(chat_id, text)
+    message_dispatcher.dispatch(_dispatcher_deps, chat_id, user_id, display_name, text)
     return "ok"
 
 

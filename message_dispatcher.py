@@ -1,4 +1,4 @@
-"""Message Dispatcher V1/V2A/V2B.
+"""Message Dispatcher V1/V2A/V2B/V3A.
 
 The explicit, ordered routing layer for incoming Telegram text. Owns
 NOTHING new — it only formalizes the priority order bot.py's webhook()
@@ -18,26 +18,38 @@ V2B: the eleven remaining command/context routes below undo — ambiguous
     reports, expense-delete command, aliases context, global alias
     command, expenses context, global expense command, and the saved-list
     router (old Phase C routes 16-26).
+V3A: the five exact special buttons (aliases intro, alias list, expenses
+    intro, cooking-mode start, help — checked right after navigation, ahead
+    of the shopping/inventory menu buttons and mode dispatch) plus full
+    ownership of Phase D (cooking mode, then general AI fallback). Before
+    V3A, bot.py's webhook() branched on `dispatch()`'s return value to run
+    Phase D itself; now `dispatch()` runs it internally and webhook() just
+    calls dispatch() once and returns "ok".
 
-Route contract: `dispatch(...)` returns a `RouteOutcome`, not a bool — see
-its docstring. This exists because pending_batch/pending_inventory_batch's
-edit-router can match (chat_id present) yet still report "nothing to do"
-(Gemini intent "none"); in the ORIGINAL single elif chain that already
-"claimed" the message, skipping every remaining Phase C route (16-26) AND
-cooking mode, landing directly on general AI-chat. A plain bool can't
-express "matched, but skip cooking mode too, unlike an ordinary CONTINUE" —
-RouteOutcome.DIRECT_GENERAL_AI_FALLBACK makes that exact, pre-existing
-semantic explicit instead of leaving a special-case guard in bot.py.
+Route contract: `dispatch(...)` returns a `RouteOutcome` — kept for the
+pre-V3A test suite and for `_resolve_route_outcome`'s own internal
+bookkeeping, but as of V3A the return value is no longer meaningful to
+callers that have Phase D wired (see `dispatch()`'s own docstring): every
+call with a real `cooking_mode` callback fully completes Phase D as a side
+effect and the caller never needs to branch on the result. This exists
+because pending_batch/pending_inventory_batch's edit-router can match
+(chat_id present) yet still report "nothing to do" (Gemini intent "none");
+in the ORIGINAL single elif chain that already "claimed" the message,
+skipping every remaining Phase C route (16-26) AND cooking mode, landing
+directly on general AI-chat. A plain bool can't express "matched, but skip
+cooking mode too, unlike an ordinary CONTINUE" — RouteOutcome.DIRECT_
+GENERAL_AI_FALLBACK makes that exact, pre-existing semantic explicit.
 
 No pending state, no keyboards, no Gemini prompts live here; everything it
 needs from the outside world is passed in via a `DispatcherDeps` container
 built and owned by bot.py.
 
 Deliberately NOT here (still bot.py-owned, unchanged): the shared confirm/
-cancel button block, confirm handlers that write to the DB, the special
-buttons still above the dispatcher call (aliases/expenses/cooking-mode/help
-menu entries), cooking mode, general AI fallback's own implementation,
-interaction_state.py's own facade scope, and every state dict's ownership.
+cancel button block (still above the dispatcher call in webhook()),
+confirm handlers that write to the DB, the special buttons'/cooking
+mode's/general AI fallback's own business logic (only called through here
+as injected callbacks), interaction_state.py's own facade scope, and every
+state dict's ownership.
 
 No import of bot.py, database.py, Flask, Telegram, psycopg or any Gemini
 SDK — legacy_shopping_flow.py/legacy_inventory_flow.py/action_history.py are
@@ -148,12 +160,16 @@ class DispatcherDeps:
     help_text: str
     shopping_deps: legacy_shopping_flow.ShoppingFlowDeps
     inventory_deps: legacy_inventory_flow.InventoryFlowDeps
-    # Optional so DispatcherDeps built before Dispatcher V2A/V2B existed
-    # (fake test deps that only exercise V1's nav/menu/mode-text routes)
+    # Optional so DispatcherDeps built before Dispatcher V2A/V2B/V3A existed
+    # (fake test deps that only exercise a subset of the routing chain)
     # keep working unchanged — see the None-guards in _dispatch_pending_
-    # routes/_dispatch_command_routes.
+    # routes/_dispatch_command_routes/_dispatch_special_buttons and in
+    # dispatch() itself (cooking_mode is None -> Phase D stays bot.py-owned,
+    # exactly like before V3A).
     pending_routes: PendingRouteDeps = None
     command_routes: CommandRouteDeps = None
+    special_button: Callable = None
+    cooking_mode: Callable = None
 
 
 def _dispatch_navigation(deps, chat_id, text):
@@ -182,6 +198,20 @@ def _dispatch_navigation(deps, chat_id, text):
         return True
 
     return False
+
+
+def _dispatch_special_buttons(deps, chat_id, user_id, display_name, text):
+    """Dispatcher V3A special-button route — one thin callback covering the
+    five exact texts (aliases intro, alias list, expenses intro,
+    cooking-mode start, help). Checked right after navigation and ahead of
+    the shopping/inventory menu buttons and mode dispatch, same reasoning
+    as every other exact-text route in this chain: mutually-exclusive
+    literal matches, so their exact position relative to each other never
+    matters — only their position ahead of anything that consumes
+    arbitrary free text does."""
+    if deps.special_button is None:
+        return False
+    return deps.special_button(chat_id, user_id, display_name, text)
 
 
 def _dispatch_shopping_menu(deps, chat_id, user_id, display_name, text):
@@ -380,18 +410,26 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
     return None
 
 
-def dispatch(deps, chat_id, user_id, display_name, text):
-    """Route contract: returns a `RouteOutcome` (see its docstring) — never
-    a bare bool. Exact internal order — mirrors old Phase A2/A3/B/C(6-26):
-    navigation, shopping menu, inventory menu, shopping_mode text,
-    inventory_mode text, the ten pending/clarification/undo routes, then
-    the eleven command/context routes. Navigation is checked first so
-    /start, /menu, /help and "⬅️ Головне меню" always work even while a
-    shopping_mode/inventory_mode or any pending state is active. If
-    shopping_mode and inventory_mode were ever both active for the same
-    chat_id, shopping_mode wins — same as before this module existed.
+def _resolve_route_outcome(deps, chat_id, user_id, display_name, text):
+    """Pure routing decision — returns a `RouteOutcome` without running
+    Phase D itself (cooking mode / general AI fallback). `dispatch()`
+    (below) is the public entrypoint that completes Phase D exactly once
+    based on this result. Exact internal order — mirrors old Phase A2/A3/
+    B/C(6-26) plus V3A's special buttons: navigation, special buttons,
+    shopping menu, inventory menu, shopping_mode text, inventory_mode text,
+    the ten pending/clarification/undo routes, then the eleven command/
+    context routes. Navigation is checked first so /start, /menu, /help and
+    "⬅️ Головне меню" always work even while a shopping_mode/inventory_mode
+    or any pending state is active; special buttons are checked right after
+    navigation so they always win over an active shopping_mode/inventory_
+    mode too. If shopping_mode and inventory_mode were ever both active for
+    the same chat_id, shopping_mode wins — same as before this module
+    existed.
     """
     if _dispatch_navigation(deps, chat_id, text):
+        return RouteOutcome.HANDLED
+
+    if _dispatch_special_buttons(deps, chat_id, user_id, display_name, text):
         return RouteOutcome.HANDLED
 
     if _dispatch_shopping_menu(deps, chat_id, user_id, display_name, text):
@@ -415,3 +453,46 @@ def dispatch(deps, chat_id, user_id, display_name, text):
         return command_outcome
 
     return RouteOutcome.CONTINUE
+
+
+def dispatch(deps, chat_id, user_id, display_name, text):
+    """Public entrypoint. Resolves the route (see `_resolve_route_outcome`)
+    and, as of V3A, also completes Phase D itself:
+
+    - HANDLED: a route already fully handled the message — nothing else
+      to do.
+    - DIRECT_GENERAL_AI_FALLBACK: an active shopping/inventory add-preview's
+      edit-router matched but reported intent "none" — cooking mode is
+      skipped entirely, the pending preview is left untouched, and
+      `deps.command_routes.general_ai_fallback` runs directly.
+    - CONTINUE: `deps.cooking_mode` is tried first; if it reports it
+      handled the message, general AI fallback never runs. Otherwise
+      `deps.command_routes.general_ai_fallback` runs exactly once.
+
+    The return value is kept as a `RouteOutcome` for callers/tests built
+    before Phase D moved here (see `DispatcherDeps.cooking_mode`'s
+    docstring) — when `deps.cooking_mode` is None, `dispatch()` returns the
+    raw `_resolve_route_outcome(...)` result unchanged and runs no Phase D
+    side effect at all, exactly like before V3A. When `deps.cooking_mode`
+    is wired (the real bot.py deps, always, after V3A), `dispatch()` always
+    returns `RouteOutcome.HANDLED` — Phase D always produces a response one
+    way or another, so callers no longer need to branch on the result.
+    """
+    outcome = _resolve_route_outcome(deps, chat_id, user_id, display_name, text)
+
+    if deps.cooking_mode is None:
+        return outcome
+
+    if outcome == RouteOutcome.HANDLED:
+        return RouteOutcome.HANDLED
+
+    if outcome == RouteOutcome.DIRECT_GENERAL_AI_FALLBACK:
+        deps.command_routes.general_ai_fallback(chat_id, text)
+        return RouteOutcome.HANDLED
+
+    # outcome == RouteOutcome.CONTINUE
+    if deps.cooking_mode(chat_id, user_id, display_name, text):
+        return RouteOutcome.HANDLED
+
+    deps.command_routes.general_ai_fallback(chat_id, text)
+    return RouteOutcome.HANDLED
