@@ -33,6 +33,13 @@ V3B: the highest-priority route of all — the shared confirm/cancel button
     V3B, webhook() contains no application routing at all — only update
     parsing, deduplication, `/myid`, the access check, and the single
     `dispatch(...)` call.
+Household Read Context V1: an optional, purely read-only slot in Phase D,
+    tried after cooking mode and before the general AI fallback (see
+    `dispatch()`'s own docstring and `DispatcherDeps.household_read`) — it
+    never claims a message any earlier route (confirm/cancel, navigation,
+    special buttons, menus, modes, pending states, command/context routes,
+    or cooking mode) already claimed, since all of those return before
+    Phase D is ever reached.
 
 Route contract: `dispatch(...)` returns a `RouteOutcome` — kept for the
 pre-V3A test suite and for `_resolve_route_outcome`'s own internal
@@ -179,6 +186,12 @@ class DispatcherDeps:
     special_button: Callable = None
     cooking_mode: Callable = None
     confirm_or_cancel: Callable = None
+    # Household Read Context V1 — optional single nested callback (thin
+    # lambda-forward to try_handle_household_read), tried in Phase D after
+    # cooking_mode and before general_ai_fallback. Kept optional (default
+    # None) so DispatcherDeps built before this existed keeps working
+    # unchanged, same reasoning as every other Optional field above.
+    household_read: Callable = None
 
 
 def _dispatch_confirm_or_cancel(deps, chat_id, user_id, display_name, text):
@@ -494,9 +507,14 @@ def dispatch(deps, chat_id, user_id, display_name, text):
       edit-router matched but reported intent "none" — cooking mode is
       skipped entirely, the pending preview is left untouched, and
       `deps.command_routes.general_ai_fallback` runs directly.
-    - CONTINUE: `deps.cooking_mode` is tried first; if it reports it
-      handled the message, general AI fallback never runs. Otherwise
-      `deps.command_routes.general_ai_fallback` runs exactly once.
+    - CONTINUE: `deps.cooking_mode` is tried first (so an active
+      `waiting_for_ingredients` state is always consumed by cooking mode
+      itself, never left dangling because household_read answered
+      instead); if it reports it handled the message, nothing else runs.
+      Otherwise `deps.household_read` (Household Read Context V1, optional)
+      is tried next; if it handled the message, general AI fallback never
+      runs. Otherwise `deps.command_routes.general_ai_fallback` runs
+      exactly once.
 
     The return value is kept as a `RouteOutcome` for callers/tests built
     before Phase D moved here (see `DispatcherDeps.cooking_mode`'s
@@ -521,6 +539,9 @@ def dispatch(deps, chat_id, user_id, display_name, text):
 
     # outcome == RouteOutcome.CONTINUE
     if deps.cooking_mode(chat_id, user_id, display_name, text):
+        return RouteOutcome.HANDLED
+
+    if deps.household_read is not None and deps.household_read(chat_id, user_id, display_name, text):
         return RouteOutcome.HANDLED
 
     deps.command_routes.general_ai_fallback(chat_id, text)

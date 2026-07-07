@@ -80,6 +80,7 @@ import legacy_shopping_flow
 import legacy_inventory_flow
 import message_dispatcher
 import interaction_state
+import household_read_context
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -4408,6 +4409,28 @@ _command_route_deps = message_dispatcher.CommandRouteDeps(
     general_ai_fallback=lambda *a, **kw: _run_general_ai_fallback(*a, **kw),
 )
 
+# Household Read Context V1 — household_read_context.py owns a single
+# read-only Phase D slot (see message_dispatcher.py's DispatcherDeps.
+# household_read docstring). Same lambda-forward reasoning as every other
+# callback container: every field here is a thin runtime forward to a
+# bot.py name so patch.object(bot, "get_inventory_items"/"call_gemini"/...)
+# keeps working through this container too. No new DB helper, no new
+# formatter — every field already exists and is used elsewhere in bot.py.
+_household_read_deps = household_read_context.HouseholdReadDeps(
+    get_household_and_user=lambda *a, **kw: get_household_and_user(*a, **kw),
+    get_inventory_items=lambda *a, **kw: get_inventory_items(*a, **kw),
+    get_active_shopping_items=lambda *a, **kw: get_active_shopping_items(*a, **kw),
+    get_household_alias_map=lambda *a, **kw: get_household_alias_map(*a, **kw),
+    resolve_item_name=lambda *a, **kw: resolve_item_name(*a, **kw),
+    canonicalize_name=lambda *a, **kw: canonicalize_name(*a, **kw),
+    format_quantity_display=lambda *a, **kw: format_quantity_display(*a, **kw),
+    format_inventory_list=lambda *a, **kw: format_inventory_list(*a, **kw),
+    format_shopping_list=lambda *a, **kw: format_shopping_list(*a, **kw),
+    call_gemini=lambda *a, **kw: call_gemini(*a, **kw),
+    send_message=lambda *a, **kw: send_message(*a, **kw),
+    category_order=CATEGORY_ORDER,
+)
+
 # Message Dispatcher V1/V2A/V2B/V3A/V3B — message_dispatcher.py owns the
 # confirm/cancel route (highest priority) plus the ordered navigation/
 # special-button/menu/mode-text dispatch slice (old Phase A2/A3/B plus
@@ -4440,6 +4463,7 @@ _dispatcher_deps = message_dispatcher.DispatcherDeps(
     special_button=lambda *a, **kw: _try_handle_special_button(*a, **kw),
     cooking_mode=lambda *a, **kw: _try_handle_cooking_mode(*a, **kw),
     confirm_or_cancel=lambda *a, **kw: _try_handle_confirm_or_cancel(*a, **kw),
+    household_read=lambda *a, **kw: household_read_context.try_handle_household_read(_household_read_deps, *a, **kw),
 )
 
 
