@@ -214,8 +214,16 @@ class CommandRouteDeps:
     global_alias_command: Callable
     active_expenses_context: Callable
     global_expense_command: Callable
-    saved_list_router: Callable
-    general_ai_fallback: Callable
+    # Inventory Cleanup / Merge v1 — optional (default None) so
+    # DispatcherDeps/CommandRouteDeps built before this existed keep working
+    # unchanged, same reasoning as every Optional field elsewhere in this
+    # module. Checked right before saved_list_router: a narrow, deterministic
+    # "об'єднай молоко в запасах"/"прибери дублікати" gate should win over
+    # the saved-list router's own broad AI edit-parser, but never overrides
+    # any higher-priority write route above it.
+    inventory_cleanup_route: Callable = None
+    saved_list_router: Callable = None
+    general_ai_fallback: Callable = None
 
 
 @dataclass
@@ -554,6 +562,15 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # Global expense command gate — fires from anywhere but never
         # overrides an active preview/confirm from ANY other flow, aliases
         # included (aliases has priority over a new expense command).
+        return RouteOutcome.HANDLED
+
+    if routes.inventory_cleanup_route is not None and routes.inventory_cleanup_route(chat_id, user_id, display_name, text):
+        # Inventory Cleanup / Merge v1 — narrow, deterministic local gate
+        # (no Gemini) for "об'єднай молоко в запасах"/"прибери дублікати"
+        # style requests and their "об'єднай их"/"об'єднай ці записи"
+        # follow-ups. Checked ahead of saved_list_router so an explicit
+        # cleanup request always wins over that router's own broad AI edit-
+        # parser, even while a saved shopping/inventory list context is open.
         return RouteOutcome.HANDLED
 
     if routes.saved_list_router(chat_id, user_id, display_name, text):

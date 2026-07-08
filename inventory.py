@@ -719,3 +719,146 @@ def _resolve_numbered_inventory_delete_selection(text, items, effective_quantity
     if not selected:
         return "mismatch", (None, False)
     return "ok", selected
+
+
+# =========================
+# INVENTORY CLEANUP / MERGE v1
+# =========================
+# Pure text-classification + candidate-grouping for "об'єднай молоко в
+# запасах" style duplicate cleanup requests. No Gemini, no DB, no bot.py
+# dependency — bot.py resolves the product phrase into a canonical_name
+# (household alias lookup + canonicalize_name, exactly like every other
+# add/merge flow), fetches the live inventory snapshot, and calls the two
+# functions below; the actual DB write reuses database.execute_merge_
+# inventory (same targets/StaleSnapshotError contract as the existing
+# saved-list "merge_duplicates" flow) — no new write path.
+
+# Bare "прибери" alone is already the general inventory-removal verb
+# (➖ Використати / прибрати) — this trigger only fires paired with
+# "дублікат(и)" so a plain "прибери молоко" (consume/remove) is never
+# misrouted into a duplicate search.
+_CLEANUP_TRIGGER_RE = re.compile(
+    r"об.?[єе]дна\w*|прибери\s+(?:ці\s+|цей\s+)?дублікат\w*",
+    re.IGNORECASE,
+)
+_CLEANUP_LEADING_DUPLICATE_WORD_RE = re.compile(r"^дублікат\w*\s*", re.IGNORECASE)
+_CLEANUP_TRAILING_LOCATION_RE = re.compile(r"\s*(?:в|у|із|з)\s+запас\w*\.?$", re.IGNORECASE)
+
+# Referential follow-ups with no explicit product name — "об'єднай их"/
+# "об'єднай ці записи" after the bot already showed duplicate candidates.
+# Deliberately a tiny fixed set (never fuzzy-matched) covering both the
+# correct Ukrainian "їх" and the common "их" typo/Russianism.
+_CLEANUP_FOLLOWUP_PHRASES = {
+    "их", "їх", "це", "ці", "ці записи", "цей запис",
+    "ці дублікати", "цей дублікат", "дублікати",
+}
+
+
+def parse_inventory_cleanup_request(text):
+    """Classify free text as an Inventory Cleanup / Merge v1 request.
+
+    Returns (None, None) if `text` isn't a cleanup phrase at all — caller
+    should try other routes. Returns (True, None) for a referential follow-
+    up ("об'єднай их", "об'єднай ці записи", "прибери ці дублікати") — the
+    caller must resolve it against a previously shown duplicate-search
+    context (never guess a product name). Returns (False, product_phrase)
+    for a direct request naming a product ("об'єднай молоко в запасах",
+    "прибери дублікати молока") — product_phrase is the raw, not yet
+    canonicalized/alias-resolved, name fragment the caller should resolve.
+
+    Deliberately narrow/deterministic, V1 scope: rename ("перейменуй ser на
+    сир"), an explicit two-name merge ("об'єднай ser і сир"), and quoted/
+    explicit-quantity removal ("прибери «сосисок — пару»") don't match this
+    gate at all and fall through to whatever route already handles that
+    text today — documented V1 limitation, not a silent misfire.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return None, None
+    lowered = stripped.lower()
+
+    trigger = _CLEANUP_TRIGGER_RE.search(lowered)
+    if not trigger:
+        return None, None
+
+    remainder = lowered[trigger.end():].strip()
+    remainder = _CLEANUP_LEADING_DUPLICATE_WORD_RE.sub("", remainder).strip()
+    remainder = _CLEANUP_TRAILING_LOCATION_RE.sub("", remainder).strip()
+    remainder = remainder.rstrip(".!?").strip()
+
+    if not remainder or remainder in _CLEANUP_FOLLOWUP_PHRASES:
+        return True, None
+    return False, remainder
+
+
+def find_inventory_cleanup_candidates(inventory_items, canonical_name):
+    """Every inventory row matching this canonical_name, regardless of
+    category (a mis-categorized duplicate is still a duplicate) — sorted by
+    id, same ordering convention as find_inventory_representation_matches."""
+    matches = [item for item in inventory_items if item.get("canonical_name") == canonical_name]
+    matches.sort(key=lambda it: it["id"])
+    return matches
+
+
+# Display-unit preference within a compatible family: prefer the "bigger"
+# unit as the merge base (9 л + 500 мл -> 9,5 л, not 9500 мл) — mirrors
+# quantities._UNIT_CONVERSION_GROUPS' own conversion factors (not re-
+# exported by quantities.py, so duplicated here as a tiny weight table).
+_CLEANUP_UNIT_DISPLAY_WEIGHT = {"шт.": 1, "г": 1, "кг": 1000, "мл": 1, "л": 1000}
+_CLEANUP_UNIT_FAMILY = {"шт.": "count", "г": "mass", "кг": "mass", "мл": "volume", "л": "volume"}
+
+
+def group_inventory_cleanup_candidates(candidate_rows):
+    """Split same-product duplicate rows into safely-mergeable groups plus a
+    leftover "incompatible" list needing an explicit user decision.
+
+    Rows are bucketed by unit family (count/mass/volume; unparseable or
+    unknown units get their own bucket) — quantities.merge_quantity_values
+    guarantees any two rows within the same family (mass: г/кг; volume:
+    мл/л; count: шт. only with itself) can be summed exactly, so a family
+    bucket with 2+ rows always becomes ONE merge group. A family bucket with
+    only 1 row has no partner to merge with and goes to "incompatible" —
+    it's not itself wrong, there's just nothing safe to combine it with
+    (e.g. "mlekо — 1 шт." next to litre/ml duplicates).
+
+    Returns {"groups": [{"rows": [...], "merged_value", "merged_unit"}],
+    "incompatible": [row, ...]}. "groups" rows are ordered base-first (the
+    row whose unit becomes the merged display unit).
+    """
+    families = {}
+    incompatible = []
+    for row in candidate_rows:
+        unit = row.get("quantity_unit")
+        value = row.get("quantity_value")
+        family = _CLEANUP_UNIT_FAMILY.get(unit) if value is not None else None
+        if family is None:
+            incompatible.append(row)
+            continue
+        families.setdefault(family, []).append(row)
+
+    groups = []
+    for rows in families.values():
+        if len(rows) < 2:
+            incompatible.extend(rows)
+            continue
+        ordered = sorted(rows, key=lambda r: (-_CLEANUP_UNIT_DISPLAY_WEIGHT.get(r["quantity_unit"], 0), r["id"]))
+        base = ordered[0]
+        running_value, running_unit = base["quantity_value"], base["quantity_unit"]
+        merged_rows = [base]
+        for row in ordered[1:]:
+            candidate = merge_quantity_values(running_value, running_unit, row["quantity_value"], row["quantity_unit"])
+            if candidate is None:
+                # Defensive only — same-family rows are always compatible
+                # per merge_quantity_values' own contract, so this never
+                # actually triggers; kept so a leftover row is still safe
+                # (never silently dropped) if that contract ever changes.
+                incompatible.append(row)
+                continue
+            running_value, running_unit = candidate
+            merged_rows.append(row)
+        if len(merged_rows) < 2:
+            incompatible.extend(merged_rows)
+            continue
+        groups.append({"rows": merged_rows, "merged_value": running_value, "merged_unit": running_unit})
+
+    return {"groups": groups, "incompatible": incompatible}
