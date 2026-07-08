@@ -2130,3 +2130,95 @@ def execute_merge_inventory(household_id, validated_groups, targets=None):
                     )
         conn.commit()
     return len(validated_groups)
+
+
+def execute_inventory_cleanup_merge(household_id, actor_user_id, validated_groups, targets=None):
+    """Inventory Cleanup / Merge v1.1 — same write as execute_merge_inventory
+    (first item_id per group updated, the rest deleted), PLUS a
+    household_action_journal row recorded in the SAME transaction so the
+    merge becomes the latest undo-able action (Action History + Safe Undo
+    v1). Deliberately reuses that EXISTING journal/undo path end to end,
+    not a new one: operation_type is 'global_household' (the only value
+    get_latest_undoable_action's query looks for), before/post snapshots
+    use the same {"inventory_buckets": {canonical_name: [row, ...]}} shape
+    apply_global_household_operations already writes, and
+    action_history.build_operation_summary/format_undo_preview render the
+    undo preview with zero new formatting code — apply_undo_action restores
+    the affected canonical-name bucket(s) exactly as it would for any other
+    global_household action, no inventory-merge-specific undo code needed.
+
+    validated_groups/targets: identical shape/contract to
+    execute_merge_inventory. Returns count of groups merged.
+    """
+    if not validated_groups:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, targets,
+                                   extra_fields=("canonical_name", "category"))
+
+            canonical_names = set()
+            for group in validated_groups:
+                cname = group.get("canonical_name")
+                if cname is None:
+                    cname = normalize_quantity_fields(group["merged_name"], group["merged_quantity_text"] or "")["canonical_name"]
+                canonical_names.add(cname)
+
+            before_buckets = {
+                cname: _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, cname, lock=True)
+                for cname in canonical_names
+            }
+
+            for group in validated_groups:
+                main_id = group["item_ids"][0]
+                rest_ids = group["item_ids"][1:]
+                canonical_name = group.get("canonical_name")
+                quantity_value = group.get("merged_quantity_value")
+                quantity_unit = group.get("merged_quantity_unit")
+                if canonical_name is None:
+                    normalized = normalize_quantity_fields(group["merged_name"], group["merged_quantity_text"] or "")
+                    canonical_name = normalized["canonical_name"]
+                    quantity_value = normalized["quantity_value"]
+                    quantity_unit = normalized["quantity_unit"]
+                cur.execute(
+                    "UPDATE inventory_items SET name=%s, quantity_text=%s, category=%s, "
+                    "canonical_name=%s, quantity_value=%s, quantity_unit=%s, quantity_inferred=FALSE, updated_at=NOW() "
+                    "WHERE id=%s AND household_id=%s",
+                    (group["merged_name"], group["merged_quantity_text"] or None, group["merged_category"],
+                     canonical_name, quantity_value, quantity_unit, main_id, household_id)
+                )
+                if rest_ids:
+                    placeholders = ",".join(["%s"] * len(rest_ids))
+                    cur.execute(
+                        f"DELETE FROM inventory_items WHERE id IN ({placeholders}) AND household_id=%s",
+                        rest_ids + [household_id]
+                    )
+
+            after_buckets = {
+                cname: _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, cname, lock=False)
+                for cname in canonical_names
+            }
+
+            before_snapshot = {"inventory_buckets": before_buckets, "shopping_buckets": {}, "expense_delete": None}
+            post_action_snapshot = {"inventory_buckets": after_buckets, "shopping_buckets": {}, "expense_adds": []}
+            forward_payload = action_history.json_safe({
+                "inventory_cleanup_merge_groups": [
+                    {"item_ids": g["item_ids"], "merged_name": g["merged_name"],
+                     "merged_quantity_text": g["merged_quantity_text"]}
+                    for g in validated_groups
+                ],
+            })
+            summary = action_history.build_operation_summary(before_snapshot, post_action_snapshot)
+
+            cur.execute(
+                """
+                INSERT INTO household_action_journal
+                    (household_id, actor_user_id, operation_type, forward_payload, inverse_payload,
+                     before_snapshot, post_action_snapshot, summary, status, created_at)
+                VALUES (%s, %s, 'global_household', %s, NULL, %s, %s, %s, 'active', NOW())
+                """,
+                (household_id, actor_user_id, Jsonb(forward_payload),
+                 Jsonb(before_snapshot), Jsonb(post_action_snapshot), Jsonb(summary))
+            )
+        conn.commit()
+    return len(validated_groups)

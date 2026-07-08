@@ -28,6 +28,7 @@ from database import (
     apply_inventory_reconciliation,
     execute_merge_shopping,
     execute_merge_inventory,
+    execute_inventory_cleanup_merge,
     update_shopping_items_batch,
     update_inventory_items_batch,
     save_list_context,
@@ -2641,46 +2642,32 @@ def _merge_snapshot_targets(validated_groups):
 
 
 # =========================
-# INVENTORY CLEANUP / MERGE v1
+# INVENTORY CLEANUP / MERGE v1.1
 # =========================
 # Global-scope route (works regardless of which menu/context is open,
 # same reasoning as household_router.py's own gate) for "об'єднай молоко в
 # запасах"-style duplicate cleanup requests. inventory.py owns the pure
-# text-classification/grouping; this reuses the EXISTING pending_merge dict
-# and "✅ Об'єднати"/"❌ Скасувати" wiring already in
-# _try_handle_confirm_or_cancel (list_type "inventory_cleanup" alongside
-# "inventory_saved") and database.execute_merge_inventory's own
-# StaleSnapshotError-protected transaction — no new pending dict, no new
-# write path, no new keyboard.
-def _format_inventory_cleanup_preview(validated_groups, incompatible_rows):
-    lines = [list_editing._format_merge_preview(validated_groups, _effective_quantity)]
-    if incompatible_rows:
-        lines.append("")
-        lines.append("Без змін (несумісні одиниці, потребують окремого рішення):")
-        for row in incompatible_rows:
-            qty = _effective_quantity(row)[2]
-            label = row["name"] + (f" — {qty}" if qty else "")
-            lines.append(f"• {label}")
-        lines.append("")
-        lines.append(
-            "«✅ Об'єднати» об'єднає лише сумісні записи вище; ці залишаться "
-            "без змін. Щоб видалити чи змінити окремий запис, скористайся "
-            "➖ Використати / прибрати."
-        )
-    return "\n".join(lines)
-
-
+# text-classification/grouping/cleanup-alias/preview-formatting; this reuses
+# the EXISTING pending_merge dict and "✅ Об'єднати"/"❌ Скасувати" wiring
+# already in _try_handle_confirm_or_cancel (list_type "inventory_cleanup")
+# and database.execute_inventory_cleanup_merge's own StaleSnapshotError-
+# protected transaction — no new pending dict, no new write path, no new
+# keyboard. execute_inventory_cleanup_merge (unlike plain
+# execute_merge_inventory) also records an Action History journal row, so a
+# confirmed cleanup merge becomes the latest undo-able "↩️ Скасувати останню
+# дію" action — same journal table/operation_type/restore path
+# apply_global_household_operations already uses, not a new one.
 def _start_inventory_cleanup(chat_id, user_id, display_name, product_phrase):
     try:
         household_id, user_db_id = get_household_and_user(user_id, display_name)
-        alias_map = get_household_alias_map(household_id)
-        _, canonical_name = resolve_item_name(product_phrase, alias_map)
+        canonical_name_candidates = inventory.cleanup_canonical_name_candidates(canonicalize_name, product_phrase)
         items = get_inventory_items(household_id)
     except Exception:
         send_message(chat_id, INVENTORY_ERROR_MSG)
         return
 
-    candidates = inventory.find_inventory_cleanup_candidates(items, canonical_name)
+    canonical_name = canonical_name_candidates[0]
+    candidates = inventory.find_inventory_cleanup_candidates(items, canonical_name_candidates, canonicalize_name)
     if len(candidates) < 2:
         if candidates:
             qty = _effective_quantity(candidates[0])[2]
@@ -2691,14 +2678,6 @@ def _start_inventory_cleanup(chat_id, user_id, display_name, product_phrase):
         return
 
     grouping = inventory.group_inventory_cleanup_candidates(candidates)
-    if not grouping["groups"]:
-        lines = ["Знайшов кілька записів, але жодні не можна безпечно об'єднати автоматично (несумісні одиниці):"]
-        for row in candidates:
-            qty = _effective_quantity(row)[2]
-            lines.append(f"• {row['name']}" + (f" — {qty}" if qty else ""))
-        send_message(chat_id, "\n".join(lines), reply_markup=INVENTORY_KEYBOARD)
-        return
-
     validated_groups = []
     for group in grouping["groups"]:
         base = group["rows"][0]
@@ -2713,6 +2692,14 @@ def _start_inventory_cleanup(chat_id, user_id, display_name, product_phrase):
             "items": group["rows"],
         })
 
+    preview = inventory.format_inventory_cleanup_preview(validated_groups, grouping["incompatible"], _effective_quantity)
+
+    if not validated_groups:
+        # Nothing safe to auto-merge — read-only warning, no pending state
+        # (nothing to confirm/cancel), no merge keyboard.
+        send_message(chat_id, preview, reply_markup=INVENTORY_KEYBOARD)
+        return
+
     pending_merge[chat_id] = {
         "groups": validated_groups,
         "targets": _merge_snapshot_targets(validated_groups),
@@ -2720,17 +2707,18 @@ def _start_inventory_cleanup(chat_id, user_id, display_name, product_phrase):
         "user_db_id": user_db_id,
         "list_type": "inventory_cleanup",
     }
-    preview = _format_inventory_cleanup_preview(validated_groups, grouping["incompatible"])
     send_message(chat_id, preview, reply_markup=MERGE_PREVIEW_KEYBOARD)
 
 
-def _confirm_inventory_cleanup_via_text(chat_id):
-    """"об'єднай их"/"об'єднай ці записи" while an Inventory Cleanup / Merge
-    v1 preview is open — same DB write/stale-protection/message as pressing
-    "✅ Об'єднати", just reached via free text instead of the exact button."""
-    merge_data = pending_merge.pop(chat_id)
+def _apply_inventory_cleanup_merge(chat_id, merge_data):
+    """Same DB write/stale-protection as pressing "✅ Об'єднати" — reached
+    either from that button (_try_handle_confirm_or_cancel) or a follow-up
+    text confirm ("об'єднай их"). execute_inventory_cleanup_merge records
+    the Action History journal row that makes this undo-able."""
     try:
-        count = execute_merge_inventory(merge_data["household_id"], merge_data["groups"], merge_data.get("targets"))
+        count = execute_inventory_cleanup_merge(
+            merge_data["household_id"], merge_data["user_db_id"], merge_data["groups"], merge_data.get("targets"),
+        )
         send_message(chat_id, f"✅ Об'єднано груп: {count}", reply_markup=INVENTORY_KEYBOARD)
     except StaleSnapshotError:
         send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=INVENTORY_KEYBOARD)
@@ -2746,13 +2734,18 @@ def _route_inventory_cleanup(chat_id, user_id, display_name, text):
     if followup:
         cleanup = pending_merge.get(chat_id)
         if cleanup and cleanup.get("list_type") == "inventory_cleanup":
-            _confirm_inventory_cleanup_via_text(chat_id)
+            merge_data = pending_merge.pop(chat_id)
+            _apply_inventory_cleanup_merge(chat_id, merge_data)
         else:
             send_message(chat_id, "Напиши, який товар об'єднати, наприклад: «Об'єднай молоко в запасах».")
         return True
 
     if _has_blocking_pending_state_for_reports(chat_id):
-        return False
+        # Another flow's preview/clarification is already open — never
+        # silently fall through to general AI; same guard message the
+        # Global Household Router already uses for the same situation.
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return True
     _start_inventory_cleanup(chat_id, user_id, display_name, product_phrase)
     return True
 
@@ -4133,7 +4126,7 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
                     send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=SHOPPING_KEYBOARD)
                 except Exception:
                     send_message(chat_id, "Не вдалося виконати об'єднання. Спробуйте ще раз.", reply_markup=SHOPPING_KEYBOARD)
-            elif list_type in ("inventory_saved", "inventory_cleanup"):
+            elif list_type == "inventory_saved":
                 try:
                     count = execute_merge_inventory(merge_data["household_id"], merge_data["groups"], merge_data.get("targets"))
                     send_message(chat_id, f"✅ Об'єднано груп: {count}", reply_markup=INVENTORY_KEYBOARD)
@@ -4141,6 +4134,8 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
                     send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=INVENTORY_KEYBOARD)
                 except Exception:
                     send_message(chat_id, "Не вдалося виконати об'єднання. Спробуйте ще раз.", reply_markup=INVENTORY_KEYBOARD)
+            elif list_type == "inventory_cleanup":
+                _apply_inventory_cleanup_merge(chat_id, merge_data)
         return True
 
     if text == "✅ Додати все":

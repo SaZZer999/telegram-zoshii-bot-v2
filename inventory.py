@@ -791,11 +791,86 @@ def parse_inventory_cleanup_request(text):
     return False, remainder
 
 
-def find_inventory_cleanup_candidates(inventory_items, canonical_name):
-    """Every inventory row matching this canonical_name, regardless of
-    category (a mis-categorized duplicate is still a duplicate) — sorted by
-    id, same ordering convention as find_inventory_representation_matches."""
-    matches = [item for item in inventory_items if item.get("canonical_name") == canonical_name]
+# =========================
+# INVENTORY CLEANUP / MERGE v1.1 — cleanup-specific alias layer
+# =========================
+# Deliberately NOT the global canonicalize_name/_NAME_SYNONYMS table
+# (bot.py/database.py) — this only widens what the CLEANUP search accepts
+# as "the same product" (a small fixed set of Ukrainian case/number
+# endings the global canonicalizer has no morphology for), never changes
+# what a new shopping/inventory item resolves to. No morphology engine: a
+# tiny, explicit lookup table, same spirit as quantities.py's
+# _WORD_NUMBER_QUANTITIES whitelist. Mixed-script homoglyphs (e.g. "mlekо"
+# with a Cyrillic "о") are already repaired by the global canonicalize_name
+# itself (_repair_mixed_script_token) — listed here too anyway, as a second,
+# independent line of defense in case a legacy row's stored canonical_name
+# predates that fix.
+_CLEANUP_NAME_ALIASES = {
+    "mleko": "молоко",
+    "mlekо": "молоко",  # note: trailing character is Cyrillic "о" (U+043E), not Latin "o"
+    "молока": "молоко",
+    "молоку": "молоко",
+    "ser": "сир",
+    "сиру": "сир",
+    "сира": "сир",
+    "сосисок": "сосиски",
+    "сосиски": "сосиски",
+    "сосисками": "сосиски",
+    "курку": "курка",
+    "курки": "курка",
+}
+
+
+def cleanup_canonical_name_candidates(canonicalize_name, product_phrase):
+    """Every canonical_name worth treating as "this product" for one cleanup
+    request, most-preferred first. If product_phrase (lowercased/trimmed)
+    hits this module's small cleanup-only alias table (declined/plural
+    Ukrainian forms canonicalize_name has no morphology for — "молока",
+    "сосисок", ...), that normalized form comes FIRST (it's what a new
+    merged row's canonical_name should actually store). canonicalize_name's
+    own result (household-alias-free; bot.py-owned, injected) always
+    follows, deduplicated. Callers search inventory with the FULL list via
+    find_inventory_cleanup_candidates and use candidates[0] as the primary
+    canonical_name for the merge write.
+    """
+    raw = (product_phrase or "").strip().lower()
+    alias_hit = _CLEANUP_NAME_ALIASES.get(raw)
+    canonical = canonicalize_name(product_phrase)
+    ordered = []
+    for candidate in (alias_hit, canonical):
+        if candidate and candidate not in ordered:
+            ordered.append(candidate)
+    return ordered
+
+
+def find_inventory_cleanup_candidates(inventory_items, canonical_name_candidates, canonicalize_name):
+    """Every inventory row recognized as one of `canonical_name_candidates`
+    (see cleanup_canonical_name_candidates), regardless of category (a mis-
+    categorized duplicate is still a duplicate) — sorted by id, same
+    ordering convention as find_inventory_representation_matches.
+
+    A row matches if EITHER its stored canonical_name, a fresh
+    canonicalize_name(row['name']) re-derivation, or this module's own
+    cleanup alias lookup on row['name'] lands in that set — the fresh
+    re-derivation/alias fallback exists because a legacy row's STORED
+    canonical_name column can predate a later normalization fix (e.g. mixed-
+    script homoglyph repair) or use a declined/plural form ("сосисок") the
+    global canonicalizer has no morphology for; cleanup search must still
+    find it even when the stored column alone would miss it.
+    canonicalize_name is bot.py-owned, injected (see module docstring).
+    """
+    candidate_set = set(canonical_name_candidates)
+    matches = []
+    for item in inventory_items:
+        name = item.get("name") or ""
+        row_names = {
+            item.get("canonical_name"),
+            canonicalize_name(name),
+            _CLEANUP_NAME_ALIASES.get(name.strip().lower()),
+        }
+        row_names.discard(None)
+        if row_names & candidate_set:
+            matches.append(item)
     matches.sort(key=lambda it: it["id"])
     return matches
 
@@ -862,3 +937,85 @@ def group_inventory_cleanup_candidates(candidate_rows):
         groups.append({"rows": merged_rows, "merged_value": running_value, "merged_unit": running_unit})
 
     return {"groups": groups, "incompatible": incompatible}
+
+
+_CLEANUP_FAMILY_LABELS = {"volume": "л/мл", "mass": "кг/г", "count": "шт."}
+
+
+def describe_cleanup_incompatibility_reason(candidate_rows):
+    """Short Ukrainian reason for why NONE of `candidate_rows` could be
+    safely auto-merged — used only when group_inventory_cleanup_candidates
+    returned no groups at all (every row is alone in its own family, or a
+    mix of numeric/text quantities)."""
+    has_numeric = any(r.get("quantity_value") is not None for r in candidate_rows)
+    has_text = any(r.get("quantity_value") is None for r in candidate_rows)
+    if has_numeric and has_text:
+        return "одна кількість числова, інша текстова"
+    families = {
+        _CLEANUP_UNIT_FAMILY.get(r.get("quantity_unit"))
+        for r in candidate_rows if r.get("quantity_value") is not None
+    }
+    families.discard(None)
+    if len(families) > 1:
+        return "несумісні одиниці виміру"
+    return "недостатньо однакових записів для безпечного об'єднання"
+
+
+def format_inventory_cleanup_preview(validated_groups, incompatible_rows, effective_quantity):
+    """Render the Inventory Cleanup / Merge v1.1 preview. effective_quantity
+    is bot.py-owned (prefers structured fields, falls back to raw
+    quantity_text), injected same as every other formatter in this module.
+
+    Two shapes:
+    - validated_groups non-empty: "🧹 Можна безпечно об'єднати" section (one
+      line + result per group) followed by an "⚠️ Не об'єдную автоматично"
+      section listing every leftover row with a short per-row reason
+      ("несумісна одиниця з <family>").
+    - validated_groups empty (nothing safe to merge at all): a single
+      read-only "🧹 Знайшов схожі записи" + reason block — caller must NOT
+      open a pending-confirm state or show the merge keyboard for this shape
+      (see bot.py's _start_inventory_cleanup).
+    """
+    lines = []
+    if validated_groups:
+        lines.append("🧹 Можна безпечно об'єднати:")
+        merged_families = set()
+        for group in validated_groups:
+            parts = []
+            for item in group["items"]:
+                label = item["name"]
+                qty = effective_quantity(item)[2]
+                if qty:
+                    label += f" — {qty}"
+                parts.append(label)
+            result = group["merged_name"]
+            if group["merged_quantity_text"]:
+                result += f" — {group['merged_quantity_text']}"
+            lines.append(f"• {' + '.join(parts)}")
+            lines.append(f"  → {result}")
+            family = _CLEANUP_UNIT_FAMILY.get(group.get("merged_unit"))
+            if family:
+                merged_families.add(_CLEANUP_FAMILY_LABELS.get(family, family))
+
+        if incompatible_rows:
+            lines.append("")
+            lines.append("⚠️ Не об'єдную автоматично:")
+            other_label = "/".join(sorted(merged_families)) if merged_families else None
+            for row in incompatible_rows:
+                qty = effective_quantity(row)[2]
+                label = row["name"] + (f" — {qty}" if qty else "")
+                reason = f" — несумісна одиниця з {other_label}" if other_label else ""
+                lines.append(f"• {label}{reason}")
+        return "\n".join(lines)
+
+    lines.append("🧹 Знайшов схожі записи:")
+    lines.append("")
+    lines.append("⚠️ Не можу безпечно об'єднати автоматично:")
+    for row in incompatible_rows:
+        qty = effective_quantity(row)[2]
+        label = row["name"] + (f" — {qty}" if qty else "")
+        lines.append(f"• {label}")
+    lines.append("")
+    lines.append(f"Причина: {describe_cleanup_incompatibility_reason(incompatible_rows)}.")
+    lines.append("Можеш прибрати або виправити зайвий запис через існуючі дії з запасами.")
+    return "\n".join(lines)
