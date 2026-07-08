@@ -81,6 +81,7 @@ import legacy_inventory_flow
 import message_dispatcher
 import interaction_state
 import household_read_context
+import meal_ideas
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -3883,8 +3884,8 @@ def _try_handle_special_button(chat_id, user_id, display_name, text):
     if text == "🍽 Що приготувати":
         active_list_context.pop(chat_id, None)
         clear_shopping_state(chat_id)
-        waiting_for_ingredients[chat_id] = True
-        send_message(chat_id, "Напиши, які продукти зараз є вдома, і я запропоную кілька страв.")
+        waiting_for_ingredients.pop(chat_id, None)
+        meal_ideas.try_handle_meal_ideas(_meal_ideas_deps, chat_id, user_id, display_name, text)
         return True
 
     if text == "ℹ Допомога":
@@ -4460,6 +4461,23 @@ _household_read_deps = household_read_context.HouseholdReadDeps(
     category_order=CATEGORY_ORDER,
 )
 
+# Meal Ideas V1 — meal_ideas.py owns a single read-only Phase D slot (see
+# message_dispatcher.py's DispatcherDeps.meal_ideas docstring) plus the
+# dedicated "🍽 Що приготувати" button (called directly from
+# _try_handle_special_button, never through waiting_for_ingredients). Same
+# lambda-forward reasoning as _household_read_deps above — every field here
+# is a thin runtime forward to a bot.py name so patch.object(bot, "get_
+# inventory_items"/"call_gemini"/...) keeps working through this container
+# too. No new DB helper, no new formatter — every field already exists and
+# is used elsewhere in bot.py.
+_meal_ideas_deps = meal_ideas.MealIdeasDeps(
+    get_household_and_user=lambda *a, **kw: get_household_and_user(*a, **kw),
+    get_inventory_items=lambda *a, **kw: get_inventory_items(*a, **kw),
+    format_quantity_display=lambda *a, **kw: format_quantity_display(*a, **kw),
+    call_gemini=lambda *a, **kw: call_gemini(*a, **kw),
+    send_message=lambda *a, **kw: send_message(*a, **kw),
+)
+
 # Message Dispatcher V1/V2A/V2B/V3A/V3B — message_dispatcher.py owns the
 # confirm/cancel route (highest priority) plus the ordered navigation/
 # special-button/menu/mode-text dispatch slice (old Phase A2/A3/B plus
@@ -4494,6 +4512,7 @@ _dispatcher_deps = message_dispatcher.DispatcherDeps(
     confirm_or_cancel=lambda *a, **kw: _try_handle_confirm_or_cancel(*a, **kw),
     household_read=lambda *a, **kw: household_read_context.try_handle_household_read(_household_read_deps, *a, **kw),
     direct_household_read=lambda *a, **kw: household_read_context.try_handle_direct_household_read(_household_read_deps, *a, **kw),
+    meal_ideas=lambda *a, **kw: meal_ideas.try_handle_meal_ideas(_meal_ideas_deps, *a, **kw),
 )
 
 

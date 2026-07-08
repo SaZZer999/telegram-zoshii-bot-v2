@@ -629,14 +629,26 @@ class TestVariationSelectorButtonHandling(unittest.TestCase):
         self.assertIsNone(message_dispatcher.strip_variation_selectors(None))
 
     def test_cooking_mode_button_without_variation_selector(self):
+        # Meal Ideas V1: the button no longer opens the old manual
+        # waiting_for_ingredients prompt — it reads the real inventory and
+        # asks Gemini directly (see tests/test_meal_ideas.py for the full
+        # Meal Ideas V1 contract).
         chat_id = 941001
-        _call_webhook(_make_update(chat_id, "🍽 Що приготувати"))
-        self.assertTrue(bot.waiting_for_ingredients.get(chat_id))
+        with patch.object(bot, "get_household_and_user", return_value=(1, 10)), \
+                patch.object(bot, "get_inventory_items", return_value=[]), \
+                patch.object(bot, "call_gemini", return_value=None):
+            _call_webhook(_make_update(chat_id, "🍽 Що приготувати"))
+        self.assertNotIn(chat_id, bot.waiting_for_ingredients)
+        self.mock_send.assert_called_once()
 
     def test_cooking_mode_button_with_variation_selector_still_works(self):
         chat_id = 941002
-        _call_webhook(_make_update(chat_id, "🍽️ Що приготувати"))
-        self.assertTrue(bot.waiting_for_ingredients.get(chat_id))
+        with patch.object(bot, "get_household_and_user", return_value=(1, 10)), \
+                patch.object(bot, "get_inventory_items", return_value=[]), \
+                patch.object(bot, "call_gemini", return_value=None):
+            _call_webhook(_make_update(chat_id, "🍽️ Що приготувати"))
+        self.assertNotIn(chat_id, bot.waiting_for_ingredients)
+        self.mock_send.assert_called_once()
 
     def test_help_button_without_variation_selector(self):
         chat_id = 941003

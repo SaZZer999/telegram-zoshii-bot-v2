@@ -50,6 +50,14 @@ Household Read Context V1: two read-only slots, both optional. A direct/
     any earlier route (confirm/cancel, navigation, special buttons, menus,
     modes, pending states, ambiguous-add/explicit-add/bare-add) already
     claimed, since all of those return before either slot is ever reached.
+Meal Ideas V1: one read-only optional slot (`DispatcherDeps.meal_ideas`) in
+    Phase D, tried after `household_read` and before the general AI
+    fallback, so a plain read-question ("Що треба купити?") is always
+    answered by household_read first, never reinterpreted as a request for
+    meal suggestions. The dedicated "🍽 Що приготувати"/"🍽️ Що приготувати"
+    button does NOT go through this slot — bot.py's special-button route
+    calls `meal_ideas.try_handle_meal_ideas` directly, before this slot (or
+    any other Phase D route) is ever reached for that message.
 
 Route contract: `dispatch(...)` returns a `RouteOutcome` — kept for the
 pre-V3A test suite and for `_resolve_route_outcome`'s own internal
@@ -232,6 +240,16 @@ class DispatcherDeps:
     # shopping/inventory list context is open. Optional for the same reason
     # as every other field above.
     direct_household_read: Callable = None
+    # Meal Ideas V1 — optional single nested callback (thin lambda-forward
+    # to meal_ideas.try_handle_meal_ideas), tried in Phase D after
+    # household_read and before general_ai_fallback (see dispatch()'s own
+    # docstring). The dedicated "🍽 Що приготувати" button calls
+    # meal_ideas.try_handle_meal_ideas directly through bot.py's special-
+    # button route instead, never through this slot — this slot exists
+    # only for the small set of natural-language phrasings ("Що можна
+    # приготувати?", "Що зробити на вечерю?", ...). Optional for the same
+    # reason as every other field above.
+    meal_ideas: Callable = None
 
 
 def _dispatch_confirm_or_cancel(deps, chat_id, user_id, display_name, text):
@@ -571,10 +589,11 @@ def dispatch(deps, chat_id, user_id, display_name, text):
       `deps.command_routes.general_ai_fallback` runs directly.
     - CONTINUE: `deps.cooking_mode` is tried first (so an active
       `waiting_for_ingredients` state is always consumed by cooking mode
-      itself, never left dangling because household_read answered
-      instead); if it reports it handled the message, nothing else runs.
-      Otherwise `deps.household_read` (Household Read Context V1, optional)
-      is tried next; if it handled the message, general AI fallback never
+      itself, never left dangling because household_read/meal_ideas
+      answered instead); if it reports it handled the message, nothing
+      else runs. Otherwise `deps.household_read` (Household Read Context
+      V1, optional) is tried next; then `deps.meal_ideas` (Meal Ideas V1,
+      optional); if either handled the message, general AI fallback never
       runs. Otherwise `deps.command_routes.general_ai_fallback` runs
       exactly once.
 
@@ -604,6 +623,9 @@ def dispatch(deps, chat_id, user_id, display_name, text):
         return RouteOutcome.HANDLED
 
     if deps.household_read is not None and deps.household_read(chat_id, user_id, display_name, text):
+        return RouteOutcome.HANDLED
+
+    if deps.meal_ideas is not None and deps.meal_ideas(chat_id, user_id, display_name, text):
         return RouteOutcome.HANDLED
 
     deps.command_routes.general_ai_fallback(chat_id, text)
