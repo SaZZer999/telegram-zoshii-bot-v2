@@ -382,6 +382,93 @@ class TestUndoRouting(unittest.TestCase):
         deps.pending_routes.start_undo_flow.assert_called_once_with(chat_id, 555, "Тест")
 
 
+class TestExactUndoButtonOutranksQuantityAndRepresentationClarification(unittest.TestCase):
+    """The exact undo button label — with or without the U+FE0F variation
+    selector — must win over an active quantity/representation
+    clarification instead of being swallowed as an invalid answer, AND must
+    clear that clarification state so it can never resurface for the NEXT
+    message either. A plain, non-button reply must still reach the
+    clarification handler unchanged."""
+
+    def test_button_with_variation_selector_wins_over_quantity_clarification(self):
+        chat_id = 20
+        deps = _make_fake_dispatcher_deps(
+            pending_routes=_make_fake_pending_route_deps(
+                pending_inventory_quantity_clarification={chat_id: {}},
+            ),
+        )
+        result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "↩️ Скасувати останню дію")
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
+        deps.pending_routes.continue_inventory_quantity_clarification.assert_not_called()
+        deps.pending_routes.start_undo_flow.assert_called_once_with(chat_id, 555, "Тест")
+        self.assertNotIn(chat_id, deps.pending_routes.pending_inventory_quantity_clarification)
+
+    def test_button_without_variation_selector_wins_over_quantity_clarification(self):
+        chat_id = 21
+        deps = _make_fake_dispatcher_deps(
+            pending_routes=_make_fake_pending_route_deps(
+                pending_inventory_quantity_clarification={chat_id: {}},
+            ),
+        )
+        result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "↩ Скасувати останню дію")
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
+        deps.pending_routes.continue_inventory_quantity_clarification.assert_not_called()
+        deps.pending_routes.start_undo_flow.assert_called_once_with(chat_id, 555, "Тест")
+        self.assertNotIn(chat_id, deps.pending_routes.pending_inventory_quantity_clarification)
+
+    def test_ordinary_reply_still_reaches_quantity_clarification(self):
+        chat_id = 22
+        deps = _make_fake_dispatcher_deps(
+            pending_routes=_make_fake_pending_route_deps(
+                pending_inventory_quantity_clarification={chat_id: {}},
+            ),
+        )
+        result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", "1 л")
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
+        deps.pending_routes.continue_inventory_quantity_clarification.assert_called_once_with(chat_id, "1 л")
+        deps.pending_routes.start_undo_flow.assert_not_called()
+
+    def test_button_wins_over_representation_clarification(self):
+        chat_id = 23
+        deps = _make_fake_dispatcher_deps(
+            pending_routes=_make_fake_pending_route_deps(
+                pending_inventory_representation_clarification={chat_id: {}},
+            ),
+        )
+        result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", message_dispatcher.action_history.UNDO_BUTTON_TEXT)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
+        deps.pending_routes.continue_inventory_representation_clarification.assert_not_called()
+        deps.pending_routes.start_undo_flow.assert_called_once_with(chat_id, 555, "Тест")
+        self.assertNotIn(chat_id, deps.pending_routes.pending_inventory_representation_clarification)
+
+    def test_button_wins_over_global_household_guard(self):
+        chat_id = 24
+        deps = _make_fake_dispatcher_deps(
+            pending_routes=_make_fake_pending_route_deps(
+                pending_global_household={chat_id: {}},
+            ),
+        )
+        result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", message_dispatcher.action_history.UNDO_BUTTON_TEXT)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
+        deps.send_message.assert_not_called()
+        deps.pending_routes.start_undo_flow.assert_called_once_with(chat_id, 555, "Тест")
+        self.assertNotIn(chat_id, deps.pending_routes.pending_global_household)
+
+    def test_button_still_blocked_by_active_expense_preview(self):
+        """Unlike quantity/representation/global-household, the active
+        expense preview guard is untouched by this fix — same as the
+        existing generic-undo-phrase behavior in
+        TestActiveExpensePreviewBlocksUndo."""
+        chat_id = 25
+        deps = _make_fake_dispatcher_deps(
+            pending_routes=_make_fake_pending_route_deps(has_active_expense_preview=MagicMock(return_value=True)),
+        )
+        result = message_dispatcher.dispatch(deps, chat_id, 555, "Тест", message_dispatcher.action_history.UNDO_BUTTON_TEXT)
+        self.assertEqual(result, message_dispatcher.RouteOutcome.HANDLED)
+        deps.send_message.assert_called_once_with(chat_id, "EXPENSE_PREVIEW_GUARD")
+        deps.pending_routes.start_undo_flow.assert_not_called()
+
+
 class TestUnhandledTextReturnsFalse(unittest.TestCase):
     """13. Unrecognized text returns RouteOutcome.CONTINUE (webhook falls
     through to the old lower router) and never calls send_message."""

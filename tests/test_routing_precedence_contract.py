@@ -26,6 +26,7 @@ import action_history  # noqa: E402
 from bot import (  # noqa: E402
     pending_global_household,
     pending_inventory_quantity_clarification,
+    pending_inventory_representation_clarification,
     pending_add_destination_clarification,
     pending_undo_action,
     pending_expense,
@@ -35,6 +36,7 @@ from bot import (  # noqa: E402
 _ALL_PENDING_DICTS = (
     pending_global_household,
     pending_inventory_quantity_clarification,
+    pending_inventory_representation_clarification,
     pending_add_destination_clarification,
     pending_undo_action,
     pending_expense,
@@ -298,6 +300,103 @@ class TestUndoButtonVariationSelector(RoutingContractTestCase):
         chat_id = 9016
         _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
         self.mock_get_latest_undoable.assert_called_once()
+        self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, self._sent_texts())
+
+
+class TestUndoButtonOutranksQuantityClarification(RoutingContractTestCase):
+    """Reproduces the live bug end-to-end: while an inventory quantity
+    clarification is active ("У запасах уже є кілька записів «Молоко»..."),
+    pressing the exact undo button must start the undo flow instead of
+    being rejected as an invalid quantity answer — and must clear the
+    clarification so it can never resurface for a later message either."""
+
+    _MILK_ITEM = {
+        "name": "Молоко", "category": "Молочне та яйця", "canonical_name": "молоко",
+        "quantity_value": 1.0, "quantity_unit": "шт.",
+        "quantity_text": "1 шт.", "quantity_inferred": True, "was_corrected": False,
+    }
+    _MILK_LITERS_ROW = {
+        "id": 201, "name": "Молоко", "category": "Молочне та яйця", "canonical_name": "молоко",
+        "quantity_value": 7.0, "quantity_unit": "л", "quantity_text": "7 л", "quantity_inferred": False,
+    }
+    _MILK_PIECES_ROW = {
+        "id": 202, "name": "Молоко", "category": "Молочне та яйця", "canonical_name": "молоко",
+        "quantity_value": 1.0, "quantity_unit": "шт.", "quantity_text": "1 шт.", "quantity_inferred": False,
+    }
+
+    def _seed_milk_clarification(self, chat_id):
+        pending_inventory_quantity_clarification[chat_id] = {
+            "household_id": 1, "user_db_id": 10, "origin": "global",
+            "item_name": "Молоко", "canonical_name": "молоко", "category": "Молочне та яйця",
+            "add_shopping_items": [], "add_inventory_items": [dict(self._MILK_ITEM)], "consume_changes": [],
+            "new_expense": None, "delete_expense": None,
+        }
+
+    def test_button_with_variation_selector_starts_undo_and_clears_clarification(self):
+        chat_id = 9017
+        self._seed_milk_clarification(chat_id)
+        _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
+
+        self.mock_get_latest_undoable.assert_called_once()
+        self.assertNotIn(chat_id, pending_inventory_quantity_clarification)
+        texts = self._sent_texts()
+        self.assertNotIn(bot._GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG, texts)
+        self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, texts)
+
+    def test_button_without_variation_selector_starts_undo_and_clears_clarification(self):
+        chat_id = 9018
+        self._seed_milk_clarification(chat_id)
+        _call_webhook(_make_update(chat_id, chat_id, "↩ Скасувати останню дію"))
+
+        self.mock_get_latest_undoable.assert_called_once()
+        self.assertNotIn(chat_id, pending_inventory_quantity_clarification)
+        texts = self._sent_texts()
+        self.assertNotIn(bot._GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG, texts)
+        self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, texts)
+
+    def test_ordinary_reply_still_reaches_quantity_clarification(self):
+        chat_id = 9019
+        self._seed_milk_clarification(chat_id)
+        with patch.object(bot, "get_inventory_items", return_value=[self._MILK_LITERS_ROW, self._MILK_PIECES_ROW]):
+            _call_webhook(_make_update(chat_id, chat_id, "1 л"))
+
+        self.mock_get_latest_undoable.assert_not_called()
+        # The reply resolved the conflict normally (never got near undo) —
+        # the clarification state is gone because it turned into a combined
+        # preview, not because the button-only bypass touched it.
+        self.assertNotIn(chat_id, pending_inventory_quantity_clarification)
+        self.assertIn(chat_id, pending_global_household)
+
+    def test_invalid_reply_still_shows_quantity_help_message(self):
+        chat_id = 9020
+        self._seed_milk_clarification(chat_id)
+        _call_webhook(_make_update(chat_id, chat_id, "багато"))
+
+        self.mock_get_latest_undoable.assert_not_called()
+        self.assertIn(chat_id, pending_inventory_quantity_clarification)
+        self.assertIn(bot._GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG, self._sent_texts())
+
+
+class TestUndoButtonOutranksRepresentationClarification(RoutingContractTestCase):
+    """Same fix, representation-clarification side: an active count-vs-
+    mass/volume conflict must not swallow the exact undo button either."""
+
+    def _seed_representation_clarification(self, chat_id):
+        pending_inventory_representation_clarification[chat_id] = {
+            "household_id": 1, "user_db_id": 10, "origin": "global",
+            "stage": "choice", "conflict": {}, "queue": [],
+            "add_shopping_items": [], "add_inventory_items": [], "inventory_merge_targets": [],
+            "consume_changes": [], "new_expenses": [], "new_expense": None,
+            "delete_expense": None, "representation_resolutions": [],
+        }
+
+    def test_button_starts_undo_and_clears_clarification(self):
+        chat_id = 9021
+        self._seed_representation_clarification(chat_id)
+        _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
+
+        self.mock_get_latest_undoable.assert_called_once()
+        self.assertNotIn(chat_id, pending_inventory_representation_clarification)
         self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, self._sent_texts())
 
 
