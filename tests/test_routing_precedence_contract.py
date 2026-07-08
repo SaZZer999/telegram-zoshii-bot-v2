@@ -30,6 +30,7 @@ from bot import (  # noqa: E402
     pending_add_destination_clarification,
     pending_undo_action,
     pending_expense,
+    pending_saved_edit,
     active_list_context,
 )
 
@@ -40,6 +41,7 @@ _ALL_PENDING_DICTS = (
     pending_add_destination_clarification,
     pending_undo_action,
     pending_expense,
+    pending_saved_edit,
 )
 
 
@@ -303,12 +305,11 @@ class TestUndoButtonVariationSelector(RoutingContractTestCase):
         self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, self._sent_texts())
 
 
-class TestUndoButtonOutranksQuantityClarification(RoutingContractTestCase):
+class TestUndoButtonCancelsQuantityClarification(RoutingContractTestCase):
     """Reproduces the live bug end-to-end: while an inventory quantity
     clarification is active ("У запасах уже є кілька записів «Молоко»..."),
-    pressing the exact undo button must start the undo flow instead of
-    being rejected as an invalid quantity answer — and must clear the
-    clarification so it can never resurface for a later message either."""
+    pressing the exact undo button must cancel THAT clarification instead
+    of opening the historical undo preview."""
 
     _MILK_ITEM = {
         "name": "Молоко", "category": "Молочне та яйця", "canonical_name": "молоко",
@@ -332,27 +333,28 @@ class TestUndoButtonOutranksQuantityClarification(RoutingContractTestCase):
             "new_expense": None, "delete_expense": None,
         }
 
-    def test_button_with_variation_selector_starts_undo_and_clears_clarification(self):
+    def test_button_with_variation_selector_cancels_clarification(self):
         chat_id = 9017
         self._seed_milk_clarification(chat_id)
         _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
 
-        self.mock_get_latest_undoable.assert_called_once()
+        self.mock_get_latest_undoable.assert_not_called()
         self.assertNotIn(chat_id, pending_inventory_quantity_clarification)
         texts = self._sent_texts()
         self.assertNotIn(bot._GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG, texts)
-        self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, texts)
+        self.assertNotIn(action_history.NO_UNDOABLE_ACTION_MSG, texts)
+        self.assertIn("Поточну дію скасовано.", texts)
 
-    def test_button_without_variation_selector_starts_undo_and_clears_clarification(self):
+    def test_button_without_variation_selector_cancels_clarification(self):
         chat_id = 9018
         self._seed_milk_clarification(chat_id)
         _call_webhook(_make_update(chat_id, chat_id, "↩ Скасувати останню дію"))
 
-        self.mock_get_latest_undoable.assert_called_once()
+        self.mock_get_latest_undoable.assert_not_called()
         self.assertNotIn(chat_id, pending_inventory_quantity_clarification)
         texts = self._sent_texts()
         self.assertNotIn(bot._GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG, texts)
-        self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, texts)
+        self.assertIn("Поточну дію скасовано.", texts)
 
     def test_ordinary_reply_still_reaches_quantity_clarification(self):
         chat_id = 9019
@@ -363,9 +365,10 @@ class TestUndoButtonOutranksQuantityClarification(RoutingContractTestCase):
         self.mock_get_latest_undoable.assert_not_called()
         # The reply resolved the conflict normally (never got near undo) —
         # the clarification state is gone because it turned into a combined
-        # preview, not because the button-only bypass touched it.
+        # preview, not because the undo-button cancel path touched it.
         self.assertNotIn(chat_id, pending_inventory_quantity_clarification)
         self.assertIn(chat_id, pending_global_household)
+        self.assertNotIn("Поточну дію скасовано.", self._sent_texts())
 
     def test_invalid_reply_still_shows_quantity_help_message(self):
         chat_id = 9020
@@ -377,9 +380,10 @@ class TestUndoButtonOutranksQuantityClarification(RoutingContractTestCase):
         self.assertIn(bot._GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG, self._sent_texts())
 
 
-class TestUndoButtonOutranksRepresentationClarification(RoutingContractTestCase):
+class TestUndoButtonCancelsRepresentationClarification(RoutingContractTestCase):
     """Same fix, representation-clarification side: an active count-vs-
-    mass/volume conflict must not swallow the exact undo button either."""
+    mass/volume conflict must be cancelled by the exact undo button too,
+    never routed to historical undo."""
 
     def _seed_representation_clarification(self, chat_id):
         pending_inventory_representation_clarification[chat_id] = {
@@ -390,14 +394,62 @@ class TestUndoButtonOutranksRepresentationClarification(RoutingContractTestCase)
             "delete_expense": None, "representation_resolutions": [],
         }
 
-    def test_button_starts_undo_and_clears_clarification(self):
+    def test_button_cancels_clarification(self):
         chat_id = 9021
         self._seed_representation_clarification(chat_id)
         _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
 
-        self.mock_get_latest_undoable.assert_called_once()
+        self.mock_get_latest_undoable.assert_not_called()
         self.assertNotIn(chat_id, pending_inventory_representation_clarification)
+        self.assertIn("Поточну дію скасовано.", self._sent_texts())
+
+
+class TestUndoButtonCancelsGlobalHouseholdPreview(RoutingContractTestCase):
+    """An active combined Global Household Router preview must be cancelled
+    by the exact undo button, never routed to historical undo."""
+
+    def test_button_cancels_preview(self):
+        chat_id = 9022
+        pending_global_household[chat_id] = {
+            "add_shopping_items": [], "add_inventory_items": [], "consume_changes": [],
+            "inventory_targets": [], "new_expense": None, "delete_expense": None,
+            "household_id": 1, "user_db_id": 10, "origin": "global",
+        }
+        _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
+
+        self.mock_get_latest_undoable.assert_not_called()
+        self.assertNotIn(chat_id, pending_global_household)
+        self.assertIn("Поточну дію скасовано.", self._sent_texts())
+
+
+class TestUndoButtonCancelsSavedEditPreview(RoutingContractTestCase):
+    """An active saved-list edit preview must be cancelled by the exact
+    undo button, never routed to historical undo."""
+
+    def test_button_cancels_saved_edit_preview(self):
+        chat_id = 9023
+        pending_saved_edit[chat_id] = {
+            "items_snapshot": [], "validated_updates": [], "household_id": 1,
+            "user_db_id": 10, "context_type": "shopping_saved",
+        }
+        _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
+
+        self.mock_get_latest_undoable.assert_not_called()
+        self.assertNotIn(chat_id, pending_saved_edit)
+        self.assertIn("Поточну дію скасовано.", self._sent_texts())
+
+
+class TestUndoButtonWithoutActivePendingOpensHistoricalUndo(RoutingContractTestCase):
+    """With no active clarification/preview at all, the exact undo button
+    still opens the normal historical undo preview, exactly as before."""
+
+    def test_button_opens_historical_undo_when_nothing_pending(self):
+        chat_id = 9024
+        _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
+
+        self.mock_get_latest_undoable.assert_called_once()
         self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, self._sent_texts())
+        self.assertNotIn("Поточну дію скасовано.", self._sent_texts())
 
 
 if __name__ == "__main__":

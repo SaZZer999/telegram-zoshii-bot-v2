@@ -172,6 +172,21 @@ class PendingRouteDeps:
     start_undo_flow: Callable
     expense_preview_guard_msg: str
     global_household_preview_guard_msg: str
+    # Undo-Button-Cancels-Active-Operation v1 — both optional (default None)
+    # so DispatcherDeps built before this existed keeps working unchanged,
+    # same reasoning as every Optional field on DispatcherDeps itself.
+    # has_active_pending_operation(chat_id) is a thin bot.py wrapper telling
+    # the exact undo button apart from a plain "nothing pending" undo press;
+    # cancel_active_pending_operation(chat_id) then pops whichever state
+    # that check found active and sends the cancellation message itself.
+    # Deliberately scoped to quantity/representation clarification, the
+    # global household preview, add-destination clarification and a pending
+    # saved-list edit — not pending_batch/pending_inventory_batch/
+    # reconciliation-clarify/an active expense preview, which are already
+    # intercepted earlier in this same route order and never reach this
+    # check at all.
+    has_active_pending_operation: Callable = None
+    cancel_active_pending_operation: Callable = None
 
 
 @dataclass
@@ -400,41 +415,44 @@ def _dispatch_pending_routes(deps, chat_id, user_id, display_name, text):
     # Computed here (ahead of the quantity/representation/global-household
     # clarification checks below) so the EXACT undo button label — with or
     # without the U+FE0F variation selector Telegram may or may not append —
-    # always wins over those three, instead of being swallowed as an invalid
-    # answer/new command. Deliberately narrower than action_history.
-    # is_undo_command(text): the natural-language undo phrasings ("скасувати
-    # останню дію" without the arrow, etc.) still queue up behind those three
-    # clarifications and behind pending_add_destination_clarification below,
-    # unchanged — only the literal button text jumps the queue.
+    # is never swallowed as an invalid answer/new command by any of them.
+    # Deliberately narrower than action_history.is_undo_command(text): the
+    # natural-language undo phrasings ("скасувати останню дію" without the
+    # arrow, etc.) still queue up behind those clarifications and behind
+    # pending_add_destination_clarification below, unchanged — only the
+    # literal button text gets this special handling.
     _undo_button_match = (
         strip_variation_selectors(text or "").strip().lower()
         == strip_variation_selectors(action_history.UNDO_BUTTON_TEXT).strip().lower()
     )
 
-    if _undo_button_match:
-        # Clear whichever of these three is active for this chat so it can
-        # never resurface and swallow the NEXT message either — falls
-        # through to pending_add_destination_clarification/undo below
-        # exactly like no clarification had ever been active.
-        routes.pending_inventory_quantity_clarification.pop(chat_id, None)
-        routes.pending_inventory_representation_clarification.pop(chat_id, None)
-        routes.pending_global_household.pop(chat_id, None)
-    else:
-        if chat_id in routes.pending_inventory_quantity_clarification:
-            routes.continue_inventory_quantity_clarification(chat_id, text)
-            return RouteOutcome.HANDLED
+    if (
+        _undo_button_match
+        and routes.has_active_pending_operation is not None
+        and routes.has_active_pending_operation(chat_id)
+    ):
+        # An unfinished command (clarification/preview/global-household
+        # operation) is open for this chat — the button cancels THAT
+        # instead of ever reaching historical undo below, exactly like
+        # pressing "❌ Скасувати" would, just with one shared message.
+        routes.cancel_active_pending_operation(chat_id)
+        return RouteOutcome.HANDLED
 
-        if chat_id in routes.pending_inventory_representation_clarification:
-            routes.continue_inventory_representation_clarification(chat_id, text)
-            return RouteOutcome.HANDLED
+    if chat_id in routes.pending_inventory_quantity_clarification:
+        routes.continue_inventory_quantity_clarification(chat_id, text)
+        return RouteOutcome.HANDLED
 
-        if chat_id in routes.pending_global_household:
-            # A combined Global Household Router preview is awaiting confirm/
-            # cancel — no new text (including one that would otherwise match
-            # household_router.gate(text)) can start a new global router pass
-            # while a plan of changes is still awaiting confirmation.
-            deps.send_message(chat_id, routes.global_household_preview_guard_msg)
-            return RouteOutcome.HANDLED
+    if chat_id in routes.pending_inventory_representation_clarification:
+        routes.continue_inventory_representation_clarification(chat_id, text)
+        return RouteOutcome.HANDLED
+
+    if chat_id in routes.pending_global_household:
+        # A combined Global Household Router preview is awaiting confirm/
+        # cancel — no new text (including one that would otherwise match
+        # household_router.gate(text)) can start a new global router pass
+        # while a plan of changes is still awaiting confirmation.
+        deps.send_message(chat_id, routes.global_household_preview_guard_msg)
+        return RouteOutcome.HANDLED
 
     if chat_id in routes.pending_add_destination_clarification:
         routes.continue_add_destination_clarification(chat_id, text)

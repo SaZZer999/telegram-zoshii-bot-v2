@@ -228,6 +228,53 @@ def _has_active_expense_preview(chat_id):
     return interaction_state.has_active_expense_preview(_interaction_state_deps, chat_id)
 
 
+# Undo-Button-Cancels-Active-Operation v1 — the exact "↩️ Скасувати останню
+# дію" button must cancel an unfinished command/clarification/preview for
+# THIS chat before it's ever allowed to open the historical undo preview.
+# Deliberately narrower than interaction_state's alias-gate group: only the
+# states reachable at the point message_dispatcher.py checks this (quantity/
+# representation clarification, the combined global-household preview,
+# add-destination clarification, a pending saved-list edit) — pending_batch/
+# pending_inventory_batch/reconciliation-clarify/an active expense preview
+# are already intercepted earlier in that same route order and never reach
+# this check at all, so including them here would be dead code.
+def _has_active_pending_clarification_or_preview(chat_id):
+    return (
+        chat_id in pending_inventory_quantity_clarification
+        or chat_id in pending_inventory_representation_clarification
+        or chat_id in pending_global_household
+        or chat_id in pending_add_destination_clarification
+        or chat_id in pending_saved_edit
+    )
+
+
+def _cancel_active_pending_operation(chat_id):
+    """Pops whichever of the states above is active for this chat and
+    replies with one shared cancellation message — same pop()/keyboard
+    choice as the matching "❌ Скасувати" branch in
+    _try_handle_confirm_or_cancel, just without that branch's own
+    per-flow-specific message text."""
+    if chat_id in pending_inventory_quantity_clarification:
+        data = pending_inventory_quantity_clarification.pop(chat_id, None)
+        keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
+    elif chat_id in pending_inventory_representation_clarification:
+        data = pending_inventory_representation_clarification.pop(chat_id, None)
+        keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
+    elif chat_id in pending_global_household:
+        data = pending_global_household.pop(chat_id, None)
+        keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
+    elif chat_id in pending_add_destination_clarification:
+        data = pending_add_destination_clarification.pop(chat_id, None)
+        keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
+    elif chat_id in pending_saved_edit:
+        edit_data = pending_saved_edit.pop(chat_id, None)
+        ctx = (edit_data or {}).get("context_type")
+        keyboard = SHOPPING_KEYBOARD if ctx == "shopping_saved" else INVENTORY_KEYBOARD
+    else:
+        keyboard = MAIN_KEYBOARD
+    send_message(chat_id, "Поточну дію скасовано.", reply_markup=keyboard)
+
+
 _SEEN_UPDATE_IDS_MAXLEN = 1000
 _seen_update_ids = deque(maxlen=_SEEN_UPDATE_IDS_MAXLEN)   # oldest-first, bounded
 _seen_update_ids_set = set()                               # O(1) membership
@@ -3479,6 +3526,8 @@ _pending_route_deps = message_dispatcher.PendingRouteDeps(
     start_undo_flow=lambda *a, **kw: _start_undo_flow(*a, **kw),
     expense_preview_guard_msg=EXPENSE_PREVIEW_GUARD_MSG,
     global_household_preview_guard_msg=GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG,
+    has_active_pending_operation=lambda *a, **kw: _has_active_pending_clarification_or_preview(*a, **kw),
+    cancel_active_pending_operation=lambda *a, **kw: _cancel_active_pending_operation(*a, **kw),
 )
 
 # =========================
