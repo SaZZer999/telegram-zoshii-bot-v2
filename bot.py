@@ -3829,7 +3829,14 @@ def _try_handle_special_button(chat_id, user_id, display_name, text):
     menu-entry buttons (aliases intro, alias list, expenses intro,
     cooking-mode start, help) 1:1 with their old inline webhook() bodies.
     Returns True if `text` matched one of them (state already cleared/
-    updated, message already sent), False otherwise."""
+    updated, message already sent), False otherwise.
+
+    `text` is compared with variation selectors (U+FE0F/U+FE0E) stripped —
+    Telegram may send "🍽️ Що приготувати"/"ℹ️ Допомога" with or without one
+    depending on client/cache, and both must route identically. Only this
+    local comparison variable is normalized; nothing sent onward (messages,
+    Gemini calls) ever sees the stripped text."""
+    text = message_dispatcher.strip_variation_selectors(text)
     if text == "🧠 Назви товарів":
         waiting_for_ingredients.pop(chat_id, None)
         active_list_context[chat_id] = "aliases"
@@ -3859,14 +3866,14 @@ def _try_handle_special_button(chat_id, user_id, display_name, text):
         send_message(chat_id, EXPENSES_INTRO_TEXT, reply_markup=EXPENSES_KEYBOARD)
         return True
 
-    if text == "🍽️ Що приготувати":
+    if text == "🍽 Що приготувати":
         active_list_context.pop(chat_id, None)
         clear_shopping_state(chat_id)
         waiting_for_ingredients[chat_id] = True
         send_message(chat_id, "Напиши, які продукти зараз є вдома, і я запропоную кілька страв.")
         return True
 
-    if text == "ℹ️ Допомога":
+    if text == "ℹ Допомога":
         send_message(
             chat_id,
             "ℹ️ Як користуватися ботом:\n\n"
@@ -3908,7 +3915,15 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
     exact texts — even when the matching branch finds no pending state and
     only sends a "nothing to confirm" message, exactly like the old inline
     `return "ok"` did regardless of whether anything actually changed.
-    Returns False for any other text."""
+    Returns False for any other text.
+
+    `text` is compared with variation selectors (U+FE0F/U+FE0E) stripped —
+    Telegram may send a pencil/emoji button label with or without one
+    depending on client/cache (e.g. "✏️ Змінити список" vs "✏ Змінити
+    список"), and both must route identically. Only this local comparison
+    variable is normalized; nothing sent onward (messages, DB writes) ever
+    sees the stripped text."""
+    text = message_dispatcher.strip_variation_selectors(text)
     if text == "✅ Об'єднати":
         if chat_id in pending_merge:
             merge_data = pending_merge.pop(chat_id)
@@ -3975,7 +3990,7 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
                 send_message(chat_id, DB_ERROR_MSG)
         return True
 
-    if text == "✏️ Надіслати інший список":
+    if text == "✏ Надіслати інший список":
         if chat_id in pending_inventory_batch:
             pending_inventory_batch.pop(chat_id, None)
             inventory_mode[chat_id] = "adding"
@@ -4069,7 +4084,7 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
             send_message(chat_id, "Додавання товарів скасовано.", reply_markup=SHOPPING_KEYBOARD)
         return True
 
-    if text == "✏️ Виправити позицію":
+    if text == "✏ Виправити позицію":
         if chat_id in pending_batch:
             n = len(pending_batch[chat_id]["items"])
             shopping_mode[chat_id] = "editing_number"
@@ -4230,7 +4245,7 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         return True
 
-    if text == "✏️ Змінити список":
+    if text == "✏ Змінити список":
         if chat_id in pending_quick_purchase:
             pending_quick_purchase.pop(chat_id, None)
             saved_list_context[chat_id] = "shopping_saved"
@@ -4351,7 +4366,7 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
                 send_message(chat_id, INVENTORY_ERROR_MSG)
         return True
 
-    if text == "✏️ Змінити вибір":
+    if text == "✏ Змінити вибір":
         if chat_id in pending_mark_batch:
             mark_data = pending_mark_batch.pop(chat_id)
             try:

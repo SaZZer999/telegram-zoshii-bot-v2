@@ -588,5 +588,97 @@ class TestWebhookIntegration(unittest.TestCase):
         self.mock_gemini.assert_not_called()
 
 
+class TestVariationSelectorButtonHandling(unittest.TestCase):
+    """Telegram may send a button's label with or without the Unicode
+    variation selector U+FE0F ("🍽 Що приготувати" vs "🍽️ Що приготувати")
+    depending on client/cache — both forms must route identically. Covers
+    message_dispatcher.strip_variation_selectors and its two call sites,
+    bot.py's special-button route (_try_handle_special_button) and
+    confirm/cancel route (_try_handle_confirm_or_cancel), at the full
+    webhook level. Free text is never touched — only the local comparison
+    copy inside those two functions is normalized."""
+
+    def setUp(self):
+        legacy_shopping_flow.shopping_mode.clear()
+        legacy_inventory_flow.inventory_mode.clear()
+        bot.active_list_context.clear()
+        bot.saved_list_context.clear()
+        bot.waiting_for_ingredients.clear()
+        bot.pending_quick_purchase.clear()
+
+        patcher_send = patch.object(bot, "send_message")
+        self.mock_send = patcher_send.start()
+        self.addCleanup(patcher_send.stop)
+
+    def tearDown(self):
+        legacy_shopping_flow.shopping_mode.clear()
+        legacy_inventory_flow.inventory_mode.clear()
+        bot.active_list_context.clear()
+        bot.saved_list_context.clear()
+        bot.waiting_for_ingredients.clear()
+        bot.pending_quick_purchase.clear()
+
+    def test_strip_variation_selectors_removes_only_fe0f_and_fe0e(self):
+        self.assertEqual(
+            message_dispatcher.strip_variation_selectors("🍽️ Що приготувати"),
+            message_dispatcher.strip_variation_selectors("🍽 Що приготувати"),
+        )
+        # An apostrophe inside a word is never touched — only the two
+        # variation-selector codepoints are ever removed.
+        self.assertEqual(message_dispatcher.strip_variation_selectors("м'ясо"), "м'ясо")
+        self.assertIsNone(message_dispatcher.strip_variation_selectors(None))
+
+    def test_cooking_mode_button_without_variation_selector(self):
+        chat_id = 941001
+        _call_webhook(_make_update(chat_id, "🍽 Що приготувати"))
+        self.assertTrue(bot.waiting_for_ingredients.get(chat_id))
+
+    def test_cooking_mode_button_with_variation_selector_still_works(self):
+        chat_id = 941002
+        _call_webhook(_make_update(chat_id, "🍽️ Що приготувати"))
+        self.assertTrue(bot.waiting_for_ingredients.get(chat_id))
+
+    def test_help_button_without_variation_selector(self):
+        chat_id = 941003
+        _call_webhook(_make_update(chat_id, "ℹ Допомога"))
+        self.mock_send.assert_called_once()
+        sent_text = self.mock_send.call_args.args[1]
+        self.assertIn("Як користуватися ботом", sent_text)
+
+    def test_quick_purchase_change_list_button_without_variation_selector(self):
+        chat_id = 941004
+        bot.pending_quick_purchase[chat_id] = {
+            "items": [], "ignored_items": [], "household_id": 1, "user_db_id": 10,
+        }
+        _call_webhook(_make_update(chat_id, "✏ Змінити список"))
+        self.assertNotIn(chat_id, bot.pending_quick_purchase)
+        self.assertEqual(bot.saved_list_context.get(chat_id), "shopping_saved")
+
+    def test_saved_batch_resend_button_without_variation_selector(self):
+        chat_id = 941005
+        legacy_shopping_flow.pending_batch[chat_id] = {
+            "items": [], "ignored_items": [], "household_id": 1, "user_db_id": 10,
+        }
+        try:
+            _call_webhook(_make_update(chat_id, "✏ Надіслати інший список"))
+            self.assertNotIn(chat_id, legacy_shopping_flow.pending_batch)
+            self.assertEqual(legacy_shopping_flow.shopping_mode.get(chat_id), "adding")
+        finally:
+            legacy_shopping_flow.pending_batch.pop(chat_id, None)
+            legacy_shopping_flow.shopping_mode.pop(chat_id, None)
+
+    def test_plain_free_text_containing_emoji_is_never_stripped_before_ai_fallback(self):
+        # A normal chat message that happens to contain the fork-and-knife
+        # emoji with its own variation selector must reach general AI-chat
+        # completely unchanged — stripping only ever happens to the LOCAL
+        # comparison copy inside the special-button/confirm-cancel routes,
+        # never to text handed onward to Gemini.
+        chat_id = 941006
+        text = "Хочу зʼїсти щось смачне 🍽️ порадиш?"
+        with patch.object(bot, "_run_general_ai_fallback") as mock_fallback:
+            _call_webhook(_make_update(chat_id, text))
+            mock_fallback.assert_called_once_with(chat_id, text)
+
+
 if __name__ == "__main__":
     unittest.main()

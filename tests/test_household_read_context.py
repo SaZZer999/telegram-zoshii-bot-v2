@@ -520,17 +520,26 @@ class DispatcherPlacementTests(unittest.TestCase):
         self.assertEqual(outcome, message_dispatcher.RouteOutcome.HANDLED)
         saved_list_router.assert_called_once()
 
-    def test_write_command_intercepted_before_direct_household_read_is_ever_called(self):
-        direct_household_read = MagicMock()
+    def test_write_command_declines_direct_read_and_reaches_global_router(self):
+        # direct_household_read now runs BEFORE global_household_router (see
+        # message_dispatcher._dispatch_command_routes) so it IS invoked for
+        # every command-route message, including a write command — but its
+        # own deterministic parser (real function here, not a blind mock)
+        # never recognizes a write-shaped phrase like "Купив хліб за 10 zł",
+        # so it declines (False) and the Global Household Router still
+        # ends up handling the write, exactly as before this reordering.
+        household_read_deps = _make_deps()
+        global_household_router = MagicMock(return_value=True)
         deps = _make_dispatcher_deps(
-            _make_command_route_deps(global_household_router=MagicMock(return_value=True)),
-            direct_household_read=direct_household_read,
+            _make_command_route_deps(global_household_router=global_household_router),
+            direct_household_read=lambda *a, **kw: hrc.try_handle_direct_household_read(household_read_deps, *a, **kw),
         )
 
         outcome = message_dispatcher._dispatch_command_routes(deps, 1, 555, "Тест", "Купив хліб за 10 zł")
 
         self.assertEqual(outcome, message_dispatcher.RouteOutcome.HANDLED)
-        direct_household_read.assert_not_called()
+        global_household_router.assert_called_once()
+        household_read_deps.send_message.assert_not_called()
 
     def test_dispatcher_deps_without_direct_household_read_stays_compatible(self):
         saved_list_router = MagicMock(return_value=True)

@@ -282,5 +282,24 @@ class TestExistingConfirmCancelStillWork(RoutingContractTestCase):
         self.assertIn(action_history.UNDO_CANCELLED_MSG, self._sent_texts())
 
 
+class TestUndoButtonVariationSelector(RoutingContractTestCase):
+    """Telegram may send the undo button's label with or without its
+    Unicode variation selector (U+FE0F) depending on client/cache — "↩
+    Скасувати останню дію" must start the same undo flow as "↩️ Скасувати
+    останню дію"."""
+
+    def test_undo_button_without_variation_selector_starts_undo_flow(self):
+        chat_id = 9015
+        _call_webhook(_make_update(chat_id, chat_id, "↩ Скасувати останню дію"))
+        self.mock_get_latest_undoable.assert_called_once()
+        self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, self._sent_texts())
+
+    def test_undo_button_with_variation_selector_still_starts_undo_flow(self):
+        chat_id = 9016
+        _call_webhook(_make_update(chat_id, chat_id, action_history.UNDO_BUTTON_TEXT))
+        self.mock_get_latest_undoable.assert_called_once()
+        self.assertIn(action_history.NO_UNDOABLE_ACTION_MSG, self._sent_texts())
+
+
 if __name__ == "__main__":
     unittest.main()

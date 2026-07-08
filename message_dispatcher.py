@@ -35,18 +35,21 @@ V3B: the highest-priority route of all — the shared confirm/cancel button
     `dispatch(...)` call.
 Household Read Context V1: two read-only slots, both optional. A direct/
     deterministic-only slot (`DispatcherDeps.direct_household_read`) inside
-    `_dispatch_command_routes`, checked after every write/context route
-    (V2B) but STRICTLY before saved_list_router — so an explicit read-
-    question like "Що треба купити?" is answered even while a saved
-    shopping/inventory list context is open, never swallowed by the saved-
-    list router's own AI edit-parser. A second, fuller slot
+    `_dispatch_command_routes`, checked right after Global Bare Add v1 but
+    BEFORE the Global Household Router, every expense/alias route, and
+    saved_list_router — so an explicit read-question like "Що треба
+    купити?" is answered without ever reaching household_router.gate()
+    (whose own local regex, e.g. "треба купити", matches such questions as a
+    bare substring and would otherwise burn a real Gemini call and
+    sometimes claim the message itself) and without being swallowed by the
+    saved-list router's own AI edit-parser, even while a saved shopping/
+    inventory list context is open. A second, fuller slot
     (`DispatcherDeps.household_read`) in Phase D, tried after cooking mode
     and before the general AI fallback, covering non-standard phrasings via
     a local topic gate + Gemini classifier. Neither slot claims a message
     any earlier route (confirm/cancel, navigation, special buttons, menus,
-    modes, pending states, or any V2B command/context route above it)
-    already claimed, since all of those return before either slot is ever
-    reached.
+    modes, pending states, ambiguous-add/explicit-add/bare-add) already
+    claimed, since all of those return before either slot is ever reached.
 
 Route contract: `dispatch(...)` returns a `RouteOutcome` — kept for the
 pre-V3A test suite and for `_resolve_route_outcome`'s own internal
@@ -88,6 +91,25 @@ from typing import Callable
 import action_history
 import legacy_shopping_flow
 import legacy_inventory_flow
+
+# Unicode variation selectors a Telegram client may or may not append to an
+# emoji button label (U+FE0F requests emoji presentation, U+FE0E requests
+# text presentation) — "🍽 Що приготувати" and "🍽️ Що приготувати" must be
+# treated as the exact same button regardless of which one a given client
+# cache sent. Deliberately just these two codepoints, nothing else, and
+# deliberately for EXACT route/button comparisons only — never applied to
+# free text forwarded to Gemini or to any outgoing bot message.
+_VARIATION_SELECTORS = "︎️"
+
+
+def strip_variation_selectors(text):
+    """Remove U+FE0F/U+FE0E from `text`, nothing else. Safe to call on any
+    string (returns non-str input unchanged) — used only where a message is
+    about to be compared against a fixed button/route label, never on text
+    that continues on to Gemini or gets echoed back to the user."""
+    if not isinstance(text, str):
+        return text
+    return text.translate({ord(ch): None for ch in _VARIATION_SELECTORS})
 
 
 class RouteOutcome(enum.Enum):
@@ -201,12 +223,14 @@ class DispatcherDeps:
     household_read: Callable = None
     # Household Read Context V1 — direct/deterministic-only routing fix.
     # Thin lambda-forward to try_handle_direct_household_read (no topic
-    # gate, no Gemini). Checked inside _dispatch_command_routes, right
-    # before saved_list_router, so an explicit read-question like "Що
-    # треба купити?" is answered even while a saved shopping/inventory list
-    # context is open, instead of being swallowed by the saved-list
-    # router's own AI edit-parser. Optional for the same reason as every
-    # other field above.
+    # gate, no Gemini). Checked inside _dispatch_command_routes right after
+    # Global Bare Add v1 — BEFORE the Global Household Router (whose local
+    # gate matches a plain read-question like "Що треба купити?" as a bare
+    # substring) and before saved_list_router, so the question is answered
+    # deterministically instead of burning a Gemini call or being swallowed
+    # by the saved-list router's own AI edit-parser, even while a saved
+    # shopping/inventory list context is open. Optional for the same reason
+    # as every other field above.
     direct_household_read: Callable = None
 
 
@@ -375,11 +399,19 @@ def _dispatch_pending_routes(deps, chat_id, user_id, display_name, text):
         routes.continue_add_destination_clarification(chat_id, text)
         return RouteOutcome.HANDLED
 
-    if chat_id in routes.pending_undo_action or action_history.is_undo_command(text):
+    _undo_button_match = (
+        strip_variation_selectors(text or "").strip().lower()
+        == strip_variation_selectors(action_history.UNDO_BUTTON_TEXT).strip().lower()
+    )
+    if chat_id in routes.pending_undo_action or action_history.is_undo_command(text) or _undo_button_match:
         # Action History + Safe Undo v1 — while pending_undo_action is
         # already set, ANY other text here is intercepted too (never
         # replaces the pending undo, never touches the database, never
-        # calls Gemini).
+        # calls Gemini). The variation-selector-stripped comparison exists
+        # only because Telegram may send the undo button's label with or
+        # without U+FE0F depending on client/cache — action_history.
+        # is_undo_command(text) alone already covers the exact-label and
+        # natural-language-phrase cases.
         if chat_id in routes.pending_undo_action:
             deps.send_message(chat_id, action_history.PENDING_UNDO_MSG)
         else:
@@ -415,6 +447,20 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # Global Bare Add v1 — a bare "Додай молоко" with NO destination
         # phrase. Checked right after explicit add and ahead of the
         # household_router gate below.
+        return RouteOutcome.HANDLED
+
+    if deps.direct_household_read and deps.direct_household_read(chat_id, user_id, display_name, text):
+        # Household Read Context V1 — direct/deterministic read-questions
+        # only (no topic gate, no Gemini). Checked here, ahead of the Global
+        # Household Router, because household_router.gate()'s own local
+        # regex (e.g. "треба купити") matches plain read-questions like "Що
+        # треба купити?" as a bare substring and would otherwise burn a real
+        # Gemini call — and, worse, occasionally "claim" the message itself
+        # — before this deterministic, side-effect-free check ever ran. A
+        # narrow, regex-only match here can never misfire on a genuine write
+        # command (see household_read_context.py's own deterministic
+        # patterns), so moving it ahead of every remaining command/context
+        # route (including saved_list_router below) is safe.
         return RouteOutcome.HANDLED
 
     if routes.global_household_router(chat_id, user_id, display_name, text):
@@ -453,14 +499,6 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # Global expense command gate — fires from anywhere but never
         # overrides an active preview/confirm from ANY other flow, aliases
         # included (aliases has priority over a new expense command).
-        return RouteOutcome.HANDLED
-
-    if deps.direct_household_read and deps.direct_household_read(chat_id, user_id, display_name, text):
-        # Household Read Context V1 — direct/deterministic read-questions
-        # only (no topic gate, no Gemini). Checked after every write/
-        # context route above but STRICTLY before saved_list_router so an
-        # explicit "Що треба купити?" is answered even while a saved
-        # shopping/inventory list context is open.
         return RouteOutcome.HANDLED
 
     if routes.saved_list_router(chat_id, user_id, display_name, text):
