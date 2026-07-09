@@ -756,6 +756,27 @@ def get_expense_month_summary(household_id, year, month):
     return {"total": total, "by_category": by_category}
 
 
+def get_expense_day_total(household_id, day):
+    """Grand total (Decimal) of one household's expenses on exactly `day` (a
+    date object) — used by the Expenses Hub's "Сьогодні" line. A single-day
+    equivalent of get_expense_month_summary's grand total, kept separate
+    (rather than reusing that function with a same-day start/end range)
+    since the hub only ever needs the total, never a per-category
+    breakdown. Never crosses household_id. Returns Decimal("0") when there
+    are no expenses that day (there is no such thing as a stored zero-
+    amount expense, so this is the only way a zero total is ever returned).
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT SUM(amount) FROM expenses WHERE household_id = %s AND expense_date = %s",
+                (household_id, day)
+            )
+            row = cur.fetchone()
+    total = row[0] if row else None
+    return total if total is not None else Decimal("0")
+
+
 def delete_expense(household_id, expense_id, snapshot):
     """Delete exactly one expense row, but only after re-verifying inside
     this same transaction (row locked FOR UPDATE, so no concurrent write can

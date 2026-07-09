@@ -369,5 +369,28 @@ class TestReportsDoNotInterruptPendingPreview(unittest.TestCase):
         self.assertTrue(any("Витрат поки немає." in t for t in sent_texts))
 
 
+# =========================
+# Expenses Hub V1 — get_expense_day_total's SQL/parameterization layer
+# =========================
+class TestGetExpenseDayTotal(unittest.TestCase):
+    def test_sums_amount_as_exact_decimal_scoped_to_household_and_day(self):
+        cursor = FakeCursor(fetchone_results=[(Decimal("134.00"),)])
+        conn = FakeConnection(cursor)
+        with patch.object(real_database, "get_connection", return_value=conn):
+            total = real_database.get_expense_day_total(household_id=7, day=date(2026, 7, 3))
+        self.assertEqual(total, Decimal("134.00"))
+        self.assertIsInstance(total, Decimal)
+        sql, params = cursor.queries[-1]
+        self.assertIn("household_id = %s AND expense_date = %s", sql)
+        self.assertEqual(params, (7, date(2026, 7, 3)))
+
+    def test_no_expenses_that_day_returns_zero_not_none(self):
+        cursor = FakeCursor(fetchone_results=[(None,)])
+        conn = FakeConnection(cursor)
+        with patch.object(real_database, "get_connection", return_value=conn):
+            total = real_database.get_expense_day_total(household_id=1, day=date(2026, 7, 3))
+        self.assertEqual(total, Decimal("0"))
+
+
 if __name__ == "__main__":
     unittest.main()

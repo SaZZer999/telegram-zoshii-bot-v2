@@ -544,6 +544,36 @@ def _format_recent_expenses(expenses):
     return "\n".join(lines)
 
 
+def _format_expenses_hub(today_total, month_total, recent_expenses):
+    """Render the Expenses Hub V1 read-only dashboard shown by the "💸
+    Витрати" button — today's total, this month's total, and up to the 5
+    most recent expenses (already sorted newest-first by get_recent_
+    expenses's own ORDER BY), followed by the same add-expense examples
+    EXPENSES_INTRO_TEXT used to show alone. Pure formatter; `today_total`/
+    `month_total` are Decimals, `recent_expenses` is get_recent_expenses's
+    return shape (already limited to at most 5 by the caller)."""
+    lines = [
+        "💸 Витрати",
+        "",
+        f"Сьогодні: {_format_expense_amount(today_total)}",
+        f"Цього місяця: {_format_expense_amount(month_total)}",
+        "",
+    ]
+    if recent_expenses:
+        lines.append("Останні витрати:")
+        for i, exp in enumerate(recent_expenses, start=1):
+            label = exp["description"] or exp["category"]
+            lines.append(f"{i}. {label} — {_format_expense_amount(exp['amount'])}")
+    else:
+        lines.append("Останніх витрат ще немає.")
+    lines.append("")
+    lines.append("Щоб додати витрату, напиши, наприклад:")
+    lines.append("• Кава 14 zł")
+    lines.append("• Запиши 120 zł за інтернет")
+    lines.append("• Biedronka 86,40 zł — продукти")
+    return "\n".join(lines)
+
+
 def _format_expense_month_summary(summary, year, month):
     """Render the current-month category breakdown. `summary` comes from
     get_expense_month_summary: {"total": Decimal, "by_category": {category: Decimal}}.
@@ -616,6 +646,29 @@ def _handle_expense_report_command(chat_id, user_id, display_name, kind):
             _bot.send_message(chat_id, _format_expense_month_summary(summary, now.year, now.month), reply_markup=keyboard)
     except Exception:
         _bot.send_message(chat_id, "Не вдалося отримати витрати. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+
+
+def _handle_expenses_hub(chat_id, user_id, display_name):
+    """Expenses Hub V1 — the "💸 Витрати" button's response: a READ-ONLY
+    dashboard (today's total, this month's total, last 5 expenses) instead
+    of only the plain instructions EXPENSES_INTRO_TEXT used to show alone.
+    Never calls Gemini, never writes to the database — active_list_context/
+    pending-state clearing for the dedicated expenses submenu stays bot.py's
+    job (see bot.py's "💸 Витрати" branch), unchanged from before this
+    existed. Always sends EXPENSES_KEYBOARD, success or failure, so the
+    submenu's own navigation ("⬅️ Головне меню") is never lost.
+    """
+    try:
+        household_id, _ = _bot.get_household_and_user(user_id, display_name)
+        now = datetime.now(ZoneInfo("Europe/Warsaw"))
+        today_total = _bot.get_expense_day_total(household_id, now.date())
+        month_summary = _bot.get_expense_month_summary(household_id, now.year, now.month)
+        recent = _bot.get_recent_expenses(household_id, limit=5)
+        _bot.send_message(
+            chat_id, _format_expenses_hub(today_total, month_summary["total"], recent), reply_markup=EXPENSES_KEYBOARD,
+        )
+    except Exception:
+        _bot.send_message(chat_id, "Не вдалося показати витрати. Спробуй ще раз трохи пізніше.", reply_markup=EXPENSES_KEYBOARD)
 
 
 def _handle_expense_command(chat_id, user_id, display_name, text):

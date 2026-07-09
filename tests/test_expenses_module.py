@@ -121,6 +121,57 @@ class TestExpensesPureHelpers(unittest.TestCase):
         self.assertEqual(payload, ["щось"])
 
 
+class TestFormatExpensesHub(unittest.TestCase):
+    """Expenses Hub V1 — pure formatter for the "💸 Витрати" read-only
+    dashboard (today's total, this month's total, last 5 expenses, add-
+    expense examples)."""
+
+    def setUp(self):
+        import expenses
+        self.expenses = expenses
+
+    def _recent(self):
+        return [
+            {"description": "Інтернет", "category": "Дім і рахунки", "amount": Decimal("120.00")},
+            {"description": "Кава", "category": "Кафе / ресторани", "amount": Decimal("14.00")},
+            {"description": "", "category": "Продукти", "amount": Decimal("86.40")},
+        ]
+
+    def test_hub_shows_header_and_totals(self):
+        text = self.expenses._format_expenses_hub(Decimal("134.00"), Decimal("1240.00"), self._recent())
+        self.assertIn("💸 Витрати", text)
+        self.assertIn("Сьогодні: 134,00 zł", text)
+        self.assertIn("Цього місяця: 1240,00 zł", text)
+
+    def test_hub_lists_recent_expenses_newest_first_with_clean_labels(self):
+        text = self.expenses._format_expenses_hub(Decimal("220.40"), Decimal("220.40"), self._recent())
+        lines = text.splitlines()
+        self.assertIn("1. Інтернет — 120,00 zł", lines)
+        self.assertIn("2. Кава — 14,00 zł", lines)
+        # Falls back to category when description is blank — same
+        # convention _format_recent_expenses/_format_expense_delete_list use.
+        self.assertIn("3. Продукти — 86,40 zł", lines)
+        idx1 = lines.index("1. Інтернет — 120,00 zł")
+        idx2 = lines.index("2. Кава — 14,00 zł")
+        idx3 = lines.index("3. Продукти — 86,40 zł")
+        self.assertLess(idx1, idx2)
+        self.assertLess(idx2, idx3)
+
+    def test_hub_shows_add_expense_examples(self):
+        text = self.expenses._format_expenses_hub(Decimal("0"), Decimal("0"), [])
+        self.assertIn("Щоб додати витрату, напиши, наприклад:", text)
+        self.assertIn("Кава 14 zł", text)
+        self.assertIn("Запиши 120 zł за інтернет", text)
+        self.assertIn("Biedronka 86,40 zł — продукти", text)
+
+    def test_hub_handles_no_expenses_gracefully(self):
+        text = self.expenses._format_expenses_hub(Decimal("0"), Decimal("0"), [])
+        self.assertIn("Сьогодні: 0,00 zł", text)
+        self.assertIn("Цього місяця: 0,00 zł", text)
+        self.assertIn("Останніх витрат ще немає.", text)
+        self.assertNotIn("Останні витрати:", text)
+
+
 class TestCleanExpenseDescription(unittest.TestCase):
     """V1.4.2 live bug: Gemini sometimes returns the WHOLE raw command as
     the expense description instead of a clean name — _clean_expense_

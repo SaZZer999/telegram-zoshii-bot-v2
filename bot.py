@@ -46,6 +46,7 @@ from database import (
     add_expense,
     get_recent_expenses,
     get_expense_month_summary,
+    get_expense_day_total,
     get_recent_expenses_for_deletion,
     delete_expense,
     apply_global_household_operations,
@@ -2632,7 +2633,9 @@ _format_expense_date_display = expenses._format_expense_date_display
 _format_expense_preview = expenses._format_expense_preview
 _format_recent_expenses = expenses._format_recent_expenses
 _format_expense_month_summary = expenses._format_expense_month_summary
+_format_expenses_hub = expenses._format_expenses_hub
 _handle_expense_report_command = expenses._handle_expense_report_command
+_handle_expenses_hub = expenses._handle_expenses_hub
 _handle_expense_command = expenses._handle_expense_command
 _format_expense_delete_list = expenses._format_expense_delete_list
 _format_expense_delete_preview = expenses._format_expense_delete_preview
@@ -4583,7 +4586,7 @@ def _try_handle_special_button(chat_id, user_id, display_name, text):
         clear_shopping_state(chat_id)
         clear_inventory_state(chat_id)
         clear_expense_state(chat_id)
-        send_message(chat_id, EXPENSES_INTRO_TEXT, reply_markup=EXPENSES_KEYBOARD)
+        _handle_expenses_hub(chat_id, user_id, display_name)
         return True
 
     if text == "🍽 Що приготувати":

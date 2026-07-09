@@ -518,6 +518,148 @@ class TestExpenseDescriptionCleaningWebhookFlow(unittest.TestCase):
 
 
 # =========================
+# Expenses Hub V1 — "💸 Витрати" read-only dashboard
+# =========================
+class TestExpensesHubWebhookFlow(unittest.TestCase):
+    """Full webhook() dispatch for the "💸 Витрати" button — everything
+    network/DB-facing patched. Does NOT subclass TestExpenseWebhookFlow (see
+    that class's own V1.4.2 sibling's docstring for why): unittest would
+    re-run its inherited tests here too, reusing the same hardcoded chat_id/
+    update_id pairs and tripping bot.py's process-wide update_id dedup
+    cache."""
+
+    def setUp(self):
+        patcher_get_user = patch.object(bot, "get_household_and_user", return_value=(1, 10))
+        self.mock_get_user = patcher_get_user.start()
+        self.addCleanup(patcher_get_user.stop)
+
+        patcher_send = patch.object(bot, "send_message")
+        self.mock_send = patcher_send.start()
+        self.addCleanup(patcher_send.stop)
+
+        patcher_gemini_chat = patch.object(bot, "call_gemini")
+        self.mock_call_gemini = patcher_gemini_chat.start()
+        self.addCleanup(patcher_gemini_chat.stop)
+
+        patcher_add = patch.object(bot, "add_expense")
+        self.mock_add_expense = patcher_add.start()
+        self.addCleanup(patcher_add.stop)
+
+    def tearDown(self):
+        for d in (bot.pending_expense, bot.active_list_context):
+            d.clear()
+
+    def _sent_texts(self):
+        return [call.args[1] for call in self.mock_send.call_args_list]
+
+    def _reply_markups(self):
+        return [call.kwargs.get("reply_markup") for call in self.mock_send.call_args_list]
+
+    def _recent(self):
+        return [
+            {"description": "Інтернет", "category": "Дім і рахунки", "amount": Decimal("120.00")},
+            {"description": "Кава", "category": "Кафе / ресторани", "amount": Decimal("14.00")},
+            {"description": "Biedronka", "category": "Продукти", "amount": Decimal("86.40")},
+        ]
+
+    # 1. Shows the hub, not only the plain instructions.
+    def test_expenses_button_shows_hub_not_only_instructions(self):
+        chat_id = 942101
+        with patch.object(bot, "get_expense_day_total", return_value=Decimal("134.00")), \
+             patch.object(bot, "get_expense_month_summary", return_value={"total": Decimal("1240.00"), "by_category": {}}), \
+             patch.object(bot, "get_recent_expenses", return_value=self._recent()):
+            _call_webhook(_make_update(942100001, chat_id, "💸 Витрати"))
+        texts = self._sent_texts()
+        self.assertTrue(any("💸 Витрати" in t and "Останні витрати:" in t for t in texts))
+        self.assertFalse(any(t == bot.EXPENSES_INTRO_TEXT for t in texts))
+
+    # 2/3. Today total and month total both present.
+    def test_hub_includes_today_and_month_totals(self):
+        chat_id = 942102
+        with patch.object(bot, "get_expense_day_total", return_value=Decimal("134.00")), \
+             patch.object(bot, "get_expense_month_summary", return_value={"total": Decimal("1240.00"), "by_category": {}}), \
+             patch.object(bot, "get_recent_expenses", return_value=[]):
+            _call_webhook(_make_update(942100002, chat_id, "💸 Витрати"))
+        texts = self._sent_texts()
+        self.assertTrue(any("Сьогодні: 134,00 zł" in t for t in texts))
+        self.assertTrue(any("Цього місяця: 1240,00 zł" in t for t in texts))
+
+    # 4. Last 5 expenses requested, newest first (get_recent_expenses's own
+    # ordering — the hub only asks for limit=5, never more).
+    def test_hub_requests_last_five_expenses(self):
+        chat_id = 942103
+        with patch.object(bot, "get_expense_day_total", return_value=Decimal("0")), \
+             patch.object(bot, "get_expense_month_summary", return_value={"total": Decimal("0"), "by_category": {}}), \
+             patch.object(bot, "get_recent_expenses", return_value=self._recent()) as mock_recent:
+            _call_webhook(_make_update(942100003, chat_id, "💸 Витрати"))
+        mock_recent.assert_called_once_with(1, limit=5)
+        texts = self._sent_texts()
+        self.assertTrue(any("1. Інтернет — 120,00 zł" in t and "2. Кава — 14,00 zł" in t for t in texts))
+
+    # 5. No expenses yet — graceful message, no crash.
+    def test_hub_handles_no_expenses_gracefully(self):
+        chat_id = 942104
+        with patch.object(bot, "get_expense_day_total", return_value=Decimal("0")), \
+             patch.object(bot, "get_expense_month_summary", return_value={"total": Decimal("0"), "by_category": {}}), \
+             patch.object(bot, "get_recent_expenses", return_value=[]):
+            _call_webhook(_make_update(942100004, chat_id, "💸 Витрати"))
+        texts = self._sent_texts()
+        self.assertTrue(any("Останніх витрат ще немає." in t for t in texts))
+
+    # 6. Keeps the expenses submenu keyboard (navigation never lost).
+    def test_hub_keeps_expenses_keyboard(self):
+        chat_id = 942105
+        with patch.object(bot, "get_expense_day_total", return_value=Decimal("0")), \
+             patch.object(bot, "get_expense_month_summary", return_value={"total": Decimal("0"), "by_category": {}}), \
+             patch.object(bot, "get_recent_expenses", return_value=[]):
+            _call_webhook(_make_update(942100005, chat_id, "💸 Витрати"))
+        self.assertIn(bot.EXPENSES_KEYBOARD, self._reply_markups())
+
+    # 7. Never calls Gemini just to render the hub.
+    def test_hub_never_calls_gemini(self):
+        chat_id = 942106
+        with patch.object(bot, "get_expense_day_total", return_value=Decimal("0")), \
+             patch.object(bot, "get_expense_month_summary", return_value={"total": Decimal("0"), "by_category": {}}), \
+             patch.object(bot, "get_recent_expenses", return_value=[]):
+            _call_webhook(_make_update(942100006, chat_id, "💸 Витрати"))
+        self.mock_call_gemini.assert_not_called()
+
+    # 8. Never writes to the DB.
+    def test_hub_never_writes_to_db(self):
+        chat_id = 942107
+        with patch.object(bot, "get_expense_day_total", return_value=Decimal("0")), \
+             patch.object(bot, "get_expense_month_summary", return_value={"total": Decimal("0"), "by_category": {}}), \
+             patch.object(bot, "get_recent_expenses", return_value=[]):
+            _call_webhook(_make_update(942100007, chat_id, "💸 Витрати"))
+        self.mock_add_expense.assert_not_called()
+        self.assertNotIn(chat_id, bot.pending_expense)
+
+    # 12. DB read failure -> controlled Ukrainian message, not a raw
+    # exception/crash.
+    def test_hub_db_failure_shows_controlled_message(self):
+        chat_id = 942108
+        with patch.object(bot, "get_expense_day_total", side_effect=Exception("boom")):
+            _call_webhook(_make_update(942100008, chat_id, "💸 Витрати"))
+        texts = self._sent_texts()
+        self.assertTrue(any("Не вдалося показати витрати" in t for t in texts))
+        self.assertIn(bot.EXPENSES_KEYBOARD, self._reply_markups())
+
+    # Regression: expense add flow still works from inside the expenses
+    # submenu after viewing the hub.
+    def test_expense_add_still_works_after_viewing_hub(self):
+        chat_id = 942109
+        with patch.object(bot, "get_expense_day_total", return_value=Decimal("0")), \
+             patch.object(bot, "get_expense_month_summary", return_value={"total": Decimal("0"), "by_category": {}}), \
+             patch.object(bot, "get_recent_expenses", return_value=[]):
+            _call_webhook(_make_update(942100009, chat_id, "💸 Витрати"))
+        self.mock_send.reset_mock()
+        with patch.object(bot, "_ask_gemini_expense_router", return_value=_ok_router_result(description="Кава", amount="14")):
+            _call_webhook(_make_update(942100010, chat_id, "Кава 14 zł"))
+        self.assertIn(chat_id, bot.pending_expense)
+        self.assertEqual(bot.pending_expense[chat_id]["description"], "Кава")
+
+
+# =========================
 # 13 — household isolation at the SQL layer
 # =========================
 class FakeCursor:
