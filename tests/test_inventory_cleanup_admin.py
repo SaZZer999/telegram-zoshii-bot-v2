@@ -145,6 +145,11 @@ class TestParseInventoryRenameRequest(unittest.TestCase):
     def test_zminy_nazvu(self):
         self.assertEqual(inventory.parse_inventory_rename_request("зміни назву mlekо на молоко"), ("mlekо", "молоко"))
 
+    # Unified Household AI Action Planner V1 — "заміни X на Y" is a common
+    # colloquial rename phrasing that wasn't in the original trigger list.
+    def test_zamin_ser_na_syr(self):
+        self.assertEqual(inventory.parse_inventory_rename_request("заміни ser на сир"), ("ser", "сир"))
+
     def test_not_a_rename_phrase_returns_none(self):
         self.assertEqual(inventory.parse_inventory_rename_request("Купив молоко"), (None, None))
 
@@ -497,6 +502,20 @@ class TestRenamePreview(InventoryAdminWebhookTestCase):
         self.assertTrue(any("mlekо — 1 шт. → Молоко — 1 шт." in t for t in texts))
         self.assertFalse(any("не хочу вгадувати" in t for t in texts))
         self.assertFalse(any("11,5 л" in t for t in texts))
+
+    # Unified Household AI Action Planner V1 — "заміни ser на сир" creates
+    # the same rename preview as "перейменуй ser на сир" via the existing
+    # safe deterministic flow (no new write path).
+    def test_zamin_ser_na_syr_creates_rename_preview(self):
+        chat_id = 771009
+        with patch.object(bot, "get_inventory_items", return_value=[_cheese_dirty_row()]):
+            _call_webhook(_make_update(771000009, chat_id, "заміни ser на сир"))
+        self.assertIn(chat_id, pending_cleanup_admin)
+        entry = pending_cleanup_admin[chat_id]
+        self.assertEqual(entry["action"], "rename")
+        self.assertEqual(entry["new_name"], "Сир")
+        texts = self._sent_texts()
+        self.assertTrue(any("ser — 1 шт. → Сир — 1 шт." in t for t in texts))
 
     # 5. "перейменуй ser на сир" works the same way.
     def test_rename_ser_na_syr(self):

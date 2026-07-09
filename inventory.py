@@ -1042,7 +1042,7 @@ def format_inventory_cleanup_preview(validated_groups, incompatible_rows, effect
 # name matching — no second alias table.
 # =========================
 _RENAME_TRIGGER_RE = re.compile(
-    r"^(?:перейменуй|виправ|зміни\s+назву)\s+(?P<old>.+?)\s+на\s+(?P<new>.+)$",
+    r"^(?:перейменуй|виправ|зміни\s+назву|заміни)\s+(?P<old>.+?)\s+на\s+(?P<new>.+)$",
     re.IGNORECASE,
 )
 _ADMIN_LOCATION_SUFFIX_RE = re.compile(r"\s*(?:із|з|в|у)\s+запас\w*\.?\s*$", re.IGNORECASE)
@@ -1173,6 +1173,80 @@ def _normalize_numeric_quantity_hint(text):
     if value is None:
         return text
     return format_quantity_display(value, unit)
+
+
+# =========================
+# INVENTORY TRANSFORM V1 — deterministic, lossy combine of TWO OR MORE
+# existing inventory rows into ONE new named record ("об'єднай сосиски і
+# мисливські ковбаски в м'ясні вироби", "перетвори молоко та вершки на
+# молочну суміш"). Same "no Gemini, no fuzzy NLP" posture as rename/delete
+# above — the trigger phrase and the source/target split are both pure regex,
+# never guessed. Unlike Inventory Cleanup / Merge v1.1 (which only merges
+# multiple rows that already share ONE canonical product), this deliberately
+# collapses DIFFERENT products into a new general record — always shown with
+# an explicit "lossy" warning before it can be confirmed (see bot.py's
+# _start_inventory_transform), since the original per-product rows are gone
+# afterwards. Pure text-classification only, no Gemini, no DB — bot.py
+# resolves each source phrase against the live inventory snapshot (reusing
+# resolve_inventory_admin_candidates, exactly like rename/delete) and calls
+# the write via database.execute_inventory_transform (same StaleSnapshotError/
+# journal-undo contract as execute_inventory_cleanup_merge).
+# =========================
+_TRANSFORM_TRIGGER_RE = re.compile(
+    r"^(?:об['’]?єднай(?:те)?|об['’]?єднати|перетвори(?:ти)?)\s+(?P<sources>.+?)\s+(?:в|у|на)\s+(?P<target>.+)$",
+    re.IGNORECASE,
+)
+_TRANSFORM_SOURCE_SPLIT_RE = re.compile(r"\s*,\s*|\s+(?:та|і|й)\s+", re.IGNORECASE)
+
+
+def parse_inventory_transform_request(text):
+    """Deterministically detect a transform/combine request ("об'єднай X і Y
+    в Z", "об'єднати X, Y та Z у W", "перетвори X на Y"), splitting the
+    source phrase list on commas and "та"/"і"/"й".
+
+    Returns (source_phrases, target_phrase) — source_phrases is a list of 2+
+    raw name fragments (never yet resolved against live inventory), target_
+    phrase is the raw new record name — or (None, None) if `text` doesn't
+    match this shape at all, or fewer than two source phrases were found
+    (a single-source "transform" has no lossy-combine meaning here and is
+    left for the caller's other routes, e.g. rename, to consider instead).
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return None, None
+    match = _TRANSFORM_TRIGGER_RE.match(stripped)
+    if not match:
+        return None, None
+    target_phrase = match.group("target").strip().rstrip(".!?").strip()
+    if not target_phrase:
+        return None, None
+    source_phrases = [
+        p.strip() for p in _TRANSFORM_SOURCE_SPLIT_RE.split(match.group("sources").strip()) if p.strip()
+    ]
+    if len(source_phrases) < 2:
+        return None, None
+    return source_phrases, target_phrase
+
+
+def format_inventory_transform_preview(source_rows, effective_quantity, target_name, target_quantity_text):
+    """Render the Inventory Transform V1 preview — every source row removed,
+    the new target record added, plus a fixed warning that different
+    products are being collapsed into one general record (always shown here,
+    never conditional, since Inventory Transform V1 only ever runs for a
+    genuine multi-source combine)."""
+    lines = ["План змін:", "", "🧊 Запаси"]
+    for row in source_rows:
+        qty = effective_quantity(row)[2]
+        label = row["name"] + (f" — {qty}" if qty else "")
+        lines.append(f"• Прибрати {label}")
+    target_label = target_name + (f" — {target_quantity_text}" if target_quantity_text else "")
+    lines.append(f"• Додати {target_label}")
+    lines.append("")
+    lines.append(
+        f"⚠️ Це об'єднає різні продукти в один загальний запис. Після цього бот не буде знати, "
+        f"що окремо були " + ", ".join(f"«{row['name']}»" for row in source_rows) + "."
+    )
+    return "\n".join(lines)
 
 
 def find_inventory_admin_exact_name_matches(inventory_items, name_phrase, name_normalizer):

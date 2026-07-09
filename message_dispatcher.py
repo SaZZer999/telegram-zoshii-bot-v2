@@ -244,6 +244,13 @@ class CommandRouteDeps:
     # and would otherwise also match "прибери дублікати молока") — see
     # inventory.parse_inventory_delete_request's docstring.
     inventory_admin_route: Callable = None
+    # Inventory Transform V1 — optional (default None), same reasoning as
+    # inventory_cleanup_route/inventory_admin_route above. Checked right
+    # after inventory_admin_route: a deterministic "об'єднай X і Y в Z"
+    # lossy-combine request always wins over saved_list_router's own broad
+    # AI edit-parser, even while a saved shopping/inventory list context is
+    # open, but never overrides any higher-priority write route above it.
+    inventory_transform_route: Callable = None
     # Destructive Bulk Household Request Guard v1 — optional (default None),
     # same reasoning as every other Optional field above. Checked FIRST in
     # this slice: a bare "Видали все"/"Очисти запаси" names no specific
@@ -621,6 +628,19 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # Global expense command gate — fires from anywhere but never
         # overrides an active preview/confirm from ANY other flow, aliases
         # included (aliases has priority over a new expense command).
+        return RouteOutcome.HANDLED
+
+    if routes.inventory_transform_route is not None and routes.inventory_transform_route(chat_id, user_id, display_name, text):
+        # Inventory Transform V1 — narrow, deterministic local gate (no
+        # Gemini) for "об'єднай X і Y в Z"/"перетвори X на Y" style lossy-
+        # combine requests. Checked BEFORE inventory_cleanup_route: that
+        # route's own "об'єднай <phrase>" trigger is broader (single-product
+        # duplicate merge) and would otherwise swallow this more specific
+        # two-or-more-source-with-a-target shape as one giant, never-found
+        # product phrase — see inventory.parse_inventory_transform_request's
+        # own "single source -> None" fallback for why a genuine single-
+        # product "об'єднай молоко в запасах" still falls through to
+        # inventory_cleanup_route unaffected.
         return RouteOutcome.HANDLED
 
     if routes.inventory_cleanup_route is not None and routes.inventory_cleanup_route(chat_id, user_id, display_name, text):

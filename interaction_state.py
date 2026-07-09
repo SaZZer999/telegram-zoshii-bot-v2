@@ -70,6 +70,9 @@ class InteractionStateDeps:
     # Destructive Bulk Household Request Guard v1.4 — awaiting a follow-up
     # reply to the guard's own "покупки чи запаси?" question.
     pending_destructive_guard: dict
+    # Inventory Transform V1 — awaiting confirm/cancel on a lossy combine of
+    # 2+ existing inventory rows into ONE new record.
+    pending_inventory_transform: dict
     pending_undo_action: dict
     # bot.py-owned shared context dicts
     active_list_context: dict
@@ -126,6 +129,11 @@ def _alias_gate_blocking_states(deps):
         # other gate/flow may start a new preview, touch the database, or
         # reach general AI-chat.
         deps.pending_cleanup_admin_disambiguation,
+        # Inventory Transform V1's own combine preview — same reasoning:
+        # while a "✅ Так, застосувати"/"❌ Скасувати" decision is pending, no
+        # other gate/flow may start a new preview, touch the database, or
+        # reach general AI-chat.
+        deps.pending_inventory_transform,
     )
 
 
@@ -264,6 +272,7 @@ def clear_interaction_state(deps, chat_id):
     deps.pending_add_destination_clarification.pop(chat_id, None)
     deps.pending_cleanup_admin_disambiguation.pop(chat_id, None)
     deps.pending_destructive_guard.pop(chat_id, None)
+    deps.pending_inventory_transform.pop(chat_id, None)
     deps.pending_undo_action.pop(chat_id, None)
 
 

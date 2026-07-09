@@ -31,6 +31,7 @@ from database import (
     execute_inventory_cleanup_merge,
     execute_inventory_rename,
     execute_inventory_delete,
+    execute_inventory_transform,
     update_shopping_items_batch,
     update_inventory_items_batch,
     save_list_context,
@@ -183,6 +184,18 @@ pending_cleanup_admin = {}   # chat_id -> {action: "rename"|"delete", household_
 # instead of ever falling through to general AI-chat.
 pending_cleanup_admin_disambiguation = {}  # chat_id -> {action: "rename"|"delete", candidates: [row, ...],
                               #             new_phrase (rename only, raw), household_id, user_db_id, origin}
+# Inventory Transform V1 — awaiting confirm/cancel on a lossy combine of 2+
+# existing inventory rows into ONE new record (see household_router-adjacent
+# route _route_inventory_transform / inventory.parse_inventory_transform_
+# request). Same "✅ Так, застосувати"/"❌ Скасувати" button pair and
+# journal/undo path as pending_cleanup_admin (database.
+# execute_inventory_transform) — a SEPARATE dict for the same reason
+# pending_cleanup_admin is separate from pending_global_household: this
+# payload shape (source ids + one target record) has nothing in common with
+# either of those.
+pending_inventory_transform = {}  # chat_id -> {household_id, user_db_id, origin, source_item_ids, targets,
+                              #             target_name, target_canonical_name, target_category,
+                              #             target_quantity_value, target_quantity_unit, target_quantity_text}
 # Destructive Bulk Household Request Guard v1 — awaiting a follow-up reply
 # to the guard's own "покупки чи запаси?" clarification (see
 # _route_destructive_bulk_guard). Deliberately tiny/ephemeral: no household_
@@ -300,6 +313,7 @@ def _has_active_pending_clarification_or_preview(chat_id):
         or chat_id in pending_cleanup_admin
         or chat_id in pending_cleanup_admin_disambiguation
         or chat_id in pending_destructive_guard
+        or chat_id in pending_inventory_transform
     )
 
 
@@ -346,6 +360,9 @@ def _cancel_active_pending_operation(chat_id):
         keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
     elif chat_id in pending_cleanup_admin_disambiguation:
         data = pending_cleanup_admin_disambiguation.pop(chat_id, None)
+        keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
+    elif chat_id in pending_inventory_transform:
+        data = pending_inventory_transform.pop(chat_id, None)
         keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
     else:
         keyboard = MAIN_KEYBOARD
@@ -3077,6 +3094,141 @@ def _apply_cleanup_admin_confirm(chat_id):
         send_message(chat_id, "Не вдалося застосувати зміни. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
 
 
+# =========================
+# INVENTORY TRANSFORM V1 — deterministic, lossy combine of 2+ existing
+# inventory rows into ONE new record ("об'єднай сосиски і мисливські
+# ковбаски в м'ясні вироби"). Global-scope route (works regardless of which
+# menu is open, same reasoning as _route_inventory_admin), checked right
+# after it. Reuses pending_inventory_transform (preview/confirm/cancel) +
+# database.execute_inventory_transform (stale-protected, journal-recorded
+# exactly like execute_inventory_cleanup_merge/execute_inventory_rename —
+# same undo path, no new one) — no DB write happens before an explicit
+# "✅ Так, застосувати" confirm. Ambiguous source names or incompatible
+# quantities are never guessed at: a clarification message is sent instead
+# and nothing is stored, so the user simply retypes a more precise command.
+# =========================
+def _start_inventory_transform(chat_id, user_id, display_name, source_phrases, target_phrase):
+    origin = household_router.current_origin(chat_id)
+    if _has_blocking_pending_state_for_reports(chat_id):
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        items = get_inventory_items(household_id)
+    except Exception:
+        send_message(chat_id, INVENTORY_ERROR_MSG)
+        return
+
+    resolved_rows = []
+    seen_ids = set()
+    for phrase in source_phrases:
+        candidates = _resolve_inventory_admin_candidates(chat_id, household_id, items, phrase, None)
+        if not candidates:
+            send_message(chat_id, f"Не знайшов у запасах «{phrase.strip()}».", reply_markup=INVENTORY_KEYBOARD)
+            return
+        if len(candidates) > 1:
+            send_message(
+                chat_id, inventory.format_inventory_admin_ambiguous_message(candidates, _effective_quantity),
+                reply_markup=INVENTORY_KEYBOARD,
+            )
+            return
+        row = candidates[0]
+        if row["id"] in seen_ids:
+            continue
+        seen_ids.add(row["id"])
+        resolved_rows.append(row)
+
+    if len(resolved_rows) < 2:
+        send_message(
+            chat_id, "Треба щонайменше два різні записи запасів, щоб об'єднати.", reply_markup=INVENTORY_KEYBOARD,
+        )
+        return
+
+    total_value = resolved_rows[0].get("quantity_value")
+    total_unit = resolved_rows[0].get("quantity_unit")
+    if total_value is None or total_unit is None:
+        send_message(
+            chat_id, "Не можу безпечно визначити кількість для об'єднання — уточни кількість вручну.",
+            reply_markup=INVENTORY_KEYBOARD,
+        )
+        return
+    for row in resolved_rows[1:]:
+        row_value = row.get("quantity_value")
+        row_unit = row.get("quantity_unit")
+        if row_value is None or row_unit is None:
+            send_message(
+                chat_id, "Не можу безпечно визначити кількість для об'єднання — уточни кількість вручну.",
+                reply_markup=INVENTORY_KEYBOARD,
+            )
+            return
+        merged = merge_quantity_values(total_value, total_unit, row_value, row_unit)
+        if merged is None:
+            send_message(
+                chat_id, "Одиниці вимірювання цих записів несумісні — не можу безпечно об'єднати.",
+                reply_markup=INVENTORY_KEYBOARD,
+            )
+            return
+        total_value, total_unit = merged
+
+    target_name = inventory.capitalize_first(target_phrase)
+    target_canonical_name = canonicalize_name(target_name)
+    target_category = resolved_rows[0].get("category") or DEFAULT_CATEGORY
+    target_quantity_text = format_quantity_display(total_value, total_unit)
+
+    targets = [
+        {
+            "item_id": row["id"], "quantity_value": row.get("quantity_value"), "quantity_unit": row.get("quantity_unit"),
+            "canonical_name": row.get("canonical_name"), "category": row.get("category") or DEFAULT_CATEGORY,
+        }
+        for row in resolved_rows
+    ]
+    pending_inventory_transform[chat_id] = {
+        "household_id": household_id, "user_db_id": user_db_id, "origin": origin,
+        "source_item_ids": [row["id"] for row in resolved_rows],
+        "targets": targets,
+        "target_name": target_name, "target_canonical_name": target_canonical_name,
+        "target_category": target_category,
+        "target_quantity_value": total_value, "target_quantity_unit": total_unit,
+        "target_quantity_text": target_quantity_text,
+    }
+    preview = inventory.format_inventory_transform_preview(
+        resolved_rows, _effective_quantity, target_name, target_quantity_text,
+    )
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+
+
+def _route_inventory_transform(chat_id, user_id, display_name, text):
+    source_phrases, target_phrase = inventory.parse_inventory_transform_request(text)
+    if source_phrases is None:
+        return False
+    _start_inventory_transform(chat_id, user_id, display_name, source_phrases, target_phrase)
+    return True
+
+
+def _apply_inventory_transform_confirm(chat_id):
+    """"✅ Так, застосувати" button for a pending_inventory_transform preview.
+    Pops the pending action BEFORE the database call, same duplicate-press
+    protection as _apply_cleanup_admin_confirm."""
+    if chat_id not in pending_inventory_transform:
+        send_message(chat_id, "Немає активної дії для підтвердження.")
+        return
+    data = pending_inventory_transform.pop(chat_id)
+    origin = data.get("origin", "global")
+    keyboard = household_router.origin_keyboard(origin)
+    try:
+        execute_inventory_transform(
+            data["household_id"], data["user_db_id"], data["source_item_ids"],
+            data["target_name"], data["target_canonical_name"], data["target_category"],
+            data["target_quantity_value"], data["target_quantity_unit"], data["target_quantity_text"],
+            data["targets"],
+        )
+        send_message(chat_id, "✅ Зміни застосовано.", reply_markup=keyboard)
+    except StaleSnapshotError:
+        send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=keyboard)
+    except Exception:
+        send_message(chat_id, "Не вдалося застосувати зміни. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+
+
 # _should_restore_persisted_context's real logic now lives in
 # interaction_state.py (called via _interaction_state_deps); thin
 # compatibility wrapper, same reasoning as the cleanup/guard wrappers above.
@@ -3970,6 +4122,7 @@ _interaction_state_deps = interaction_state.InteractionStateDeps(
     pending_cleanup_admin=pending_cleanup_admin,
     pending_cleanup_admin_disambiguation=pending_cleanup_admin_disambiguation,
     pending_destructive_guard=pending_destructive_guard,
+    pending_inventory_transform=pending_inventory_transform,
     pending_undo_action=pending_undo_action,
     active_list_context=active_list_context,
     saved_list_context=saved_list_context,
@@ -4815,6 +4968,10 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
             data = pending_cleanup_admin_disambiguation.pop(chat_id, None)
             origin = (data or {}).get("origin", "global")
             send_message(chat_id, "Зміни скасовано.", reply_markup=household_router.origin_keyboard(origin))
+        elif chat_id in pending_inventory_transform:
+            data = pending_inventory_transform.pop(chat_id, None)
+            origin = (data or {}).get("origin", "global")
+            send_message(chat_id, "Зміни скасовано.", reply_markup=household_router.origin_keyboard(origin))
         elif chat_id in pending_destructive_guard:
             data = pending_destructive_guard.pop(chat_id, None)
             origin = (data or {}).get("origin", "global")
@@ -4955,6 +5112,8 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
     if text == "✅ Так, застосувати":
         if chat_id in pending_cleanup_admin:
             _apply_cleanup_admin_confirm(chat_id)
+        elif chat_id in pending_inventory_transform:
+            _apply_inventory_transform_confirm(chat_id)
         else:
             _apply_global_household_confirm(chat_id)
         return True
@@ -5168,6 +5327,7 @@ _command_route_deps = message_dispatcher.CommandRouteDeps(
     global_expense_command=lambda *a, **kw: _route_global_expense_command(*a, **kw),
     inventory_cleanup_route=lambda *a, **kw: _route_inventory_cleanup(*a, **kw),
     inventory_admin_route=lambda *a, **kw: _route_inventory_admin(*a, **kw),
+    inventory_transform_route=lambda *a, **kw: _route_inventory_transform(*a, **kw),
     destructive_bulk_guard=lambda *a, **kw: _route_destructive_bulk_guard(*a, **kw),
     saved_list_router=lambda *a, **kw: _route_saved_list_router(*a, **kw),
     general_ai_fallback=lambda *a, **kw: _run_general_ai_fallback(*a, **kw),

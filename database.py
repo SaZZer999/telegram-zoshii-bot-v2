@@ -2364,3 +2364,76 @@ def execute_inventory_delete(household_id, actor_user_id, item_id, target):
             )
         conn.commit()
     return True
+
+
+def execute_inventory_transform(household_id, actor_user_id, source_item_ids, target_name, target_canonical_name,
+                                 target_category, target_quantity_value, target_quantity_unit, target_quantity_text,
+                                 targets):
+    """Inventory Transform V1 — lossy combine of 2+ existing inventory rows
+    (possibly different products) into ONE new record: every source row is
+    deleted, one target row is merged-or-inserted via the same
+    _merge_or_insert_inventory_in_tx helper add_inventory_items_batch already
+    uses. Stale-protected and journal-recorded exactly like
+    execute_inventory_cleanup_merge/execute_inventory_rename (same
+    operation_type 'global_household', same {"inventory_buckets": {...}}
+    snapshot shape, so apply_undo_action's existing generic bucket-restore
+    needs no new undo code here either).
+
+    targets: snapshot of {item_id, quantity_value, quantity_unit,
+    canonical_name, category} for every source row, captured when the
+    preview was built — re-verified (locked FOR UPDATE) inside this
+    transaction before anything is written; raises StaleSnapshotError if any
+    source row vanished or its quantity/canonical_name/category changed
+    since the preview was shown.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, targets,
+                                   extra_fields=("canonical_name", "category"))
+
+            source_canonical_names = {t["canonical_name"] for t in targets}
+            canonical_names = sorted(source_canonical_names | {target_canonical_name})
+            before_buckets = {
+                cname: _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, cname, lock=True)
+                for cname in canonical_names
+            }
+
+            placeholders = ",".join(["%s"] * len(source_item_ids))
+            cur.execute(
+                f"DELETE FROM inventory_items WHERE id IN ({placeholders}) AND household_id=%s",
+                list(source_item_ids) + [household_id]
+            )
+
+            _merge_or_insert_inventory_in_tx(
+                cur, household_id, actor_user_id, target_name, target_quantity_text or "", target_category,
+                canonical_name=target_canonical_name, quantity_value=target_quantity_value,
+                quantity_unit=target_quantity_unit, quantity_inferred=False,
+            )
+
+            after_buckets = {
+                cname: _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, cname, lock=False)
+                for cname in canonical_names
+            }
+
+            before_snapshot = {"inventory_buckets": before_buckets, "shopping_buckets": {}, "expense_delete": None}
+            post_action_snapshot = {"inventory_buckets": after_buckets, "shopping_buckets": {}, "expense_adds": []}
+            forward_payload = action_history.json_safe({
+                "inventory_transform": {
+                    "source_item_ids": list(source_item_ids), "target_name": target_name,
+                    "target_canonical_name": target_canonical_name, "target_quantity_text": target_quantity_text,
+                },
+            })
+            summary = action_history.build_operation_summary(before_snapshot, post_action_snapshot)
+
+            cur.execute(
+                """
+                INSERT INTO household_action_journal
+                    (household_id, actor_user_id, operation_type, forward_payload, inverse_payload,
+                     before_snapshot, post_action_snapshot, summary, status, created_at)
+                VALUES (%s, %s, 'global_household', %s, NULL, %s, %s, %s, 'active', NOW())
+                """,
+                (household_id, actor_user_id, Jsonb(forward_payload),
+                 Jsonb(before_snapshot), Jsonb(post_action_snapshot), Jsonb(summary))
+            )
+        conn.commit()
+    return True
