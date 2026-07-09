@@ -2222,3 +2222,124 @@ def execute_inventory_cleanup_merge(household_id, actor_user_id, validated_group
             )
         conn.commit()
     return len(validated_groups)
+
+
+def execute_inventory_rename(household_id, actor_user_id, item_id, new_name, new_canonical_name, target):
+    """Inventory Cleanup Admin v1 — rename ONE inventory row's display name
+    (and re-derived canonical_name), stale-protected and journal-recorded
+    exactly like execute_inventory_cleanup_merge (same operation_type
+    'global_household', same {"inventory_buckets": {...}} snapshot shape,
+    so apply_undo_action restores it with zero new undo code).
+
+    target: {item_id, quantity_value, quantity_unit, name, canonical_name}
+    — the exact row snapshot the preview was built from; re-verified (locked
+    FOR UPDATE) inside this transaction via _verify_targets_in_tx before
+    anything is written — raises StaleSnapshotError if the row vanished or
+    its name/canonical_name/quantity changed since the preview was shown.
+
+    new_canonical_name may equal target["canonical_name"] (the common case:
+    a legacy row's stored canonical_name is often already correct, only the
+    display name is dirty) or differ from it (a genuinely stale
+    canonical_name gets corrected too) — either way both the OLD and NEW
+    canonical-name buckets are captured before/after, so undo restores
+    correctly regardless of which case this is.
+    """
+    old_canonical_name = target["canonical_name"]
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, [target],
+                                   extra_fields=("name", "canonical_name"))
+
+            # sorted(), not a raw set iteration — deterministic query order
+            # (matters when old/new canonical_name genuinely differ, so
+            # two buckets are fetched) rather than relying on Python's
+            # randomized string-hash set ordering.
+            canonical_names = sorted({old_canonical_name, new_canonical_name})
+            before_buckets = {
+                cname: _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, cname, lock=True)
+                for cname in canonical_names
+            }
+
+            cur.execute(
+                "UPDATE inventory_items SET name=%s, canonical_name=%s, updated_at=NOW() "
+                "WHERE id=%s AND household_id=%s",
+                (new_name, new_canonical_name, item_id, household_id)
+            )
+
+            after_buckets = {
+                cname: _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, cname, lock=False)
+                for cname in canonical_names
+            }
+
+            before_snapshot = {"inventory_buckets": before_buckets, "shopping_buckets": {}, "expense_delete": None}
+            post_action_snapshot = {"inventory_buckets": after_buckets, "shopping_buckets": {}, "expense_adds": []}
+            forward_payload = action_history.json_safe({
+                "inventory_rename": {"item_id": item_id, "new_name": new_name, "new_canonical_name": new_canonical_name},
+            })
+            summary = action_history.build_operation_summary(before_snapshot, post_action_snapshot)
+
+            cur.execute(
+                """
+                INSERT INTO household_action_journal
+                    (household_id, actor_user_id, operation_type, forward_payload, inverse_payload,
+                     before_snapshot, post_action_snapshot, summary, status, created_at)
+                VALUES (%s, %s, 'global_household', %s, NULL, %s, %s, %s, 'active', NOW())
+                """,
+                (household_id, actor_user_id, Jsonb(forward_payload),
+                 Jsonb(before_snapshot), Jsonb(post_action_snapshot), Jsonb(summary))
+            )
+        conn.commit()
+    return True
+
+
+def execute_inventory_delete(household_id, actor_user_id, item_id, target):
+    """Inventory Cleanup Admin v1 — delete ONE inventory row, stale-protected
+    and journal-recorded exactly like execute_inventory_cleanup_merge (see
+    its docstring) — the row disappearing from its canonical-name bucket's
+    before/after snapshot is exactly what apply_undo_action's existing
+    generic bucket-restore already knows how to reinsert (new id, per spec),
+    so this needs no new undo code either.
+
+    target: {item_id, quantity_value, quantity_unit, name, canonical_name}
+    — re-verified (locked FOR UPDATE) before anything is written; raises
+    StaleSnapshotError if the row vanished or its name/canonical_name/
+    quantity changed since the preview was shown.
+    """
+    canonical_name = target["canonical_name"]
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            _verify_targets_in_tx(cur, "inventory_items", household_id, [target],
+                                   extra_fields=("name", "canonical_name"))
+
+            before_buckets = {
+                canonical_name: _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, canonical_name, lock=True),
+            }
+
+            cur.execute(
+                "DELETE FROM inventory_items WHERE id=%s AND household_id=%s",
+                (item_id, household_id)
+            )
+
+            after_buckets = {
+                canonical_name: _fetch_bucket_rows_in_tx(cur, "inventory_items", household_id, canonical_name, lock=False),
+            }
+
+            before_snapshot = {"inventory_buckets": before_buckets, "shopping_buckets": {}, "expense_delete": None}
+            post_action_snapshot = {"inventory_buckets": after_buckets, "shopping_buckets": {}, "expense_adds": []}
+            forward_payload = action_history.json_safe({
+                "inventory_delete": {"item_id": item_id, "name": target.get("name")},
+            })
+            summary = action_history.build_operation_summary(before_snapshot, post_action_snapshot)
+
+            cur.execute(
+                """
+                INSERT INTO household_action_journal
+                    (household_id, actor_user_id, operation_type, forward_payload, inverse_payload,
+                     before_snapshot, post_action_snapshot, summary, status, created_at)
+                VALUES (%s, %s, 'global_household', %s, NULL, %s, %s, %s, 'active', NOW())
+                """,
+                (household_id, actor_user_id, Jsonb(forward_payload),
+                 Jsonb(before_snapshot), Jsonb(post_action_snapshot), Jsonb(summary))
+            )
+        conn.commit()
+    return True

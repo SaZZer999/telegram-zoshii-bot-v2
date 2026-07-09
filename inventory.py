@@ -28,7 +28,7 @@ _effective_quantity itself, format_grouped_list, and every database call.
 import re
 from decimal import Decimal
 
-from quantities import STRUCTURED_UNITS, format_quantity_display, merge_quantity_values
+from quantities import STRUCTURED_UNITS, format_quantity_display, merge_quantity_values, _WORD_NUMBER_QUANTITIES
 
 # Mirrors bot.py's/database.py's own DEFAULT_CATEGORY literal — a tiny,
 # self-contained constant (not business logic), duplicated on purpose so
@@ -1023,4 +1023,182 @@ def format_inventory_cleanup_preview(validated_groups, incompatible_rows, effect
     lines.append("")
     lines.append(f"Причина: {describe_cleanup_incompatibility_reason(incompatible_rows)}.")
     lines.append("Можеш прибрати або виправити зайвий запис через існуючі дії з запасами.")
+    return "\n".join(lines)
+
+
+# =========================
+# INVENTORY CLEANUP ADMIN V1 — deterministic rename/delete of ONE existing
+# inventory row ("перейменуй ser на сир", "видали mlekо із запасів", "прибери
+# сосисок — пару"). Pure text-classification/candidate-resolution/preview-
+# formatting only, no Gemini, no DB — bot.py resolves the household's live
+# inventory snapshot and calls the write via database.execute_inventory_
+# rename/execute_inventory_delete (same StaleSnapshotError/journal-undo
+# contract as execute_inventory_cleanup_merge — see that function's own
+# docstring). Deliberately reuses cleanup_canonical_name_candidates/
+# find_inventory_cleanup_candidates (Inventory Cleanup / Merge v1.1) for
+# name matching — no second alias table.
+# =========================
+_RENAME_TRIGGER_RE = re.compile(
+    r"^(?:перейменуй|виправ|зміни\s+назву)\s+(?P<old>.+?)\s+на\s+(?P<new>.+)$",
+    re.IGNORECASE,
+)
+_ADMIN_LOCATION_SUFFIX_RE = re.compile(r"\s*(?:із|з|в|у)\s+запас\w*\.?\s*$", re.IGNORECASE)
+
+
+def parse_inventory_rename_request(text):
+    """Deterministically detect a rename request ("перейменуй X на Y",
+    "виправ X на Y", "зміни назву X на Y"), optionally followed by a
+    trailing "в запасах"/"у запасах" location phrase on the NEW-name side
+    (stripped, never treated as part of the new name).
+
+    Returns (old_phrase, new_name) — both raw, not yet canonicalized/
+    resolved — or (None, None) if `text` doesn't match this shape at all.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return None, None
+    match = _RENAME_TRIGGER_RE.match(stripped)
+    if not match:
+        return None, None
+    old_phrase = match.group("old").strip()
+    new_phrase = _ADMIN_LOCATION_SUFFIX_RE.sub("", match.group("new").strip()).strip()
+    new_phrase = new_phrase.rstrip(".!?").strip()
+    if not old_phrase or not new_phrase:
+        return None, None
+    return old_phrase, new_phrase
+
+
+_DELETE_TRIGGER_RE = re.compile(
+    r"^(?:видали|прибери)\s+(?:запис\s+)?(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+_ADMIN_DASH_RE = re.compile(r"\s*[—–]\s*|\s+-\s+")
+
+# Bare "все"/"всі"/"усе"/"усі" (with optional "крім ..." exception clause)
+# is the existing bulk "select/delete everything" pronoun several OTHER
+# flows already own — the aliases submenu's own "Видали всі назви" bulk-
+# delete (matched via active_list_context == "aliases", checked well before
+# this route) and the shopping/inventory numbered-list "mark/remove all"
+# selection mode. Neither names an actual product, so this route must never
+# claim it — doing so would misfire as "Не знайшов такого запису в
+# запасах." for a message some OTHER already-correct flow either already
+# handled, or (outside any of those modes) intentionally leaves for general
+# AI-chat/the safety-net guard, exactly as before this route existed.
+_DELETE_BULK_PRONOUN_RE = re.compile(r"^(?:все|всі|усе|усі)(?:\s*,?\s*крім\s+.+)?$", re.IGNORECASE)
+# A location phrase naming the SHOPPING list, not inventory — out of scope
+# for this route (see module docstring: rename/delete here is inventory-
+# only); never claimed, even though nothing else handles it yet either.
+_SHOPPING_LOCATION_RE = re.compile(r"(?:зі?\s+списку\s+покупок|з\s+покупок|із\s+покупок)\s*\.?\s*$", re.IGNORECASE)
+
+
+def parse_inventory_delete_request(text):
+    """Deterministically detect a delete request ("видали X із запасів",
+    "прибери X", "прибери запис X", "видали X <text-quantity>", "прибери X
+    — <text-quantity>"). Deliberately excludes "прибери ... дублікат..."
+    (Inventory Cleanup / Merge v1's own trigger — caller must try that gate
+    FIRST, see bot.py's dispatch order) — this function has no "дублікат"
+    special-case of its own, so a duplicate-cleanup phrase simply produces a
+    (name, None) pair the caller never reaches (already claimed upstream).
+    Also excludes a bare bulk "все"/"всі"/"усе"/"усі" pronoun (see
+    _DELETE_BULK_PRONOUN_RE) and an explicit shopping-list location phrase
+    (see _SHOPPING_LOCATION_RE) — neither is this route's job.
+
+    Returns (name_phrase, quantity_hint) — quantity_hint is None when no
+    explicit quantity was given (candidate count alone must disambiguate),
+    or the exact text after an explicit "—"/"-" separator, or the LAST word
+    when it's one of quantities._WORD_NUMBER_QUANTITIES's tiny whitelist
+    ("пара"/"пару") — deliberately narrow so an ordinary multi-word product
+    name (e.g. "кокосове молоко") is never mis-split into a fake quantity
+    hint. Returns (None, None) if `text` doesn't match this shape at all.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return None, None
+    match = _DELETE_TRIGGER_RE.match(stripped)
+    if not match:
+        return None, None
+    raw_rest = match.group("rest").strip()
+    if _SHOPPING_LOCATION_RE.search(raw_rest):
+        return None, None
+    rest = _ADMIN_LOCATION_SUFFIX_RE.sub("", raw_rest).strip()
+    rest = rest.rstrip(".!?").strip()
+    if not rest or _DELETE_BULK_PRONOUN_RE.match(rest):
+        return None, None
+
+    dash_match = _ADMIN_DASH_RE.search(rest)
+    if dash_match:
+        name_part = rest[:dash_match.start()].strip()
+        qty_part = rest[dash_match.end():].strip()
+        if name_part and qty_part:
+            return name_part, qty_part
+
+    words = rest.split()
+    if len(words) >= 2 and words[-1].lower() in _WORD_NUMBER_QUANTITIES:
+        return " ".join(words[:-1]).strip(), words[-1]
+
+    return rest, None
+
+
+def resolve_inventory_admin_candidates(inventory_items, canonical_name_candidates, canonicalize_name, quantity_hint=None):
+    """Every inventory row matching `canonical_name_candidates` (see
+    find_inventory_cleanup_candidates), narrowed to an exact quantity_text
+    match when `quantity_hint` is given AND that narrowing actually finds at
+    least one row — e.g. "сосисок пару" narrows "Сосиски — 6 шт." + "сосисок
+    — пару" down to just the second row. If the hint matches nothing (e.g. a
+    stale/wrong guess), the FULL candidate list is returned instead of an
+    empty one, so the caller's normal not-found/ambiguous handling still
+    applies rather than silently losing a real match. Comparison is
+    case/whitespace-insensitive against the row's stored quantity_text
+    exactly as-is — never re-parsed/re-interpreted (a legacy row's raw text
+    quantity, e.g. "пару", is exactly what this must match)."""
+    candidates = find_inventory_cleanup_candidates(inventory_items, canonical_name_candidates, canonicalize_name)
+    if quantity_hint:
+        hint_norm = quantity_hint.strip().lower()
+        narrowed = [c for c in candidates if (c.get("quantity_text") or "").strip().lower() == hint_norm]
+        if narrowed:
+            return narrowed
+    return candidates
+
+
+def capitalize_first(text):
+    """Capitalize only the first character of `text`, leaving every other
+    character as typed — matches this codebase's existing display-name
+    convention (e.g. "Зелений чай", "Кокосове молоко": only the first word's
+    first letter is capitalized, never a per-word title-case). Never touches
+    an empty/blank string."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return stripped
+    return stripped[0].upper() + stripped[1:]
+
+
+def format_inventory_rename_preview(old_name, quantity_text, new_name):
+    """Render the Inventory Cleanup Admin V1 rename preview — one line,
+    the row's own quantity shown on both sides unchanged (only the name
+    changes)."""
+    lines = ["План змін:", "", "🧊 Запаси"]
+    suffix = f" — {quantity_text}" if quantity_text else ""
+    lines.append(f"• {old_name}{suffix} → {new_name}{suffix}")
+    return "\n".join(lines)
+
+
+def format_inventory_delete_preview(name, quantity_text):
+    """Render the Inventory Cleanup Admin V1 delete preview — one line."""
+    lines = ["План змін:", "", "🧊 Запаси"]
+    suffix = f" — {quantity_text}" if quantity_text else ""
+    lines.append(f"• Прибрати {name}{suffix}")
+    return "\n".join(lines)
+
+
+def format_inventory_admin_ambiguous_message(candidates, effective_quantity):
+    """Multiple rows matched the same rename/delete request — never guess;
+    list every candidate and ask for a more precise reference (e.g. with an
+    explicit quantity)."""
+    lines = ["Знайшов кілька записів, не хочу вгадувати:", ""]
+    for row in candidates:
+        qty = effective_quantity(row)[2]
+        label = row["name"] + (f" — {qty}" if qty else "")
+        lines.append(f"• {label}")
+    lines.append("")
+    lines.append("Напиши точніше, який саме запис потрібен (наприклад, з кількістю).")
     return "\n".join(lines)

@@ -222,6 +222,13 @@ class CommandRouteDeps:
     # the saved-list router's own broad AI edit-parser, but never overrides
     # any higher-priority write route above it.
     inventory_cleanup_route: Callable = None
+    # Inventory Cleanup Admin v1 — optional (default None), same reasoning as
+    # inventory_cleanup_route above. Checked right AFTER it: cleanup's own
+    # "прибери дублікат..." trigger must keep winning for that exact phrase
+    # (this route's own "видали"/"прибери X" gate is deliberately broader
+    # and would otherwise also match "прибери дублікати молока") — see
+    # inventory.parse_inventory_delete_request's docstring.
+    inventory_admin_route: Callable = None
     saved_list_router: Callable = None
     general_ai_fallback: Callable = None
 
@@ -571,6 +578,15 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # follow-ups. Checked ahead of saved_list_router so an explicit
         # cleanup request always wins over that router's own broad AI edit-
         # parser, even while a saved shopping/inventory list context is open.
+        return RouteOutcome.HANDLED
+
+    if routes.inventory_admin_route is not None and routes.inventory_admin_route(chat_id, user_id, display_name, text):
+        # Inventory Cleanup Admin v1 — narrow, deterministic local gate (no
+        # Gemini) for "перейменуй X на Y"/"видали X із запасів"/"прибери X"
+        # style requests. Checked right after inventory_cleanup_route (never
+        # before it — see inventory_admin_route's own docstring) and still
+        # ahead of saved_list_router for the same reason that route already
+        # wins over the AI edit-parser.
         return RouteOutcome.HANDLED
 
     if routes.saved_list_router(chat_id, user_id, display_name, text):

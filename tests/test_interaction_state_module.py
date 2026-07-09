@@ -61,6 +61,7 @@ def _make_fake_deps(**overrides):
         pending_inventory_quantity_clarification={},
         pending_inventory_representation_clarification={},
         pending_add_destination_clarification={},
+        pending_cleanup_admin={},
         pending_undo_action={},
         active_list_context={},
         saved_list_context={},

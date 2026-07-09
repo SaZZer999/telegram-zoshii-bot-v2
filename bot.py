@@ -29,6 +29,8 @@ from database import (
     execute_merge_shopping,
     execute_merge_inventory,
     execute_inventory_cleanup_merge,
+    execute_inventory_rename,
+    execute_inventory_delete,
     update_shopping_items_batch,
     update_inventory_items_batch,
     save_list_context,
@@ -150,8 +152,23 @@ pending_alias_action = {}     # chat_id -> {kind: "create"|"update"|"delete", ho
 # written and there's no pending_merge entry to confirm/cancel, but the very
 # next "↩️ Скасувати останню дію"/"❌ Скасувати" press must acknowledge THIS
 # read-only check instead of silently falling through to an unrelated older
-# historical undo. Holds no data — chat_id membership is the only signal.
-pending_cleanup_notice = {}   # chat_id -> True
+# historical undo. Also doubles (Inventory Cleanup Admin v1) as a small
+# contextual hint for an immediate follow-up rename/delete request ("прибери
+# сосисок пару" right after this warning) — see _start_inventory_delete's
+# candidate-narrowing fallback — though the normal live-inventory candidate
+# search already resolves that exact case on its own.
+pending_cleanup_notice = {}   # chat_id -> {"rows": [row, ...], "household_id": id}
+# Inventory Cleanup Admin v1 — awaiting confirm/cancel on a rename/delete
+# preview for ONE existing inventory row ("перейменуй ser на сир", "видали
+# mlekо із запасів"). Same "✅ Так, застосувати"/"❌ Скасувати" button pair
+# and journal/undo path as pending_global_household (see database.
+# execute_inventory_rename/execute_inventory_delete) — a SEPARATE dict
+# rather than folded into pending_global_household's own payload shape,
+# since that shape (add/consume/expense operations) has nothing in common
+# with a single-row rename/delete and _apply_global_household_confirm's
+# existing contract shouldn't need to branch on a whole new operation kind.
+pending_cleanup_admin = {}   # chat_id -> {action: "rename"|"delete", household_id, user_db_id, origin,
+                              #             item_id, target, new_name (rename only), new_canonical_name (rename only)}
 # Expense pending state now lives in expenses.py — re-exported here (same
 # dict objects, not copies) so every existing bot.<name> reference/test
 # keeps working unchanged.
@@ -255,6 +272,7 @@ def _has_active_pending_clarification_or_preview(chat_id):
         or chat_id in pending_global_household
         or chat_id in pending_add_destination_clarification
         or chat_id in pending_saved_edit
+        or chat_id in pending_cleanup_admin
     )
 
 
@@ -288,6 +306,9 @@ def _cancel_active_pending_operation(chat_id):
         edit_data = pending_saved_edit.pop(chat_id, None)
         ctx = (edit_data or {}).get("context_type")
         keyboard = SHOPPING_KEYBOARD if ctx == "shopping_saved" else INVENTORY_KEYBOARD
+    elif chat_id in pending_cleanup_admin:
+        data = pending_cleanup_admin.pop(chat_id, None)
+        keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
     else:
         keyboard = MAIN_KEYBOARD
     send_message(chat_id, "Поточну дію скасовано.", reply_markup=keyboard)
@@ -2719,8 +2740,11 @@ def _start_inventory_cleanup(chat_id, user_id, display_name, product_phrase):
         # entry (nothing to confirm/cancel), no merge keyboard. Still record
         # a small ephemeral notice so the very next "↩️ Скасувати останню
         # дію"/"❌ Скасувати" press acknowledges THIS read-only check
-        # instead of silently opening an unrelated older historical undo.
-        pending_cleanup_notice[chat_id] = True
+        # instead of silently opening an unrelated older historical undo —
+        # and so an immediate follow-up rename/delete request has the shown
+        # candidate rows available as a contextual hint (see
+        # _start_inventory_delete).
+        pending_cleanup_notice[chat_id] = {"rows": grouping["incompatible"], "household_id": household_id}
         send_message(chat_id, preview, reply_markup=INVENTORY_KEYBOARD)
         return
 
@@ -2772,6 +2796,166 @@ def _route_inventory_cleanup(chat_id, user_id, display_name, text):
         return True
     _start_inventory_cleanup(chat_id, user_id, display_name, product_phrase)
     return True
+
+
+INVENTORY_ADMIN_NOT_FOUND_MSG = "Не знайшов такого запису в запасах."
+
+
+# =========================
+# INVENTORY CLEANUP ADMIN v1 — deterministic rename/delete of ONE existing
+# inventory row ("перейменуй ser на сир", "видали mlekо із запасів", "прибери
+# сосисок — пару"). Global-scope route (works regardless of which menu is
+# open, same reasoning as _route_inventory_cleanup), checked right after it
+# so cleanup's own "прибери дублікат..." trigger always wins for that exact
+# phrase (see inventory.parse_inventory_delete_request's docstring). Reuses
+# pending_cleanup_admin (preview/confirm/cancel) + database.
+# execute_inventory_rename/execute_inventory_delete (stale-protected,
+# journal-recorded exactly like execute_inventory_cleanup_merge — same
+# undo path, no new one) — no DB write happens before an explicit "✅ Так,
+# застосувати" confirm.
+# =========================
+def _resolve_inventory_admin_candidates(chat_id, household_id, items, name_phrase, quantity_hint):
+    """Live-inventory candidate search (inventory.resolve_inventory_admin_
+    candidates), then — only if that alone is still ambiguous (2+ rows) — a
+    best-effort narrowing against this chat's active Inventory Cleanup
+    read-only-warning context (pending_cleanup_notice), if one exists and
+    actually narrows it down to exactly one row. Never used to override an
+    already-unique live-inventory match, never guesses beyond what's safe."""
+    canonical_name_candidates = inventory.cleanup_canonical_name_candidates(canonicalize_name, name_phrase)
+    candidates = inventory.resolve_inventory_admin_candidates(
+        items, canonical_name_candidates, canonicalize_name, quantity_hint=quantity_hint,
+    )
+    if len(candidates) > 1:
+        context = pending_cleanup_notice.get(chat_id)
+        context_rows = (context or {}).get("rows") if isinstance(context, dict) else None
+        if context_rows:
+            context_ids = {r["id"] for r in context_rows}
+            narrowed = [c for c in candidates if c["id"] in context_ids]
+            if len(narrowed) == 1:
+                candidates = narrowed
+    return candidates
+
+
+def _inventory_admin_target(row):
+    return {
+        "item_id": row["id"],
+        "quantity_value": row.get("quantity_value"),
+        "quantity_unit": row.get("quantity_unit"),
+        "name": row.get("name"),
+        "canonical_name": row.get("canonical_name"),
+    }
+
+
+def _start_inventory_rename(chat_id, user_id, display_name, old_phrase, new_phrase):
+    origin = household_router.current_origin(chat_id)
+    if _has_blocking_pending_state_for_reports(chat_id):
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        items = get_inventory_items(household_id)
+    except Exception:
+        send_message(chat_id, INVENTORY_ERROR_MSG)
+        return
+
+    candidates = _resolve_inventory_admin_candidates(chat_id, household_id, items, old_phrase, None)
+    if not candidates:
+        send_message(chat_id, INVENTORY_ADMIN_NOT_FOUND_MSG, reply_markup=INVENTORY_KEYBOARD)
+        return
+    if len(candidates) > 1:
+        send_message(
+            chat_id, inventory.format_inventory_admin_ambiguous_message(candidates, _effective_quantity),
+            reply_markup=INVENTORY_KEYBOARD,
+        )
+        return
+
+    row = candidates[0]
+    new_name = inventory.capitalize_first(new_phrase)
+    new_canonical_name = canonicalize_name(new_name)
+    quantity_text = _effective_quantity(row)[2]
+    pending_cleanup_notice.pop(chat_id, None)
+    pending_cleanup_admin[chat_id] = {
+        "action": "rename",
+        "household_id": household_id, "user_db_id": user_db_id, "origin": origin,
+        "item_id": row["id"], "new_name": new_name, "new_canonical_name": new_canonical_name,
+        "target": _inventory_admin_target(row),
+    }
+    preview = inventory.format_inventory_rename_preview(row["name"], quantity_text, new_name)
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+
+
+def _start_inventory_delete(chat_id, user_id, display_name, name_phrase, quantity_hint):
+    origin = household_router.current_origin(chat_id)
+    if _has_blocking_pending_state_for_reports(chat_id):
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        items = get_inventory_items(household_id)
+    except Exception:
+        send_message(chat_id, INVENTORY_ERROR_MSG)
+        return
+
+    candidates = _resolve_inventory_admin_candidates(chat_id, household_id, items, name_phrase, quantity_hint)
+    if not candidates:
+        send_message(chat_id, INVENTORY_ADMIN_NOT_FOUND_MSG, reply_markup=INVENTORY_KEYBOARD)
+        return
+    if len(candidates) > 1:
+        send_message(
+            chat_id, inventory.format_inventory_admin_ambiguous_message(candidates, _effective_quantity),
+            reply_markup=INVENTORY_KEYBOARD,
+        )
+        return
+
+    row = candidates[0]
+    quantity_text = _effective_quantity(row)[2]
+    pending_cleanup_notice.pop(chat_id, None)
+    pending_cleanup_admin[chat_id] = {
+        "action": "delete",
+        "household_id": household_id, "user_db_id": user_db_id, "origin": origin,
+        "item_id": row["id"], "target": _inventory_admin_target(row),
+    }
+    preview = inventory.format_inventory_delete_preview(row["name"], quantity_text)
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+
+
+def _route_inventory_admin(chat_id, user_id, display_name, text):
+    old_phrase, new_phrase = inventory.parse_inventory_rename_request(text)
+    if old_phrase is not None:
+        _start_inventory_rename(chat_id, user_id, display_name, old_phrase, new_phrase)
+        return True
+
+    name_phrase, quantity_hint = inventory.parse_inventory_delete_request(text)
+    if name_phrase is not None:
+        _start_inventory_delete(chat_id, user_id, display_name, name_phrase, quantity_hint)
+        return True
+
+    return False
+
+
+def _apply_cleanup_admin_confirm(chat_id):
+    """"✅ Так, застосувати" button for a pending_cleanup_admin preview. Pops
+    the pending action BEFORE the database call, same duplicate-press
+    protection as _apply_global_household_confirm."""
+    if chat_id not in pending_cleanup_admin:
+        send_message(chat_id, "Немає активної дії для підтвердження.")
+        return
+    data = pending_cleanup_admin.pop(chat_id)
+    origin = data.get("origin", "global")
+    keyboard = household_router.origin_keyboard(origin)
+    try:
+        if data["action"] == "rename":
+            execute_inventory_rename(
+                data["household_id"], data["user_db_id"], data["item_id"],
+                data["new_name"], data["new_canonical_name"], data["target"],
+            )
+        else:
+            execute_inventory_delete(data["household_id"], data["user_db_id"], data["item_id"], data["target"])
+        send_message(chat_id, "✅ Зміни застосовано.", reply_markup=keyboard)
+    except StaleSnapshotError:
+        send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=keyboard)
+    except Exception:
+        send_message(chat_id, "Не вдалося застосувати зміни. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
 
 
 # _should_restore_persisted_context's real logic now lives in
@@ -3664,6 +3848,7 @@ _interaction_state_deps = interaction_state.InteractionStateDeps(
     pending_inventory_quantity_clarification=pending_inventory_quantity_clarification,
     pending_inventory_representation_clarification=pending_inventory_representation_clarification,
     pending_add_destination_clarification=pending_add_destination_clarification,
+    pending_cleanup_admin=pending_cleanup_admin,
     pending_undo_action=pending_undo_action,
     active_list_context=active_list_context,
     saved_list_context=saved_list_context,
@@ -4360,6 +4545,10 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
             data = pending_add_destination_clarification.pop(chat_id, None)
             origin = (data or {}).get("origin", "global")
             send_message(chat_id, "Вибір місця додавання скасовано.", reply_markup=household_router.origin_keyboard(origin))
+        elif chat_id in pending_cleanup_admin:
+            data = pending_cleanup_admin.pop(chat_id, None)
+            origin = (data or {}).get("origin", "global")
+            send_message(chat_id, "Зміни скасовано.", reply_markup=household_router.origin_keyboard(origin))
         elif chat_id in pending_undo_action:
             pending_undo_action.pop(chat_id, None)
             send_message(chat_id, action_history.UNDO_CANCELLED_MSG, reply_markup=MAIN_KEYBOARD)
@@ -4494,7 +4683,10 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
         return True
 
     if text == "✅ Так, застосувати":
-        _apply_global_household_confirm(chat_id)
+        if chat_id in pending_cleanup_admin:
+            _apply_cleanup_admin_confirm(chat_id)
+        else:
+            _apply_global_household_confirm(chat_id)
         return True
 
     if text == "✅ Так, скасувати":
@@ -4705,6 +4897,7 @@ _command_route_deps = message_dispatcher.CommandRouteDeps(
     active_expenses_context=lambda *a, **kw: _route_active_expenses_context(*a, **kw),
     global_expense_command=lambda *a, **kw: _route_global_expense_command(*a, **kw),
     inventory_cleanup_route=lambda *a, **kw: _route_inventory_cleanup(*a, **kw),
+    inventory_admin_route=lambda *a, **kw: _route_inventory_admin(*a, **kw),
     saved_list_router=lambda *a, **kw: _route_saved_list_router(*a, **kw),
     general_ai_fallback=lambda *a, **kw: _run_general_ai_fallback(*a, **kw),
 )

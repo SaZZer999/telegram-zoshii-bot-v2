@@ -61,6 +61,9 @@ class InteractionStateDeps:
     pending_inventory_quantity_clarification: dict
     pending_inventory_representation_clarification: dict
     pending_add_destination_clarification: dict
+    # Inventory Cleanup Admin v1 — awaiting confirm/cancel on a rename/delete
+    # preview for ONE inventory row.
+    pending_cleanup_admin: dict
     pending_undo_action: dict
     # bot.py-owned shared context dicts
     active_list_context: dict
@@ -107,6 +110,11 @@ def _alias_gate_blocking_states(deps):
         # may start a new preview, touch the database, or reach general
         # AI-chat.
         deps.pending_add_destination_clarification,
+        # Inventory Cleanup Admin v1's own rename/delete preview — same
+        # reasoning: while a "✅ Так, застосувати"/"❌ Скасувати" decision is
+        # pending, no other gate/flow may start a new preview, touch the
+        # database, or reach general AI-chat.
+        deps.pending_cleanup_admin,
     )
 
 

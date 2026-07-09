@@ -122,6 +122,12 @@ def diff_bucket(before_rows, after_rows):
             if row_signature(arow) != row_signature(brow):
                 entries.append({
                     "kind": "update", "name": arow.get("name"),
+                    # old_name lets _format_bucket_line render a rename
+                    # (Inventory Cleanup Admin v1) distinctly from a plain
+                    # quantity update — equal to `name` for every OTHER
+                    # "update" entry (quantity/category-only changes), which
+                    # keeps their existing rendering completely unchanged.
+                    "old_name": brow.get("name"),
                     "current_text": arow.get("quantity_text"),
                     "target_text": brow.get("quantity_text"),
                 })
@@ -201,7 +207,14 @@ def _format_bucket_line(entry):
     name = entry.get("name")
     quantity_text = entry.get("quantity_text")
     if entry["kind"] == "update":
-        return f"• {name} — {entry.get('current_text')} → {entry.get('target_text')}"
+        old_name = entry.get("old_name")
+        current_text = entry.get("current_text")
+        target_text = entry.get("target_text")
+        if old_name is not None and old_name != name:
+            if current_text == target_text:
+                return f"• {name} → {old_name}"
+            return f"• {name} — {current_text} → {old_name} — {target_text}"
+        return f"• {name} — {current_text} → {target_text}"
     if entry["kind"] == "restore":
         suffix = f" — {quantity_text}" if quantity_text else ""
         return f"• Повернути {name}{suffix}"
