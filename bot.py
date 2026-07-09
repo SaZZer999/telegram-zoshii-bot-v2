@@ -182,6 +182,17 @@ pending_cleanup_admin = {}   # chat_id -> {action: "rename"|"delete", household_
 # instead of ever falling through to general AI-chat.
 pending_cleanup_admin_disambiguation = {}  # chat_id -> {action: "rename"|"delete", candidates: [row, ...],
                               #             new_phrase (rename only, raw), household_id, user_db_id, origin}
+# Destructive Bulk Household Request Guard v1 — awaiting a follow-up reply
+# to the guard's own "покупки чи запаси?" clarification (see
+# _route_destructive_bulk_guard). Deliberately tiny/ephemeral: no household_
+# id/user_db_id (nothing is EVER written from this state, so there is
+# nothing to re-verify at write time), just enough to restore the right
+# keyboard. A recognized destination word ("покупки"/"запаси"/...) or a
+# cancel is resolved by _continue_destructive_guard; any OTHER reply simply
+# releases this context and lets normal routing continue for that SAME
+# message, exactly like a real bulk-clear command never having been asked
+# about in the first place.
+pending_destructive_guard = {}  # chat_id -> {"origin": origin}
 # Expense pending state now lives in expenses.py — re-exported here (same
 # dict objects, not copies) so every existing bot.<name> reference/test
 # keeps working unchanged.
@@ -287,6 +298,7 @@ def _has_active_pending_clarification_or_preview(chat_id):
         or chat_id in pending_saved_edit
         or chat_id in pending_cleanup_admin
         or chat_id in pending_cleanup_admin_disambiguation
+        or chat_id in pending_destructive_guard
     )
 
 
@@ -303,6 +315,14 @@ def _cancel_active_pending_operation(chat_id):
         # imply something was undone.
         pending_cleanup_notice.pop(chat_id, None)
         send_message(chat_id, CLEANUP_NOTICE_ACKNOWLEDGED_MSG, reply_markup=INVENTORY_KEYBOARD)
+        return
+    if chat_id in pending_destructive_guard:
+        # The destructive guard's own "покупки чи запаси?" question — no DB
+        # write happened, so acknowledge with its own dedicated wording
+        # instead of the generic "Поточну дію скасовано.".
+        data = pending_destructive_guard.pop(chat_id, None)
+        keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
+        send_message(chat_id, DESTRUCTIVE_GUARD_CANCELLED_MSG, reply_markup=keyboard)
         return
     if chat_id in pending_inventory_quantity_clarification:
         data = pending_inventory_quantity_clarification.pop(chat_id, None)
@@ -2906,6 +2926,9 @@ def _start_inventory_rename(chat_id, user_id, display_name, old_phrase, new_phra
     row = candidates[0]
     new_name = inventory.capitalize_first(new_phrase)
     new_canonical_name = canonicalize_name(new_name)
+    if inventory.is_noop_rename(row, new_name, new_canonical_name, _normalize_display_name_for_exact_match):
+        send_message(chat_id, inventory.format_noop_rename_message(row["name"]), reply_markup=INVENTORY_KEYBOARD)
+        return
     quantity_text = _effective_quantity(row)[2]
     pending_cleanup_notice.pop(chat_id, None)
     pending_cleanup_admin[chat_id] = {
@@ -3004,6 +3027,11 @@ def _continue_cleanup_admin_disambiguation(chat_id, text):
     if data["action"] == "rename":
         new_name = inventory.capitalize_first(data["new_phrase"])
         new_canonical_name = canonicalize_name(new_name)
+        if inventory.is_noop_rename(selected, new_name, new_canonical_name, _normalize_display_name_for_exact_match):
+            send_message(
+                chat_id, inventory.format_noop_rename_message(selected["name"]), reply_markup=INVENTORY_KEYBOARD,
+            )
+            return
         pending_cleanup_admin[chat_id] = {
             "action": "rename",
             "household_id": household_id, "user_db_id": user_db_id, "origin": origin,
@@ -3938,6 +3966,7 @@ _interaction_state_deps = interaction_state.InteractionStateDeps(
     pending_add_destination_clarification=pending_add_destination_clarification,
     pending_cleanup_admin=pending_cleanup_admin,
     pending_cleanup_admin_disambiguation=pending_cleanup_admin_disambiguation,
+    pending_destructive_guard=pending_destructive_guard,
     pending_undo_action=pending_undo_action,
     active_list_context=active_list_context,
     saved_list_context=saved_list_context,
@@ -3976,6 +4005,8 @@ _pending_route_deps = message_dispatcher.PendingRouteDeps(
     cancel_active_pending_operation=lambda *a, **kw: _cancel_active_pending_operation(*a, **kw),
     pending_cleanup_admin_disambiguation=pending_cleanup_admin_disambiguation,
     continue_cleanup_admin_disambiguation=lambda *a, **kw: _continue_cleanup_admin_disambiguation(*a, **kw),
+    pending_destructive_guard=pending_destructive_guard,
+    continue_destructive_guard=lambda *a, **kw: _continue_destructive_guard(*a, **kw),
 )
 
 # =========================
@@ -4352,6 +4383,22 @@ DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG = (
     "Таку дію можна зробити тільки через окремий preview і підтвердження."
 )
 
+# Destructive Bulk Household Request Guard v1.4 — a destination reply to the
+# guard's own "покупки чи запаси?" question (pending_destructive_guard) must
+# never fall into the ordinary shopping/inventory read-list route (that's
+# what the live bug looked like: "Видали все" -> "покупки" -> shopping list
+# shown, as if it were "Що треба купити?"). Deliberately a small, EXACT
+# (whole-message) match — never a substring inside a longer reply — so an
+# unrelated follow-up is never misread as answering this question.
+_DESTRUCTIVE_GUARD_SHOPPING_RE = re.compile(r"^\s*(?:покупки|покупок|список\s+покупок)\s*[.!?]*\s*$", re.IGNORECASE)
+_DESTRUCTIVE_GUARD_INVENTORY_RE = re.compile(r"^\s*(?:запаси|запасів|інвентар\w*)\s*[.!?]*\s*$", re.IGNORECASE)
+
+DESTRUCTIVE_BULK_NOT_IMPLEMENTED_MSG = (
+    "Масове очищення через текст ще не реалізоване. "
+    "Можеш видалити конкретні позиції або скористатися меню, де є preview і підтвердження."
+)
+DESTRUCTIVE_GUARD_CANCELLED_MSG = "Очищення скасовано. Я нічого не змінював."
+
 
 def _looks_like_destructive_bulk_household_request(text):
     """True if `text` (stripped) is ENTIRELY a bare destructive bulk-clear
@@ -4369,10 +4416,46 @@ def _route_destructive_bulk_guard(chat_id, user_id, display_name, text):
     classifier (see that field's own docstring). _run_general_ai_fallback
     below runs the SAME guard again for the DIRECT_GENERAL_AI_FALLBACK path
     (an active batch-edit-router reporting intent "none"), which skips this
-    command-routes slice entirely."""
+    command-routes slice entirely. Stores a small ephemeral pending_
+    destructive_guard context so a destination follow-up ("покупки"/
+    "запаси"/...) is resolved by _continue_destructive_guard instead of
+    ever reaching the ordinary read-list route."""
     if _looks_like_destructive_bulk_household_request(text):
+        origin = household_router.current_origin(chat_id)
+        pending_destructive_guard[chat_id] = {"origin": origin}
         send_message(chat_id, DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG)
         return True
+    return False
+
+
+def _continue_destructive_guard(chat_id, text):
+    """Follow-up reply to the Destructive Bulk Household Request Guard's own
+    "покупки чи запаси?" clarification (pending_destructive_guard). A
+    recognized destination word is intercepted here so it NEVER falls into
+    the ordinary shopping/inventory read-list route below it in the dispatch
+    chain — there is no existing safe bulk-delete-by-text preview flow to
+    route to (V1.4 scope), so this always replies with a controlled "not
+    implemented, use specific items or the menu" message; never executes a
+    DB write, never calls general AI. Returns True (message_dispatcher.py's
+    caller treats the message as fully handled) when a destination was
+    recognized, False otherwise. Any OTHER reply (unrelated to this
+    clarification) simply releases the ephemeral context here and returns
+    False, so the caller falls through and normal routing continues for
+    that SAME message — a real bulk-clear question was asked and just went
+    unanswered, not a blocking preview."""
+    data = pending_destructive_guard.get(chat_id)
+    if not data:
+        return False
+    stripped = (text or "").strip()
+    if _DESTRUCTIVE_GUARD_SHOPPING_RE.match(stripped):
+        pending_destructive_guard.pop(chat_id, None)
+        send_message(chat_id, DESTRUCTIVE_BULK_NOT_IMPLEMENTED_MSG, reply_markup=SHOPPING_KEYBOARD)
+        return True
+    if _DESTRUCTIVE_GUARD_INVENTORY_RE.match(stripped):
+        pending_destructive_guard.pop(chat_id, None)
+        send_message(chat_id, DESTRUCTIVE_BULK_NOT_IMPLEMENTED_MSG, reply_markup=INVENTORY_KEYBOARD)
+        return True
+    pending_destructive_guard.pop(chat_id, None)
     return False
 
 
@@ -4698,6 +4781,10 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
             data = pending_cleanup_admin_disambiguation.pop(chat_id, None)
             origin = (data or {}).get("origin", "global")
             send_message(chat_id, "Зміни скасовано.", reply_markup=household_router.origin_keyboard(origin))
+        elif chat_id in pending_destructive_guard:
+            data = pending_destructive_guard.pop(chat_id, None)
+            origin = (data or {}).get("origin", "global")
+            send_message(chat_id, DESTRUCTIVE_GUARD_CANCELLED_MSG, reply_markup=household_router.origin_keyboard(origin))
         elif chat_id in pending_undo_action:
             pending_undo_action.pop(chat_id, None)
             send_message(chat_id, action_history.UNDO_CANCELLED_MSG, reply_markup=MAIN_KEYBOARD)

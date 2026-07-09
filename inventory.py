@@ -28,7 +28,10 @@ _effective_quantity itself, format_grouped_list, and every database call.
 import re
 from decimal import Decimal
 
-from quantities import STRUCTURED_UNITS, format_quantity_display, merge_quantity_values, _WORD_NUMBER_QUANTITIES
+from quantities import (
+    STRUCTURED_UNITS, format_quantity_display, merge_quantity_values,
+    parse_structured_quantity, _WORD_NUMBER_QUANTITIES,
+)
 
 # Mirrors bot.py's/database.py's own DEFAULT_CATEGORY literal — a tiny,
 # self-contained constant (not business logic), duplicated on purpose so
@@ -1109,7 +1112,14 @@ def parse_inventory_delete_request(text):
     when it's one of quantities._WORD_NUMBER_QUANTITIES's tiny whitelist
     ("пара"/"пару") — deliberately narrow so an ordinary multi-word product
     name (e.g. "кокосове молоко") is never mis-split into a fake quantity
-    hint. Returns (None, None) if `text` doesn't match this shape at all.
+    hint. A trailing NUMERIC quantity ("1 шт", "1 штуку", "1,5 л" — with or
+    without a "—"/"-" separator) is also detected and re-rendered through
+    _normalize_numeric_quantity_hint into the SAME canonical form an
+    inventory row's own quantity_text is stored in (e.g. "1 шт."), so
+    "прибери Молоко 1 шт"/"прибери Молоко — 1 шт"/"прибери молоко 1 штуку"
+    all resolve to the exact stored "1 шт." — never blocked by a trailing-
+    dot/unit-spelling mismatch. Returns (None, None) if `text` doesn't match
+    this shape at all.
     """
     stripped = (text or "").strip()
     if not stripped:
@@ -1130,13 +1140,39 @@ def parse_inventory_delete_request(text):
         name_part = rest[:dash_match.start()].strip()
         qty_part = rest[dash_match.end():].strip()
         if name_part and qty_part:
-            return name_part, qty_part
+            return name_part, _normalize_numeric_quantity_hint(qty_part)
 
     words = rest.split()
     if len(words) >= 2 and words[-1].lower() in _WORD_NUMBER_QUANTITIES:
         return " ".join(words[:-1]).strip(), words[-1]
 
+    if len(words) >= 3:
+        trailing_qty = " ".join(words[-2:])
+        value, unit = parse_structured_quantity(trailing_qty)
+        if value is not None and unit is not None:
+            name_part = " ".join(words[:-2]).strip()
+            if name_part:
+                return name_part, format_quantity_display(value, unit)
+
     return rest, None
+
+
+def _normalize_numeric_quantity_hint(text):
+    """If `text` is a genuine NUMERIC quantity ("1 шт", "1,5 л", ...) that
+    quantities.parse_structured_quantity can parse, re-render it through
+    quantities.format_quantity_display — the SAME canonical form an
+    inventory row's own quantity_text is stored in (e.g. "1 шт."), so a
+    trailing-dot/unit-spelling mismatch never blocks an otherwise-correct
+    match. A WORD-based quantity ("пара"/"пару") has no digit and is
+    returned UNCHANGED — those rows store the literal word as their
+    quantity_text (e.g. "пару"), so re-rendering through format_quantity_
+    display (which would turn "пару" into "2 шт.") must never happen here."""
+    if not text or not any(ch.isdigit() for ch in text):
+        return text
+    value, unit = parse_structured_quantity(text)
+    if value is None:
+        return text
+    return format_quantity_display(value, unit)
 
 
 def find_inventory_admin_exact_name_matches(inventory_items, name_phrase, name_normalizer):
@@ -1298,6 +1334,28 @@ def capitalize_first(text):
     if not stripped:
         return stripped
     return stripped[0].upper() + stripped[1:]
+
+
+def is_noop_rename(row, new_name, new_canonical_name, name_normalizer):
+    """True if renaming `row` to new_name/new_canonical_name would be a
+    meaningless no-op — the row's CURRENT visible name already normalizes to
+    the same thing as new_name (case/Latin-Cyrillic-homoglyph-insensitive,
+    via `name_normalizer`) AND its canonical_name already equals
+    new_canonical_name. Blocks re-running "перейменуй ser на сир" after
+    "ser" was already renamed to "Сир" — the alias/canonical fallback search
+    (see resolve_inventory_admin_candidates) still finds that row (its
+    canonical_name is "сир"), but renaming it to itself must never create a
+    preview, a DB write, or an undo journal entry."""
+    return (
+        name_normalizer(row.get("name") or "") == name_normalizer(new_name)
+        and (row.get("canonical_name") or "") == (new_canonical_name or "")
+    )
+
+
+def format_noop_rename_message(current_name):
+    """Controlled reply for is_noop_rename's blocked case — never implies a
+    DB write happened, never shows an empty "X -> X" preview."""
+    return f"Цей запис уже називається «{current_name}». Змін не потрібно."
 
 
 def format_inventory_rename_preview(old_name, quantity_text, new_name):

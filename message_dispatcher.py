@@ -193,6 +193,15 @@ class PendingRouteDeps:
     # every other Optional field on this dataclass.
     pending_cleanup_admin_disambiguation: dict = None
     continue_cleanup_admin_disambiguation: Callable = None
+    # Destructive Bulk Household Request Guard v1.4 — a follow-up reply to
+    # the guard's own "покупки чи запаси?" question. Optional (default
+    # None), same reasoning as every other Optional field on this dataclass.
+    # continue_destructive_guard(chat_id, text) returns True when it fully
+    # handled the reply (a recognized destination word) — False means it
+    # already released the ephemeral context and the SAME message must fall
+    # through to normal routing instead of being treated as handled here.
+    pending_destructive_guard: dict = None
+    continue_destructive_guard: Callable = None
 
 
 @dataclass
@@ -485,6 +494,17 @@ def _dispatch_pending_routes(deps, chat_id, user_id, display_name, text):
         # candidate list, never a new command, never general AI-chat.
         routes.continue_cleanup_admin_disambiguation(chat_id, text)
         return RouteOutcome.HANDLED
+
+    if routes.pending_destructive_guard is not None and chat_id in routes.pending_destructive_guard:
+        # Destructive Bulk Household Request Guard v1.4 — a reply to the
+        # guard's own "покупки чи запаси?" question. A recognized
+        # destination word is fully handled here (never the ordinary read-
+        # list route below, never general AI-chat). Anything else already
+        # released the ephemeral context (continue_destructive_guard
+        # returned False) — fall through so the SAME message still gets
+        # normal routing instead of being silently swallowed.
+        if routes.continue_destructive_guard(chat_id, text):
+            return RouteOutcome.HANDLED
 
     if chat_id in routes.pending_global_household:
         # A combined Global Household Router preview is awaiting confirm/

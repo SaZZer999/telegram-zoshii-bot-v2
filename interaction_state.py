@@ -67,6 +67,9 @@ class InteractionStateDeps:
     # Inventory Cleanup Admin v1 — awaiting a follow-up reply that
     # disambiguates a rename/delete request matching 2+ inventory rows.
     pending_cleanup_admin_disambiguation: dict
+    # Destructive Bulk Household Request Guard v1.4 — awaiting a follow-up
+    # reply to the guard's own "покупки чи запаси?" question.
+    pending_destructive_guard: dict
     pending_undo_action: dict
     # bot.py-owned shared context dicts
     active_list_context: dict
@@ -260,6 +263,7 @@ def clear_interaction_state(deps, chat_id):
     deps.pending_inventory_representation_clarification.pop(chat_id, None)
     deps.pending_add_destination_clarification.pop(chat_id, None)
     deps.pending_cleanup_admin_disambiguation.pop(chat_id, None)
+    deps.pending_destructive_guard.pop(chat_id, None)
     deps.pending_undo_action.pop(chat_id, None)
 
 

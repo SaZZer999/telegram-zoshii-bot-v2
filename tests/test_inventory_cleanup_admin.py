@@ -48,14 +48,18 @@ from bot import (  # noqa: E402
     pending_cleanup_admin_disambiguation,
     pending_cleanup_notice,
     pending_merge,
+    pending_destructive_guard,
     canonicalize_name,
     _normalize_display_name_for_exact_match,
     STALE_PREVIEW_MSG,
     INVENTORY_KEYBOARD,
+    SHOPPING_KEYBOARD,
     GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD,
     GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG,
     INVENTORY_ADMIN_NOT_FOUND_MSG,
     DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG,
+    DESTRUCTIVE_BULK_NOT_IMPLEMENTED_MSG,
+    DESTRUCTIVE_GUARD_CANCELLED_MSG,
 )
 
 
@@ -101,6 +105,18 @@ def _milk_multi_rows():
          "quantity_value": Decimal("1"), "quantity_unit": "л", "quantity_text": "1 л"},
         {"id": 11, "name": "Молоко", "canonical_name": "молоко", "category": "Молочне та яйця",
          "quantity_value": Decimal("2"), "quantity_unit": "л", "quantity_text": "2 л"},
+    ]
+
+
+def _milk_litres_and_pieces_rows():
+    """The exact V1.4 live-bug inventory: "Молоко — 12,5 л" and
+    "Молоко — 1 шт." — a delete-by-name+quantity request must hit ONLY the
+    "1 шт." row, never the litres one."""
+    return [
+        {"id": 20, "name": "Молоко", "canonical_name": "молоко", "category": "Молочне та яйця",
+         "quantity_value": Decimal("12.5"), "quantity_unit": "л", "quantity_text": "12,5 л"},
+        {"id": 21, "name": "Молоко", "canonical_name": "молоко", "category": "Молочне та яйця",
+         "quantity_value": Decimal("1"), "quantity_unit": "шт.", "quantity_text": "1 шт."},
     ]
 
 
@@ -338,6 +354,76 @@ class TestFormatters(unittest.TestCase):
         self.assertIn("не хочу вгадувати", text)
 
 
+class TestIsNoopRename(unittest.TestCase):
+    """V1.4: renaming a row to the name it ALREADY has must never be treated
+    as a real change — e.g. re-running "перейменуй ser на сир" after "ser"
+    was already renamed to "Сир" (alias/canonical fallback still finds that
+    row, since its canonical_name is "сир")."""
+
+    def _normalizer(self, s):
+        return _normalize_display_name_for_exact_match(s)
+
+    def test_already_renamed_row_is_noop(self):
+        row = {"name": "Сир", "canonical_name": "сир"}
+        self.assertTrue(inventory.is_noop_rename(row, "Сир", "сир", self._normalizer))
+
+    def test_case_and_homoglyph_insensitive_noop(self):
+        row = {"name": "mlekо", "canonical_name": "молоко"}
+        self.assertTrue(inventory.is_noop_rename(row, "Mleko", "молоко", self._normalizer))
+
+    def test_real_rename_is_not_noop(self):
+        row = {"name": "ser", "canonical_name": "сир"}
+        self.assertFalse(inventory.is_noop_rename(row, "Сир", "сир", self._normalizer))
+
+    def test_same_display_name_different_canonical_is_not_noop(self):
+        # Defensive: a same-looking display name but a genuinely different
+        # canonical_name target is still a real change.
+        row = {"name": "Сир", "canonical_name": "сир"}
+        self.assertFalse(inventory.is_noop_rename(row, "Сир", "інший_сир", self._normalizer))
+
+    def test_format_noop_rename_message(self):
+        text = inventory.format_noop_rename_message("Сир")
+        self.assertIn("Сир", text)
+        self.assertIn("Змін не потрібно", text)
+
+
+class TestParseInventoryDeleteRequestNumericQuantity(unittest.TestCase):
+    """V1.4: "прибери/видали <name> <numeric quantity>" (with or without a
+    dash separator, with or without a trailing unit dot, "штуку" included)
+    must split into (name, canonical quantity hint) — never treated as one
+    long unmatched name phrase."""
+
+    def test_no_dash_numeric_count(self):
+        self.assertEqual(inventory.parse_inventory_delete_request("прибери Молоко 1 шт"), ("Молоко", "1 шт."))
+
+    def test_no_dash_video_variant(self):
+        self.assertEqual(inventory.parse_inventory_delete_request("видали Молоко 1 шт"), ("Молоко", "1 шт."))
+
+    def test_dash_numeric_count(self):
+        self.assertEqual(inventory.parse_inventory_delete_request("прибери Молоко — 1 шт"), ("Молоко", "1 шт."))
+
+    def test_lowercase_name(self):
+        self.assertEqual(inventory.parse_inventory_delete_request("прибери молоко 1 шт"), ("молоко", "1 шт."))
+
+    def test_stuku_accusative_unit_word(self):
+        self.assertEqual(inventory.parse_inventory_delete_request("прибери молоко 1 штуку"), ("молоко", "1 шт."))
+
+    def test_trailing_dot_after_unit_is_stripped_before_parsing(self):
+        self.assertEqual(inventory.parse_inventory_delete_request("прибери молоко 1 шт."), ("молоко", "1 шт."))
+
+    def test_multi_word_name_with_trailing_quantity(self):
+        self.assertEqual(
+            inventory.parse_inventory_delete_request("прибери кокосове молоко 2 шт"), ("кокосове молоко", "2 шт."),
+        )
+
+    def test_word_number_quantity_still_takes_priority_and_stays_unnormalized(self):
+        # Regression: "пару" must never be re-rendered into "2 шт." — that
+        # would break the existing "сосисок — пару"/"сосисок пару" matching,
+        # since the row's OWN quantity_text is the literal word "пару".
+        self.assertEqual(inventory.parse_inventory_delete_request("прибери сосисок пару"), ("сосисок", "пару"))
+        self.assertEqual(inventory.parse_inventory_delete_request("прибери сосисок — пару"), ("сосисок", "пару"))
+
+
 # =========================
 # Webhook-level routing (bot.py) — network/DB calls patched.
 # =========================
@@ -359,6 +445,7 @@ class InventoryAdminWebhookTestCase(unittest.TestCase):
         pending_cleanup_admin_disambiguation.clear()
         pending_cleanup_notice.clear()
         pending_merge.clear()
+        pending_destructive_guard.clear()
         patcher_send = patch.object(bot, "send_message")
         self.mock_send = patcher_send.start()
         self.addCleanup(patcher_send.stop)
@@ -371,6 +458,7 @@ class InventoryAdminWebhookTestCase(unittest.TestCase):
         pending_cleanup_admin_disambiguation.clear()
         pending_cleanup_notice.clear()
         pending_merge.clear()
+        pending_destructive_guard.clear()
 
     def _sent_texts(self):
         return [call.args[1] for call in self.mock_send.call_args_list]
@@ -428,6 +516,36 @@ class TestRenamePreview(InventoryAdminWebhookTestCase):
             _call_webhook(_make_update(771000003, chat_id, "перейменуй сир на Сир"))
         self.assertNotIn(chat_id, pending_cleanup_admin)
         self.assertTrue(any(INVENTORY_ADMIN_NOT_FOUND_MSG == t for t in self._sent_texts()))
+
+    # V1.4 live bug: "ser" no longer exists (already renamed to "Сир") — the
+    # alias/canonical fallback still finds "Сир" (its canonical_name is
+    # "сир"), but renaming it to itself must never create a preview.
+    def test_noop_rename_does_not_create_preview(self):
+        chat_id = 771006
+        already_renamed_row = {
+            "id": 5, "name": "Сир", "canonical_name": "сир", "category": "Молочне та яйця",
+            "quantity_value": Decimal("1"), "quantity_unit": "шт.", "quantity_text": "1 шт.",
+        }
+        with patch.object(bot, "get_inventory_items", return_value=[already_renamed_row]):
+            _call_webhook(_make_update(771000006, chat_id, "перейменуй ser на сир"))
+        self.assertNotIn(chat_id, pending_cleanup_admin)
+        texts = self._sent_texts()
+        self.assertTrue(any("Змін не потрібно" in t for t in texts))
+        self.assertFalse(any("Сир — 1 шт. → Сир — 1 шт." in t for t in texts))
+
+    # No journal-writing call may ever happen for a no-op rename — the
+    # regression was an empty "Буде повернено:" undo preview created by a
+    # meaningless UPDATE+journal-INSERT for an unchanged row.
+    def test_noop_rename_never_calls_execute_inventory_rename(self):
+        chat_id = 771007
+        already_renamed_row = {
+            "id": 5, "name": "Сир", "canonical_name": "сир", "category": "Молочне та яйця",
+            "quantity_value": Decimal("1"), "quantity_unit": "шт.", "quantity_text": "1 шт.",
+        }
+        with patch.object(bot, "get_inventory_items", return_value=[already_renamed_row]):
+            with patch.object(bot, "execute_inventory_rename") as mock_rename:
+                _call_webhook(_make_update(771000007, chat_id, "перейменуй ser на сир"))
+        mock_rename.assert_not_called()
 
     # 10. Multiple matching rows — never guess.
     def test_rename_ambiguous_asks_for_clarification(self):
@@ -559,6 +677,58 @@ class TestDeletePreview(InventoryAdminWebhookTestCase):
         # a LATER undo press must reach normal historical undo, not the
         # (now stale) "cleanup check" acknowledgement.
         self.assertNotIn(chat_id, pending_cleanup_notice)
+
+
+class TestDeleteByNameAndNumericQuantity(InventoryAdminWebhookTestCase):
+    """V1.4 live bug: "прибери Молоко 1 шт" (numeric count, no dash) failed
+    to find "Молоко — 1 шт." next to "Молоко — 12,5 л" — parse_inventory_
+    delete_request only split off a WORD-number quantity ("пару"), never a
+    numeric one."""
+
+    def _assert_targets_only_pieces_row(self, chat_id, update_id, text):
+        with patch.object(bot, "get_inventory_items", return_value=_milk_litres_and_pieces_rows()):
+            _call_webhook(_make_update(update_id, chat_id, text))
+        self.assertIn(chat_id, pending_cleanup_admin, f"{text!r} did not create a pending delete")
+        entry = pending_cleanup_admin[chat_id]
+        self.assertEqual(entry["action"], "delete")
+        self.assertEqual(entry["item_id"], 21)
+        texts = self._sent_texts()
+        self.assertTrue(any("Прибрати Молоко — 1 шт." in t for t in texts))
+        self.assertFalse(any("12,5" in t for t in texts))
+
+    def test_prybery_no_dash(self):
+        self._assert_targets_only_pieces_row(771091, 771091001, "прибери Молоко 1 шт")
+
+    def test_prybery_dash(self):
+        self._assert_targets_only_pieces_row(771092, 771092001, "прибери Молоко — 1 шт")
+
+    def test_vydaly_no_dash(self):
+        self._assert_targets_only_pieces_row(771093, 771093001, "видали Молоко 1 шт")
+
+    def test_vydaly_dash(self):
+        self._assert_targets_only_pieces_row(771094, 771094001, "видали Молоко — 1 шт")
+
+    def test_lowercase_name_stuku(self):
+        self._assert_targets_only_pieces_row(771095, 771095001, "прибери молоко 1 штуку")
+
+    def test_trailing_dot_after_unit(self):
+        self._assert_targets_only_pieces_row(771096, 771096001, "прибери молоко 1 шт.")
+
+    def test_does_not_match_litres_row(self):
+        chat_id = 771099
+        with patch.object(bot, "get_inventory_items", return_value=_milk_litres_and_pieces_rows()):
+            _call_webhook(_make_update(771099001, chat_id, "прибери Молоко 12,5 л"))
+        self.assertIn(chat_id, pending_cleanup_admin)
+        self.assertEqual(pending_cleanup_admin[chat_id]["item_id"], 20)
+
+    # If quantity narrowing still leaves 2+ rows, ask for clarification —
+    # never silently guess.
+    def test_still_ambiguous_without_narrowing_quantity(self):
+        chat_id = 771098
+        with patch.object(bot, "get_inventory_items", return_value=_milk_multi_rows()):
+            _call_webhook(_make_update(771098001, chat_id, "прибери Молоко 5 л"))
+        self.assertNotIn(chat_id, pending_cleanup_admin)
+        self.assertTrue(any("не хочу вгадувати" in t for t in self._sent_texts()))
 
 
 class TestDeleteConfirmAndCancel(InventoryAdminWebhookTestCase):
@@ -937,6 +1107,16 @@ class TestExistingRoutesStillWork(InventoryAdminWebhookTestCase):
         self.assertTrue(self._sent_texts())
         self.assertNotIn(chat_id, pending_cleanup_admin)
 
+    # V1.4 regression check: none of the new no-op-rename/numeric-quantity/
+    # destructive-guard-followup changes touch general AI-chat routing.
+    def test_general_ai_still_answers_unrelated_questions(self):
+        chat_id = 771055
+        with patch.object(bot, "call_gemini", return_value="Бо це білок казеїн реагує на кислоту.") as mock_gemini:
+            _call_webhook(_make_update(771000055, chat_id, "Поясни коротко, чому молоко згортається в каві?"))
+        mock_gemini.assert_called_once()
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        self.assertNotIn(chat_id, pending_cleanup_admin)
+
     def test_meal_ideas_question_still_works(self):
         chat_id = 771051
         with patch.object(bot.meal_ideas, "try_handle_meal_ideas", return_value=True) as mock_meal:
@@ -998,6 +1178,9 @@ class TestDestructiveBulkHouseholdGuard(InventoryAdminWebhookTestCase):
         self.assertEqual(self._sent_texts(), [DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG])
         self.assertNotIn(chat_id, pending_cleanup_admin)
         self.assertNotIn(chat_id, pending_cleanup_admin_disambiguation)
+        # V1.4: the guard now stores a pending context so a destination
+        # follow-up ("покупки"/"запаси") is intercepted too.
+        self.assertIn(chat_id, pending_destructive_guard)
 
     def test_vydaly_vse(self):
         self._assert_guarded("Видали все", 771070)
@@ -1037,6 +1220,96 @@ class TestDestructiveBulkHouseholdGuard(InventoryAdminWebhookTestCase):
             _call_webhook(_make_update(771080001, chat_id, "видали mlekо із запасів"))
         self.assertIn(chat_id, pending_cleanup_admin)
         self.assertFalse(any(t == DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG for t in self._sent_texts()))
+
+
+class TestDestructiveGuardFollowup(InventoryAdminWebhookTestCase):
+    """V1.4 live bug: after "Видали все" -> "покупки чи запаси?", replying
+    "покупки" fell into the ordinary shopping read-list route instead of a
+    controlled destructive-guard response."""
+
+    def _trigger_guard(self, chat_id, update_id):
+        _call_webhook(_make_update(update_id, chat_id, "Видали все"))
+        self.assertIn(chat_id, pending_destructive_guard)
+        self.mock_send.reset_mock()
+
+    def test_pokupky_followup_does_not_show_shopping_list(self):
+        chat_id = 771100
+        self._trigger_guard(chat_id, 771100001)
+        with patch.object(bot, "get_active_shopping_items") as mock_shopping_items:
+            _call_webhook(_make_update(771100002, chat_id, "покупки"))
+        mock_shopping_items.assert_not_called()
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        texts = self._sent_texts()
+        self.assertEqual(texts, [DESTRUCTIVE_BULK_NOT_IMPLEMENTED_MSG])
+
+    def test_zapasy_followup_does_not_show_inventory_list(self):
+        chat_id = 771101
+        self._trigger_guard(chat_id, 771101001)
+        with patch.object(bot, "get_inventory_items") as mock_inventory_items:
+            _call_webhook(_make_update(771101002, chat_id, "запаси"))
+        mock_inventory_items.assert_not_called()
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        texts = self._sent_texts()
+        self.assertEqual(texts, [DESTRUCTIVE_BULK_NOT_IMPLEMENTED_MSG])
+
+    def test_spysok_pokupok_followup_recognized(self):
+        chat_id = 771102
+        self._trigger_guard(chat_id, 771102001)
+        _call_webhook(_make_update(771102002, chat_id, "список покупок"))
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        self.assertEqual(self._sent_texts(), [DESTRUCTIVE_BULK_NOT_IMPLEMENTED_MSG])
+
+    def test_inventar_followup_recognized(self):
+        chat_id = 771103
+        self._trigger_guard(chat_id, 771103001)
+        _call_webhook(_make_update(771103002, chat_id, "інвентар"))
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        self.assertEqual(self._sent_texts(), [DESTRUCTIVE_BULK_NOT_IMPLEMENTED_MSG])
+
+    def test_followup_never_writes_db(self):
+        chat_id = 771104
+        self._trigger_guard(chat_id, 771104001)
+        with patch.object(bot, "delete_items_batch") as mock_delete_shopping, \
+             patch.object(bot, "execute_inventory_delete") as mock_delete_inventory:
+            _call_webhook(_make_update(771104002, chat_id, "покупки"))
+        mock_delete_shopping.assert_not_called()
+        mock_delete_inventory.assert_not_called()
+
+    def test_cancel_button_clears_context(self):
+        chat_id = 771105
+        self._trigger_guard(chat_id, 771105001)
+        _call_webhook(_make_update(771105002, chat_id, "❌ Скасувати"))
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        self.assertEqual(self._sent_texts(), [DESTRUCTIVE_GUARD_CANCELLED_MSG])
+
+    def test_undo_button_clears_context(self):
+        chat_id = 771106
+        self._trigger_guard(chat_id, 771106001)
+        _call_webhook(_make_update(771106002, chat_id, "↩️ Скасувати останню дію"))
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        self.assertEqual(self._sent_texts(), [DESTRUCTIVE_GUARD_CANCELLED_MSG])
+
+    # After the context clears (unrecognized follow-up), ordinary routing
+    # must still work normally for that SAME message.
+    def test_unrelated_followup_clears_context_and_routes_normally(self):
+        chat_id = 771107
+        self._trigger_guard(chat_id, 771107001)
+        with patch.object(bot, "get_active_shopping_items", return_value=[]):
+            _call_webhook(_make_update(771107002, chat_id, "Що треба купити?"))
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        self.assertTrue(self._sent_texts())
+        self.assertNotEqual(self._sent_texts(), [DESTRUCTIVE_BULK_NOT_IMPLEMENTED_MSG])
+
+    # After the context clears, a fresh cleanup-admin request still works.
+    def test_after_cleared_ordinary_admin_route_still_works(self):
+        chat_id = 771108
+        self._trigger_guard(chat_id, 771108001)
+        _call_webhook(_make_update(771108002, chat_id, "якийсь інший текст"))
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        self.mock_send.reset_mock()
+        with patch.object(bot, "get_inventory_items", return_value=[_cheese_dirty_row()]):
+            _call_webhook(_make_update(771108003, chat_id, "перейменуй ser на сир"))
+        self.assertIn(chat_id, pending_cleanup_admin)
 
 
 if __name__ == "__main__":

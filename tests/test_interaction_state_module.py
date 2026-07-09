@@ -63,6 +63,7 @@ def _make_fake_deps(**overrides):
         pending_add_destination_clarification={},
         pending_cleanup_admin={},
         pending_cleanup_admin_disambiguation={},
+        pending_destructive_guard={},
         pending_undo_action={},
         active_list_context={},
         saved_list_context={},
@@ -193,7 +194,7 @@ class TestClearInteractionStateSnapshot(unittest.TestCase):
             deps.pending_alias_action, deps.pending_global_household,
             deps.pending_inventory_quantity_clarification, deps.pending_inventory_representation_clarification,
             deps.pending_add_destination_clarification, deps.pending_undo_action,
-            deps.pending_cleanup_admin_disambiguation,
+            deps.pending_cleanup_admin_disambiguation, deps.pending_destructive_guard,
         )
         for d in all_dicts:
             d[chat_id] = "marker"
