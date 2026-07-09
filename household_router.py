@@ -1119,14 +1119,59 @@ def build_household_operations_preview(text, shopping_items, inventory_items, re
 # already rejects); build_explicit_add_preview always assigns every parsed
 # item to the ONE destination bucket Python already decided.
 # =========================
+# Shared add-verb alternation — the imperative "Додай"/"Додайте" AND the
+# infinitive "Додати" (a common live-bug shape: bot-preview-style action
+# lines like "Додати Тестовий чай — 1 шт." use the infinitive, not the
+# imperative). Every "^додай(?:те)?" anchor below also accepts "додати" for
+# this reason.
+_ADD_VERB_RE = r"(?:додай(?:те)?|додати)"
+
+# A leading bullet ("•"/"-") plus add-verb on its OWN line — only ever
+# stripped from the 2nd+ line of an already-destination-resolved multi-line
+# item text (never the first line, which detect_explicit_add_destination/
+# detect_bare_add/detect_header_add_destination already consumed via their
+# own anchored match) — so a pasted-back multi-line preview like
+# "Додати Тестовий чай — 1 шт.\nДодати Зелений чай — 1 шт." reaches Gemini
+# as plain item lines instead of noisy repeated verbs.
+_LINE_ADD_VERB_RE = re.compile(r"^[•\-]?\s*" + _ADD_VERB_RE + r"\s+", re.IGNORECASE)
+
+
+def _strip_line_add_verbs(text):
+    """Strip a leading bullet+add-verb from EACH line of `text` (see
+    _LINE_ADD_VERB_RE) — a line with no such marker is returned unchanged.
+    Pure text cleanup only, never touches item content itself."""
+    return "\n".join(_LINE_ADD_VERB_RE.sub("", line, count=1) for line in text.splitlines())
+
+
 _EXPLICIT_SHOPPING_DESTINATION_RE = re.compile(
-    r"^додай(?:те)?\s+(?:до\s+покупок|у\s+покупки|в\s+список\s+покупок)[:\-]?\s+",
+    r"^" + _ADD_VERB_RE + r"\s+(?:до\s+покупок|у\s+покупки|в\s+список\s+покупок)[:\-]?\s+",
     re.IGNORECASE,
 )
 _EXPLICIT_INVENTORY_DESTINATION_RE = re.compile(
-    r"^додай(?:те)?\s+(?:в\s+запаси|у\s+запаси|до\s+запасів)[:\-]?\s+",
+    r"^" + _ADD_VERB_RE + r"\s+(?:в\s+запаси|у\s+запаси|до\s+запасів)[:\-]?\s+",
     re.IGNORECASE,
 )
+
+# A standalone destination HEADER as the very first line of a multi-line
+# message — the exact main-menu button labels ("🛒 Покупки"/"🧊 Запаси") or a
+# bare "до покупок"/"до запасів" line — followed by item lines below it.
+# Deliberately requires the header to be the WHOLE first line (never a
+# substring of a longer line) so it can never misfire on an ordinary
+# sentence that happens to mention "покупки"/"запаси" in passing.
+_HEADER_SHOPPING_LINE_RE = re.compile(r"^🛒\s*Покупки\s*$|^до\s+покупок\s*$", re.IGNORECASE)
+_HEADER_INVENTORY_LINE_RE = re.compile(r"^🧊\s*Запаси\s*$|^до\s+запасів\s*$", re.IGNORECASE)
+
+# U+FE0F/U+FE0E (emoji/text presentation variation selectors) — a Telegram
+# client may or may not append one to "🛒"/"🧊" depending on client/cache
+# (same reasoning as message_dispatcher.strip_variation_selectors, which
+# this module can't import without creating a dependency on the dispatch
+# layer — a two-codepoint local translate table is simpler than a cross-
+# module call for this one narrow header-line comparison).
+_HEADER_VARIATION_SELECTORS = "︎️"
+
+
+def _strip_header_variation_selectors(line):
+    return line.translate({ord(ch): None for ch in _HEADER_VARIATION_SELECTORS})
 
 
 def detect_explicit_add_destination(text):
@@ -1145,12 +1190,43 @@ def detect_explicit_add_destination(text):
         return None, None
     match = _EXPLICIT_SHOPPING_DESTINATION_RE.match(stripped)
     if match:
-        rest = stripped[match.end():].strip()
+        rest = _strip_line_add_verbs(stripped[match.end():].strip())
         return ("add_shopping", rest) if rest else (None, None)
     match = _EXPLICIT_INVENTORY_DESTINATION_RE.match(stripped)
     if match:
-        rest = stripped[match.end():].strip()
+        rest = _strip_line_add_verbs(stripped[match.end():].strip())
         return ("add_inventory", rest) if rest else (None, None)
+    return None, None
+
+
+def detect_header_add_destination(text):
+    """Deterministically detect a STANDALONE destination header line
+    ("🛒 Покупки"/"🧊 Запаси"/"до покупок"/"до запасів" — see
+    _HEADER_SHOPPING_LINE_RE/_HEADER_INVENTORY_LINE_RE) as the very first
+    line of a multi-line message, followed by one or more item lines below
+    it — e.g. a bot-preview-style block the user pasted back:
+        🛒 Покупки
+        Додати Тестовий чай — 1 шт.
+    Never fuzzy — the header must be the ENTIRE first line, nothing else on
+    it (see module docstring). Returns ("add_shopping"|"add_inventory",
+    item_text) with the header line stripped off (and any per-line "Додати"
+    verb noise on the remaining lines cleaned via _strip_line_add_verbs), or
+    (None, None) if the first line isn't an exact header match or there's
+    no remaining item text below it.
+    """
+    if not isinstance(text, str):
+        return None, None
+    lines = text.strip().splitlines()
+    if len(lines) < 2:
+        return None, None
+    first_line = _strip_header_variation_selectors(lines[0].strip())
+    rest = _strip_line_add_verbs("\n".join(lines[1:]).strip())
+    if not rest:
+        return None, None
+    if _HEADER_SHOPPING_LINE_RE.match(first_line):
+        return "add_shopping", rest
+    if _HEADER_INVENTORY_LINE_RE.match(first_line):
+        return "add_inventory", rest
     return None, None
 
 
@@ -1315,28 +1391,32 @@ def build_explicit_add_preview(destination, item_text, inventory_items, alias_ma
 
 
 # =========================
-# GLOBAL BARE ADD v1 — "Додай молоко" with NO destination phrase at all.
-# detect_bare_add strips just the bare "Додай"/"Додайте" verb (deterministic,
-# no Gemini) and deliberately refuses any fragment carrying an expense-amount
-# marker (zł/zl/pln/a bare "z"), so a message like "Додай молоко за 10 zł"
-# is never treated as a bare add at all — it falls through unchanged to
-# whichever existing gate already owns that phrasing (the expense-add gate),
-# exactly like before this feature existed. Item parsing itself
-# (parse_bare_add_items) reuses the SAME Gemini prompt/validation as Global
-# Explicit Add v1 — there is no second parser — and is destination-agnostic,
-# so callers can parse once, ask "покупки чи запаси?" if the active menu
-# doesn't already answer that, and only then call
+# GLOBAL BARE ADD v1 — "Додай молоко"/"Додати молоко" with NO destination
+# phrase at all. detect_bare_add strips just the bare add verb
+# (deterministic, no Gemini — see _ADD_VERB_RE) and deliberately refuses any
+# fragment carrying an expense-amount marker (zł/zl/pln/a bare "z"), so a
+# message like "Додай молоко за 10 zł" is never treated as a bare add at all
+# — it falls through unchanged to whichever existing gate already owns that
+# phrasing (the expense-add gate), exactly like before this feature existed.
+# Item parsing itself (parse_bare_add_items) reuses the SAME Gemini prompt/
+# validation as Global Explicit Add v1 — there is no second parser — and is
+# destination-agnostic, so callers can parse once, ask "покупки чи запаси?"
+# if the active menu doesn't already answer that, and only then call
 # build_add_preview_from_items without ever calling Gemini a second time.
 # =========================
-_BARE_ADD_RE = re.compile(r"^додай(?:те)?\s+", re.IGNORECASE)
+_BARE_ADD_RE = re.compile(r"^" + _ADD_VERB_RE + r"\s+", re.IGNORECASE)
 
 
 def detect_bare_add(text):
-    """Returns the item text (bare "Додай"/"Додайте" verb stripped) if `text`
-    is a bare add command with no explicit destination and no expense-amount
-    marker, or None otherwise. Caller must already have ruled out an explicit
-    destination phrase (detect_explicit_add_destination) before calling this
-    — a message that matches both is always handled as the explicit-add one.
+    """Returns the item text (bare add verb stripped — "Додай"/"Додайте"/
+    "Додати", see _ADD_VERB_RE) if `text` is a bare add command with no
+    explicit destination and no expense-amount marker, or None otherwise.
+    Caller must already have ruled out an explicit destination phrase
+    (detect_explicit_add_destination) before calling this — a message that
+    matches both is always handled as the explicit-add one. Any per-line
+    add-verb noise on a 2nd+ line (e.g. a pasted-back multi-line preview
+    where every line starts with "Додати") is cleaned via
+    _strip_line_add_verbs before Gemini ever sees it.
     """
     if not isinstance(text, str):
         return None
@@ -1346,7 +1426,7 @@ def detect_bare_add(text):
     match = _BARE_ADD_RE.match(stripped)
     if not match:
         return None
-    rest = stripped[match.end():].strip()
+    rest = _strip_line_add_verbs(stripped[match.end():].strip())
     if not rest:
         return None
     if expenses._EXPENSE_AMOUNT_RE.search(rest):

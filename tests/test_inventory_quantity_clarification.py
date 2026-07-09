@@ -340,5 +340,93 @@ class TestClarificationContinuation(_BaseGlobalRouterTestCase):
         self.assertTrue(any("Сир" in t and "3 шт." in t and "500 г" in t for t in texts))
 
 
+def _milk_single_row():
+    return {"id": 401, "name": "Молоко", "category": "Молочне та яйця", "canonical_name": "молоко",
+             "quantity_value": 9.5, "quantity_unit": "л", "quantity_text": "9,5 л", "quantity_inferred": False}
+
+
+class TestSingleRowQuantityClarificationWording(_BaseGlobalRouterTestCase):
+    """V1.2 bugfix: with exactly ONE existing row, the clarification must
+    ask "Скільки додати?" — never "до якого запису" (that phrasing is only
+    correct when there are 2+ candidate rows)."""
+
+    # 9. Exactly one existing row asks "how much", never "which record".
+    def test_single_row_asks_how_much_not_which_record(self):
+        chat_id = 996020
+        with patch.object(bot, "get_inventory_items", return_value=[_milk_single_row()]):
+            self.mock_hr.return_value = _bare_milk_router_result()
+            _call_webhook(_make_update(996000020, chat_id, "Купив молоко"))
+        self.assertIn(chat_id, pending_inventory_quantity_clarification)
+        texts = self._sent_texts()
+        self.assertTrue(any(
+            "У запасах уже є «Молоко — 9,5 л»." in t and "Скільки додати?" in t
+            for t in texts
+        ))
+        self.assertFalse(any("до якого запису" in t for t in texts))
+
+
+class TestSingleRowBareNumberQuantity(_BaseGlobalRouterTestCase):
+    """V1.2 optional improvement: a bare number reply during a single-row
+    quantity clarification is accepted using that row's existing unit."""
+
+    def _seed_single_row_clarification(self, chat_id):
+        pending_inventory_quantity_clarification[chat_id] = {
+            "household_id": 1, "user_db_id": 10, "origin": "global",
+            "item_name": "Молоко", "canonical_name": "молоко", "category": "Молочне та яйця",
+            "add_shopping_items": [],
+            "add_inventory_items": [_milk_item(1.0, "шт.", "1 шт.", True)],
+            "consume_changes": [],
+            "new_expense": None,
+            "delete_expense": None,
+        }
+
+    # 10. Explicit "2л" still works exactly as before for the single-row case.
+    def test_explicit_quantity_reply_still_works(self):
+        chat_id = 996021
+        self._seed_single_row_clarification(chat_id)
+        with patch.object(bot, "get_inventory_items", return_value=[_milk_single_row()]):
+            _call_webhook(_make_update(996000021, chat_id, "2л"))
+        self.assertNotIn(chat_id, pending_inventory_quantity_clarification)
+        self.assertIn(chat_id, pending_global_household)
+        texts = self._sent_texts()
+        self.assertTrue(any("Молоко — 9,5 л + 2 л → буде 11,5 л" in t for t in texts))
+
+    # 11. Bare "2" (no unit) during a single-row clarification is accepted
+    # as "2 л" — the existing row's own unit.
+    def test_bare_number_defaults_to_existing_rows_unit(self):
+        chat_id = 996022
+        self._seed_single_row_clarification(chat_id)
+        with patch.object(bot, "get_inventory_items", return_value=[_milk_single_row()]):
+            _call_webhook(_make_update(996000022, chat_id, "2"))
+        self.assertNotIn(chat_id, pending_inventory_quantity_clarification)
+        self.assertIn(chat_id, pending_global_household)
+        texts = self._sent_texts()
+        self.assertTrue(any("Молоко — 9,5 л + 2 л → буде 11,5 л" in t for t in texts))
+
+    # A bare number stays rejected when 2+ rows make the unit ambiguous —
+    # the fallback only ever applies to the unambiguous single-row case.
+    def test_bare_number_still_rejected_with_multiple_rows(self):
+        chat_id = 996023
+        self._seed_single_row_clarification(chat_id)
+        with patch.object(bot, "get_inventory_items", return_value=[_milk_liters_row(), _milk_pieces_row()]):
+            _call_webhook(_make_update(996000023, chat_id, "2"))
+        self.assertIn(chat_id, pending_inventory_quantity_clarification)
+        self.mock_call_gemini.assert_not_called()
+        texts = self._sent_texts()
+        self.assertTrue(any("Потрібна точна кількість з одиницею." in t for t in texts))
+
+    # A genuinely invalid reply is still rejected without ever touching the
+    # database (no get_inventory_items patch needed/expected here).
+    def test_garbage_reply_still_rejected_without_db_call(self):
+        chat_id = 996024
+        self._seed_single_row_clarification(chat_id)
+        with patch.object(bot, "get_inventory_items") as mock_get_items:
+            _call_webhook(_make_update(996000024, chat_id, "багато"))
+            mock_get_items.assert_not_called()
+        self.assertIn(chat_id, pending_inventory_quantity_clarification)
+        texts = self._sent_texts()
+        self.assertTrue(any("Потрібна точна кількість з одиницею." in t for t in texts))
+
+
 if __name__ == '__main__':
     unittest.main()

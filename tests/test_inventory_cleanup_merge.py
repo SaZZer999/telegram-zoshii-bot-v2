@@ -37,14 +37,18 @@ os.environ.setdefault('GROQ_API_KEY', 'test_groq_key')
 os.environ.setdefault('GEMINI_API_KEY', 'test_gemini_key')
 os.environ.setdefault('ALLOWED_USER_IDS', '')
 
+import action_history  # noqa: E402
 import bot  # noqa: E402
 from bot import (  # noqa: E402
     pending_merge,
+    pending_cleanup_notice,
+    pending_undo_action,
     canonicalize_name,
     STALE_PREVIEW_MSG,
     INVENTORY_KEYBOARD,
     MERGE_PREVIEW_KEYBOARD,
     GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG,
+    CLEANUP_NOTICE_ACKNOWLEDGED_MSG,
 )
 
 
@@ -378,6 +382,8 @@ def _sausage_rows():
 class InventoryCleanupWebhookTestCase(unittest.TestCase):
     def setUp(self):
         pending_merge.clear()
+        pending_cleanup_notice.clear()
+        pending_undo_action.clear()
         patcher_send = patch.object(bot, "send_message")
         self.mock_send = patcher_send.start()
         self.addCleanup(patcher_send.stop)
@@ -390,6 +396,8 @@ class InventoryCleanupWebhookTestCase(unittest.TestCase):
 
     def tearDown(self):
         pending_merge.clear()
+        pending_cleanup_notice.clear()
+        pending_undo_action.clear()
 
     def _sent_texts(self):
         return [call.args[1] for call in self.mock_send.call_args_list]
@@ -601,6 +609,65 @@ class TestConfirmAndCancel(InventoryCleanupWebhookTestCase):
         _call_webhook(_make_update(770000022, chat_id, "❌ Скасувати"))
         self.assertNotIn(chat_id, pending_merge)
         self.assertTrue(any("Об'єднання скасовано." in t for t in self._sent_texts()))
+
+
+class TestReadOnlyCleanupWarningUndoInterception(InventoryCleanupWebhookTestCase):
+    """V1.2 bugfix: a read-only "no safe merge found" cleanup check (no
+    pending_merge entry — see test_sausage_rows_found_but_not_merged_and_
+    no_confirm_button above) must never let the very next "↩️ Скасувати
+    останню дію"/"❌ Скасувати" press silently open an unrelated OLDER
+    historical undo — it must acknowledge THIS read-only check instead, then
+    clear itself so a later undo press behaves normally again."""
+
+    def _run_sausage_cleanup(self, chat_id):
+        with patch.object(bot, "get_inventory_items", return_value=_sausage_rows()):
+            _call_webhook(_make_update(chat_id * 10, chat_id, "об'єднай сосиски в запасах"))
+        self.mock_send.reset_mock()
+
+    # 7. Undo button right after the read-only warning acknowledges it
+    # instead of opening historical undo.
+    def test_undo_button_acknowledges_readonly_check_first(self):
+        chat_id = 770030
+        self._run_sausage_cleanup(chat_id)
+        self.assertIn(chat_id, pending_cleanup_notice)
+        with patch.object(bot, "get_latest_undoable_action") as mock_get_action:
+            _call_webhook(_make_update(770000041, chat_id, action_history.UNDO_BUTTON_TEXT))
+        mock_get_action.assert_not_called()
+        self.assertNotIn(chat_id, pending_cleanup_notice)
+        self.assertTrue(any(CLEANUP_NOTICE_ACKNOWLEDGED_MSG == t for t in self._sent_texts()))
+
+    # 8. After the notice is cleared, a SECOND undo press behaves normally
+    # (reaches the real historical-undo lookup).
+    def test_second_undo_press_reaches_normal_historical_undo(self):
+        chat_id = 770031
+        self._run_sausage_cleanup(chat_id)
+        with patch.object(bot, "get_latest_undoable_action", return_value=None):
+            _call_webhook(_make_update(770000042, chat_id, action_history.UNDO_BUTTON_TEXT))
+        self.assertNotIn(chat_id, pending_cleanup_notice)
+        self.mock_send.reset_mock()
+
+        with patch.object(bot, "get_latest_undoable_action", return_value=None) as mock_get_action:
+            _call_webhook(_make_update(770000043, chat_id, action_history.UNDO_BUTTON_TEXT))
+        mock_get_action.assert_called_once_with(1, 10)
+        self.assertTrue(any(action_history.NO_UNDOABLE_ACTION_MSG == t for t in self._sent_texts()))
+
+    # "❌ Скасувати" right after the read-only warning acknowledges it the
+    # same way as the undo button.
+    def test_cancel_button_acknowledges_readonly_check(self):
+        chat_id = 770032
+        self._run_sausage_cleanup(chat_id)
+        _call_webhook(_make_update(770000044, chat_id, "❌ Скасувати"))
+        self.assertNotIn(chat_id, pending_cleanup_notice)
+        self.assertTrue(any(CLEANUP_NOTICE_ACKNOWLEDGED_MSG == t for t in self._sent_texts()))
+
+    # A SAFE merge preview (pending_merge set) is unaffected by this notice
+    # — its own dedicated undo/cancel wiring (tested above) still wins.
+    def test_safe_merge_preview_never_sets_cleanup_notice(self):
+        chat_id = 770033
+        with patch.object(bot, "get_inventory_items", return_value=_milk_rows()):
+            _call_webhook(_make_update(770000045, chat_id, "об'єднай молоко в запасах"))
+        self.assertNotIn(chat_id, pending_cleanup_notice)
+        self.assertIn(chat_id, pending_merge)
 
 
 # =========================

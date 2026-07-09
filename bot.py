@@ -144,6 +144,14 @@ pending_compound_inventory = {}  # chat_id -> {inventory_changes, add_to_shoppin
 pending_inventory_reconciliation = {}  # chat_id -> {updates, additions, deletes, household_id, user_db_id}
 pending_inventory_reconciliation_clarify = {}  # chat_id -> {ambiguous_group, rest, household_id, user_db_id}
 pending_alias_action = {}     # chat_id -> {kind: "create"|"update"|"delete", household_id, user_db_id, alias_text, target_display_name, alias_normalized (delete only)}
+# Inventory Cleanup read-only-warning notice — set when "об'єднай X в
+# запасах" finds duplicate rows but none are safely auto-mergeable (see
+# _start_inventory_cleanup's "not validated_groups" branch): nothing was
+# written and there's no pending_merge entry to confirm/cancel, but the very
+# next "↩️ Скасувати останню дію"/"❌ Скасувати" press must acknowledge THIS
+# read-only check instead of silently falling through to an unrelated older
+# historical undo. Holds no data — chat_id membership is the only signal.
+pending_cleanup_notice = {}   # chat_id -> True
 # Expense pending state now lives in expenses.py — re-exported here (same
 # dict objects, not copies) so every existing bot.<name> reference/test
 # keeps working unchanged.
@@ -241,7 +249,8 @@ def _has_active_expense_preview(chat_id):
 # this check at all, so including them here would be dead code.
 def _has_active_pending_clarification_or_preview(chat_id):
     return (
-        chat_id in pending_inventory_quantity_clarification
+        chat_id in pending_cleanup_notice
+        or chat_id in pending_inventory_quantity_clarification
         or chat_id in pending_inventory_representation_clarification
         or chat_id in pending_global_household
         or chat_id in pending_add_destination_clarification
@@ -255,6 +264,14 @@ def _cancel_active_pending_operation(chat_id):
     choice as the matching "❌ Скасувати" branch in
     _try_handle_confirm_or_cancel, just without that branch's own
     per-flow-specific message text."""
+    if chat_id in pending_cleanup_notice:
+        # A read-only "об'єднай X в запасах" check found nothing safe to
+        # auto-merge — no DB write happened, so acknowledge that instead of
+        # the generic "Поточну дію скасовано." wording, which would wrongly
+        # imply something was undone.
+        pending_cleanup_notice.pop(chat_id, None)
+        send_message(chat_id, CLEANUP_NOTICE_ACKNOWLEDGED_MSG, reply_markup=INVENTORY_KEYBOARD)
+        return
     if chat_id in pending_inventory_quantity_clarification:
         data = pending_inventory_quantity_clarification.pop(chat_id, None)
         keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
@@ -2641,6 +2658,9 @@ def _merge_snapshot_targets(validated_groups):
     return list_editing._merge_snapshot_targets(validated_groups, canonicalize_name, DEFAULT_CATEGORY)
 
 
+CLEANUP_NOTICE_ACKNOWLEDGED_MSG = "Цю перевірку скасовано. Я нічого не змінював."
+
+
 # =========================
 # INVENTORY CLEANUP / MERGE v1.1
 # =========================
@@ -2695,8 +2715,12 @@ def _start_inventory_cleanup(chat_id, user_id, display_name, product_phrase):
     preview = inventory.format_inventory_cleanup_preview(validated_groups, grouping["incompatible"], _effective_quantity)
 
     if not validated_groups:
-        # Nothing safe to auto-merge — read-only warning, no pending state
-        # (nothing to confirm/cancel), no merge keyboard.
+        # Nothing safe to auto-merge — read-only warning, no pending_merge
+        # entry (nothing to confirm/cancel), no merge keyboard. Still record
+        # a small ephemeral notice so the very next "↩️ Скасувати останню
+        # дію"/"❌ Скасувати" press acknowledges THIS read-only check
+        # instead of silently opening an unrelated older historical undo.
+        pending_cleanup_notice[chat_id] = True
         send_message(chat_id, preview, reply_markup=INVENTORY_KEYBOARD)
         return
 
@@ -2960,7 +2984,7 @@ def _try_global_household_router(chat_id, user_id, display_name, text):
 # not "add an item", so it must keep working through the existing expense-add
 # flow untouched.
 # =========================
-_AMBIGUOUS_ADD_PREFIX_RE = re.compile(r"^додай(?:те)?\s+", re.IGNORECASE)
+_AMBIGUOUS_ADD_PREFIX_RE = re.compile(r"^(?:додай(?:те)?|додати)\s+", re.IGNORECASE)
 _AMBIGUOUS_ADD_EXPENSE_WORD_RE = re.compile(r"^витрат\w*", re.IGNORECASE)
 
 AMBIGUOUS_ADD_WITH_PRICE_MSG = (
@@ -3008,15 +3032,19 @@ def _handle_ambiguous_add_with_price(chat_id):
 def _try_global_explicit_add(chat_id, user_id, display_name, text):
     """Global Explicit Add v1 — a message with an EXPLICIT destination
     phrase ("Додай до покупок ...", "Додай в запаси ...", see
-    household_router.detect_explicit_add_destination) adds to that list
+    household_router.detect_explicit_add_destination) OR a standalone
+    destination HEADER line ("🛒 Покупки"/"🧊 Запаси"/"до покупок"/"до
+    запасів" as the whole first line, see
+    household_router.detect_header_add_destination) adds to that list
     regardless of which menu is open. Returns True if handled (a preview,
     clarification, or invalid/unresolved message was sent). Returns False
-    only when no explicit destination phrase is present at all, letting
-    the caller fall through to _try_global_bare_add (Global Bare Add v1,
-    see below) exactly as before this route existed for every OTHER
-    message shape.
+    only when neither shape matches at all, letting the caller fall through
+    to _try_global_bare_add (Global Bare Add v1, see below) exactly as
+    before this route existed for every OTHER message shape.
     """
     destination, item_text = household_router.detect_explicit_add_destination(text)
+    if destination is None:
+        destination, item_text = household_router.detect_header_add_destination(text)
     if destination is None:
         return False
     origin = household_router.current_origin(chat_id)
@@ -3216,7 +3244,24 @@ def _continue_inventory_quantity_clarification(chat_id, text):
     message (the caller must not fall through to anything else)."""
     data = pending_inventory_quantity_clarification[chat_id]
     value, unit = _parse_explicit_clarification_quantity(text)
+
+    # Bare-number fallback: a reply that's just a positive number (no unit)
+    # can't be resolved to a definite (value, unit) pair without checking
+    # inventory first (see below) — captured here as a plain Decimal
+    # candidate, purely local, no DB call yet, so a genuinely invalid reply
+    # ("багато", "щось незрозуміле") is rejected immediately below without
+    # ever touching the database, exactly as before this fallback existed.
+    bare_value = None
     if value is None or unit is None:
+        bare_stripped = (text or "").strip().replace(",", ".")
+        try:
+            candidate = Decimal(bare_stripped)
+        except InvalidOperation:
+            candidate = None
+        if candidate is not None and candidate > 0:
+            bare_value = candidate
+
+    if value is None and bare_value is None:
         send_message(chat_id, _GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG)
         return
 
@@ -3247,6 +3292,27 @@ def _continue_inventory_quantity_clarification(chat_id, text):
             send_message(chat_id, "Не зміг безпечно продовжити цю дію. Спробуй написати команду ще раз.", reply_markup=keyboard)
             return
 
+        # Свіжий стан: re-fetch inventory now, never reuse the snapshot
+        # shown when the clarification question was asked — a conflicting
+        # row could have appeared (or disappeared) in the meantime. Fetched
+        # once here and reused below by the representation guard call too.
+        fresh_inventory_items = get_inventory_items(household_id)
+
+        if value is None:
+            # Bare-number reply — only safe to resolve when EXACTLY one
+            # existing row matches this item (same "unambiguous single row"
+            # condition format_global_quantity_clarification_message uses
+            # for its own "Скільки додати?" wording): a bare "2" then
+            # unambiguously means "2 <that row's unit>". With 0 or 2+
+            # matching rows the unit is NOT unambiguous, so the reply is
+            # still rejected, same as before this fallback existed.
+            single_matches = find_inventory_representation_matches(fresh_inventory_items, canonical_name, category)
+            if len(single_matches) != 1:
+                send_message(chat_id, _GLOBAL_QUANTITY_CLARIFICATION_INVALID_MSG)
+                return
+            _, fallback_unit, _ = _effective_quantity(single_matches[0])
+            value, unit = bare_value, fallback_unit
+
         resolved_item = dict(add_inventory_items[match_index])
         resolved_item["quantity_value"] = value
         resolved_item["quantity_unit"] = unit
@@ -3257,10 +3323,6 @@ def _continue_inventory_quantity_clarification(chat_id, text):
         updated_items = list(add_inventory_items)
         updated_items[match_index] = resolved_item
 
-        # Свіжий стан: re-fetch inventory now, never reuse the snapshot
-        # shown when the clarification question was asked — a conflicting
-        # row could have appeared (or disappeared) in the meantime.
-        fresh_inventory_items = get_inventory_items(household_id)
         guard_kind, guard_result = household_router.apply_inventory_representation_guard(
             updated_items, fresh_inventory_items,
         )
@@ -3972,12 +4034,52 @@ def _route_saved_list_router(chat_id, user_id, display_name, text):
     return False
 
 
+# Household-Action-Line Fallback Guard v1 — a last-resort, LOCAL (no Gemini)
+# safety net checked right before general AI-chat. Every deterministic
+# add-flow route (ambiguous-add-price guard, Global Explicit/Header/Bare
+# Add, household_router.gate()) has already had first crack at the message
+# by this point in Phase D, so an "Додати"/"Додай"/"Додайте" line has
+# ALWAYS already been fully handled upstream — this only ever fires for
+# verb shapes V1.2 has no dedicated deterministic route for yet
+# ("Прибрати"/"Використати" bot-preview-style lines), so THOSE never fall
+# through to the general AI-chat reply, which would otherwise (correctly,
+# but confusingly for the user) explain it has no database access.
+_UNROUTED_HOUSEHOLD_ACTION_LINE_RE = re.compile(
+    r"^[•\-]?\s*(?:додай(?:те)?|додати|прибери(?:ть)?|прибрати|використай(?:те)?|використати)\s+\S",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_unrouted_household_action(text):
+    """True if ANY line of `text` starts with a household-action verb (see
+    _UNROUTED_HOUSEHOLD_ACTION_LINE_RE) followed by content — pure/local,
+    never calls Gemini."""
+    if not isinstance(text, str):
+        return False
+    return any(_UNROUTED_HOUSEHOLD_ACTION_LINE_RE.match(line.strip()) for line in text.splitlines())
+
+
+UNROUTED_HOUSEHOLD_ACTION_MSG = (
+    "Здається, це побутова дія, але я не зміг однозначно її розпізнати.\n\n"
+    "Спробуй написати конкретніше, наприклад:\n"
+    "«Купив молоко» — додати в запаси\n"
+    "«Треба купити молоко» — додати в покупки\n"
+    "«Використав 500 мл молока» — списати із запасів"
+)
+
+
 def _run_general_ai_fallback(chat_id, text):
     """Exact, unchanged general AI-chat fallback (Gemini 3.1 Flash Lite) —
     extracted from webhook()'s final block into a named function so it can
     be invoked directly for RouteOutcome.DIRECT_GENERAL_AI_FALLBACK (which
     must skip cooking mode entirely) as well as normally at the end of
-    Phase D for RouteOutcome.CONTINUE."""
+    Phase D for RouteOutcome.CONTINUE. Household-Action-Line Fallback Guard
+    v1 (see above) runs first — every household-shaped line still reaching
+    here is asked to be more specific instead of ever prompting Gemini."""
+    if _looks_like_unrouted_household_action(text):
+        send_message(chat_id, UNROUTED_HOUSEHOLD_ACTION_MSG)
+        return
+
     if chat_id not in user_history:
         user_history[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
@@ -4178,7 +4280,13 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
         return True
 
     if text == "❌ Скасувати":
-        if chat_id in pending_merge:
+        if chat_id in pending_cleanup_notice:
+            # A read-only cleanup check (no safe merge found) — nothing was
+            # written, so acknowledge it instead of falling into any of the
+            # branches below.
+            pending_cleanup_notice.pop(chat_id, None)
+            send_message(chat_id, CLEANUP_NOTICE_ACKNOWLEDGED_MSG, reply_markup=INVENTORY_KEYBOARD)
+        elif chat_id in pending_merge:
             merge_data = pending_merge.pop(chat_id)
             list_type = merge_data["list_type"]
             if list_type == "shopping_pending_add":

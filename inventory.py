@@ -240,12 +240,17 @@ def format_global_quantity_clarification_message(name, existing_items):
     here continues the ORIGINAL command instead of restating it in full,
     the example shows a bare quantity, not "Купив 1 л X"."""
     if len(existing_items) == 1:
+        # Exactly one existing row — there's no ambiguity about WHICH record
+        # to add to, only about how much, so this must never say "до якого
+        # запису" (that phrasing is reserved for the 2+ rows branch below).
         lines = [f"У запасах уже є «{name} — {existing_items[0]['quantity_text']}».", ""]
-    else:
-        lines = [f"У запасах уже є кілька записів «{name}»:", ""]
-        for item in existing_items:
-            lines.append(f"• {item['quantity_text']}")
-        lines.append("")
+        lines.append("Скільки додати?")
+        lines.append("Напиши, наприклад: «1 л» або «500 мл».")
+        return "\n".join(lines)
+    lines = [f"У запасах уже є кілька записів «{name}»:", ""]
+    for item in existing_items:
+        lines.append(f"• {item['quantity_text']}")
+    lines.append("")
     lines.append("Не хочу вгадувати, до якого запису додати нову покупку.")
     lines.append("Напиши точну кількість, наприклад: «1 л» або «500 мл».")
     return "\n".join(lines)
