@@ -1139,7 +1139,29 @@ def parse_inventory_delete_request(text):
     return rest, None
 
 
-def resolve_inventory_admin_candidates(inventory_items, canonical_name_candidates, canonicalize_name, quantity_hint=None):
+def find_inventory_admin_exact_name_matches(inventory_items, name_phrase, name_normalizer):
+    """Every existing inventory row whose OWN visible name (item['name'] —
+    NOT canonical_name) is exactly the same product as `name_phrase`, once
+    both go through `name_normalizer` (bot.py-owned: lowercase/trim +
+    Latin/Cyrillic homoglyph repair, deliberately WITHOUT the global
+    synonym table canonicalize_name applies). This is the HIGHEST-priority
+    match for Inventory Cleanup Admin rename/delete: "mlekо" must resolve to
+    the row literally named "mlekо"/"Mleko"/"Mlekо" and NEVER to a
+    DIFFERENT row (e.g. "Молоко") just because both happen to share a
+    canonical_name — that collision is exactly what canonicalize_name's own
+    synonym mapping would otherwise cause if used for this comparison.
+    Sorted by id, same convention as every other candidate-search helper in
+    this module."""
+    target = name_normalizer(name_phrase)
+    if not target:
+        return []
+    matches = [item for item in inventory_items if name_normalizer(item.get("name") or "") == target]
+    matches.sort(key=lambda it: it["id"])
+    return matches
+
+
+def resolve_inventory_admin_candidates(inventory_items, canonical_name_candidates, canonicalize_name, quantity_hint=None,
+                                        name_phrase=None, name_normalizer=None):
     """Every inventory row matching `canonical_name_candidates` (see
     find_inventory_cleanup_candidates), narrowed to an exact quantity_text
     match when `quantity_hint` is given AND that narrowing actually finds at
@@ -1150,7 +1172,29 @@ def resolve_inventory_admin_candidates(inventory_items, canonical_name_candidate
     applies rather than silently losing a real match. Comparison is
     case/whitespace-insensitive against the row's stored quantity_text
     exactly as-is — never re-parsed/re-interpreted (a legacy row's raw text
-    quantity, e.g. "пару", is exactly what this must match)."""
+    quantity, e.g. "пару", is exactly what this must match).
+
+    When `name_phrase`/`name_normalizer` are BOTH given (bot.py's Inventory
+    Cleanup Admin caller always provides them), an EXACT visible row-name
+    match (find_inventory_admin_exact_name_matches) is tried FIRST and, if
+    it finds anything at all, wins outright over the alias/canonical pool
+    below — even a single alias/canonical match is never allowed to override
+    an existing exact-name row, and quantity_hint still narrows the exact-
+    match pool the same way it narrows the fallback pool. Only when NO
+    exact visible-name match exists at all does this fall back to the
+    alias/canonical cleanup search. Callers that omit name_phrase/
+    name_normalizer (both default None) get the exact same behavior as
+    before this priority existed."""
+    if name_phrase is not None and name_normalizer is not None:
+        exact_matches = find_inventory_admin_exact_name_matches(inventory_items, name_phrase, name_normalizer)
+        if exact_matches:
+            if quantity_hint:
+                hint_norm = quantity_hint.strip().lower()
+                narrowed = [c for c in exact_matches if (c.get("quantity_text") or "").strip().lower() == hint_norm]
+                if narrowed:
+                    return narrowed
+            return exact_matches
+
     candidates = find_inventory_cleanup_candidates(inventory_items, canonical_name_candidates, canonicalize_name)
     if quantity_hint:
         hint_norm = quantity_hint.strip().lower()
@@ -1158,6 +1202,90 @@ def resolve_inventory_admin_candidates(inventory_items, canonical_name_candidate
         if narrowed:
             return narrowed
     return candidates
+
+
+def _normalize_quantity_fragment_for_disambiguation(text):
+    """Lower/trim + strip a single trailing '.' — used only to compare a
+    user-typed quantity fragment ("1 шт") against a row's stored
+    quantity_text ("1 шт."), which almost always carries that trailing
+    period. Never applied to name matching."""
+    return (text or "").strip().rstrip(".").lower()
+
+
+_ADMIN_DISAMBIGUATION_NUMBER_RE = re.compile(r"^№?\s*(\d+)\s*$")
+
+
+def resolve_cleanup_admin_disambiguation_reply(text, candidates, name_normalizer):
+    """Try to select exactly ONE row from a previously-shown Inventory
+    Cleanup Admin ambiguous-candidates list, using a short follow-up reply.
+    Deterministic, no Gemini, no fuzzy matching:
+
+      - A bare "№N" or plain "N" selects the row at that 1-based POSITION
+        in `candidates` — the exact same order they were numbered in by
+        format_inventory_admin_ambiguous_message — only when
+        1 <= N <= len(candidates).
+      - Otherwise, an optional "—"/"-" dash splits the reply into a name
+        fragment and a quantity fragment (e.g. "mlekо — 1 шт"); with no
+        dash, this also tries to peel a trailing quantity fragment off the
+        end of the text by checking whether it matches (after
+        _normalize_quantity_fragment_for_disambiguation) any candidate's
+        own quantity_text — e.g. "Mleko 1 шт" against a candidate whose
+        quantity_text is "1 шт." peels into name "Mleko" + quantity "1 шт".
+        If no candidate quantity_text matches as a suffix at all, the whole
+        reply is treated as a bare name fragment.
+      - Each detected fragment independently narrows the candidate pool: a
+        name fragment (via `name_normalizer`, same Latin/Cyrillic-homoglyph
+        tolerance as find_inventory_admin_exact_name_matches) against each
+        candidate's own name, a quantity fragment against quantity_text. A
+        fragment that matches NOTHING in the current pool is ignored rather
+        than emptying the pool (so a wrong guess never wipes out an
+        otherwise-correct narrowing from the other fragment).
+
+    Returns the single selected row (dict) if exactly one candidate remains
+    after every applicable narrowing step, else None (still ambiguous, or
+    nothing matched at all — caller must ask again)."""
+    stripped = (text or "").strip()
+    if not stripped or not candidates:
+        return None
+
+    numbered = _ADMIN_DISAMBIGUATION_NUMBER_RE.match(stripped)
+    if numbered:
+        idx = int(numbered.group(1))
+        if 1 <= idx <= len(candidates):
+            return candidates[idx - 1]
+        return None
+
+    name_part, qty_part = None, None
+    dash_match = _ADMIN_DASH_RE.search(stripped)
+    if dash_match:
+        name_part = stripped[:dash_match.start()].strip() or None
+        qty_part = stripped[dash_match.end():].strip() or None
+    else:
+        lowered = stripped.lower()
+        for cand in candidates:
+            qty_norm = _normalize_quantity_fragment_for_disambiguation(cand.get("quantity_text"))
+            if qty_norm and lowered.endswith(qty_norm):
+                remainder = stripped[: len(stripped) - len(qty_norm)].strip()
+                name_part = remainder or None
+                qty_part = stripped[len(stripped) - len(qty_norm):].strip()
+                break
+        if qty_part is None:
+            name_part = stripped
+
+    pool = candidates
+    if name_part:
+        name_pool = [c for c in pool if name_normalizer(c.get("name") or "") == name_normalizer(name_part)]
+        if name_pool:
+            pool = name_pool
+    if qty_part:
+        qty_norm = _normalize_quantity_fragment_for_disambiguation(qty_part)
+        qty_pool = [c for c in pool if _normalize_quantity_fragment_for_disambiguation(c.get("quantity_text")) == qty_norm]
+        if qty_pool:
+            pool = qty_pool
+
+    if len(pool) == 1:
+        return pool[0]
+    return None
 
 
 def capitalize_first(text):
@@ -1192,13 +1320,16 @@ def format_inventory_delete_preview(name, quantity_text):
 
 def format_inventory_admin_ambiguous_message(candidates, effective_quantity):
     """Multiple rows matched the same rename/delete request — never guess;
-    list every candidate and ask for a more precise reference (e.g. with an
-    explicit quantity)."""
+    list every candidate (numbered, 1-based, in the SAME order the caller
+    stores them in a pending disambiguation context — see
+    resolve_cleanup_admin_disambiguation_reply's "№N"/bare-N selection) and
+    ask for a more precise reference (e.g. with an explicit quantity or that
+    number)."""
     lines = ["Знайшов кілька записів, не хочу вгадувати:", ""]
-    for row in candidates:
+    for i, row in enumerate(candidates, start=1):
         qty = effective_quantity(row)[2]
         label = row["name"] + (f" — {qty}" if qty else "")
-        lines.append(f"• {label}")
+        lines.append(f"{i}. {label}")
     lines.append("")
-    lines.append("Напиши точніше, який саме запис потрібен (наприклад, з кількістю).")
+    lines.append("Напиши точніше, який саме запис потрібен (наприклад, з кількістю або номером).")
     return "\n".join(lines)

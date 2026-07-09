@@ -169,6 +169,19 @@ pending_cleanup_notice = {}   # chat_id -> {"rows": [row, ...], "household_id": 
 # existing contract shouldn't need to branch on a whole new operation kind.
 pending_cleanup_admin = {}   # chat_id -> {action: "rename"|"delete", household_id, user_db_id, origin,
                               #             item_id, target, new_name (rename only), new_canonical_name (rename only)}
+# Inventory Cleanup Admin v1 — awaiting a follow-up reply that disambiguates
+# a rename/delete request that matched 2+ inventory rows (see
+# _start_inventory_rename/_start_inventory_delete's "len(candidates) > 1"
+# branch). Holds only the already-fetched candidate ROW SNAPSHOTS (never
+# re-queried until the user's follow-up narrows it to exactly one — the
+# eventual pending_cleanup_admin preview built from that one row still goes
+# through the same StaleSnapshotError-protected write as every other rename/
+# delete). A follow-up like "Mleko 1 шт"/"1 шт"/"№2"/"2" is resolved via
+# inventory.resolve_cleanup_admin_disambiguation_reply; anything that still
+# doesn't uniquely identify one row re-asks with the same candidate list
+# instead of ever falling through to general AI-chat.
+pending_cleanup_admin_disambiguation = {}  # chat_id -> {action: "rename"|"delete", candidates: [row, ...],
+                              #             new_phrase (rename only, raw), household_id, user_db_id, origin}
 # Expense pending state now lives in expenses.py — re-exported here (same
 # dict objects, not copies) so every existing bot.<name> reference/test
 # keeps working unchanged.
@@ -273,6 +286,7 @@ def _has_active_pending_clarification_or_preview(chat_id):
         or chat_id in pending_add_destination_clarification
         or chat_id in pending_saved_edit
         or chat_id in pending_cleanup_admin
+        or chat_id in pending_cleanup_admin_disambiguation
     )
 
 
@@ -308,6 +322,9 @@ def _cancel_active_pending_operation(chat_id):
         keyboard = SHOPPING_KEYBOARD if ctx == "shopping_saved" else INVENTORY_KEYBOARD
     elif chat_id in pending_cleanup_admin:
         data = pending_cleanup_admin.pop(chat_id, None)
+        keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
+    elif chat_id in pending_cleanup_admin_disambiguation:
+        data = pending_cleanup_admin_disambiguation.pop(chat_id, None)
         keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
     else:
         keyboard = MAIN_KEYBOARD
@@ -1492,6 +1509,18 @@ def canonicalize_name(name):
     cleaned = _repair_mixed_script(_clean_unicode_whitespace(name or ""))
     base = cleaned.strip().lower()
     return _NAME_SYNONYMS.get(base, base)
+
+
+def _normalize_display_name_for_exact_match(name):
+    """Case-insensitive, Latin/Cyrillic-homoglyph-tolerant normalization of
+    an inventory row's OWN visible name — same mixed-script repair
+    canonicalize_name uses, but WITHOUT the global _NAME_SYNONYMS table, so
+    two textually different products (e.g. "mlekо" and "Молоко") never
+    collapse into the same key the way canonicalize_name's synonym mapping
+    would. Used only for Inventory Cleanup Admin's exact visible-row-name
+    matching priority (see inventory.resolve_inventory_admin_candidates and
+    inventory.resolve_cleanup_admin_disambiguation_reply)."""
+    return _repair_mixed_script(_clean_unicode_whitespace(name or "")).strip().lower()
 
 
 # Self-contained mirror of database.py's alias-resolution logic. Duplicated on
@@ -2824,6 +2853,7 @@ def _resolve_inventory_admin_candidates(chat_id, household_id, items, name_phras
     canonical_name_candidates = inventory.cleanup_canonical_name_candidates(canonicalize_name, name_phrase)
     candidates = inventory.resolve_inventory_admin_candidates(
         items, canonical_name_candidates, canonicalize_name, quantity_hint=quantity_hint,
+        name_phrase=name_phrase, name_normalizer=_normalize_display_name_for_exact_match,
     )
     if len(candidates) > 1:
         context = pending_cleanup_notice.get(chat_id)
@@ -2863,6 +2893,10 @@ def _start_inventory_rename(chat_id, user_id, display_name, old_phrase, new_phra
         send_message(chat_id, INVENTORY_ADMIN_NOT_FOUND_MSG, reply_markup=INVENTORY_KEYBOARD)
         return
     if len(candidates) > 1:
+        pending_cleanup_admin_disambiguation[chat_id] = {
+            "action": "rename", "candidates": candidates, "new_phrase": new_phrase,
+            "household_id": household_id, "user_db_id": user_db_id, "origin": origin,
+        }
         send_message(
             chat_id, inventory.format_inventory_admin_ambiguous_message(candidates, _effective_quantity),
             reply_markup=INVENTORY_KEYBOARD,
@@ -2901,6 +2935,10 @@ def _start_inventory_delete(chat_id, user_id, display_name, name_phrase, quantit
         send_message(chat_id, INVENTORY_ADMIN_NOT_FOUND_MSG, reply_markup=INVENTORY_KEYBOARD)
         return
     if len(candidates) > 1:
+        pending_cleanup_admin_disambiguation[chat_id] = {
+            "action": "delete", "candidates": candidates, "new_phrase": None,
+            "household_id": household_id, "user_db_id": user_db_id, "origin": origin,
+        }
         send_message(
             chat_id, inventory.format_inventory_admin_ambiguous_message(candidates, _effective_quantity),
             reply_markup=INVENTORY_KEYBOARD,
@@ -2931,6 +2969,56 @@ def _route_inventory_admin(chat_id, user_id, display_name, text):
         return True
 
     return False
+
+
+def _continue_cleanup_admin_disambiguation(chat_id, text):
+    """Follow-up reply to an Inventory Cleanup Admin ambiguous-candidates
+    message ("Mleko 1 шт", "1 шт", "№2", "2", ...) — resolved via
+    inventory.resolve_cleanup_admin_disambiguation_reply against the
+    candidate rows stored in pending_cleanup_admin_disambiguation. A unique
+    match opens the SAME rename/delete preview (pending_cleanup_admin,
+    awaiting "✅ Так, застосувати"/"❌ Скасувати") the direct single-match
+    path would have built; anything still ambiguous re-asks with the same
+    candidate list instead of ever falling through to general AI-chat."""
+    data = pending_cleanup_admin_disambiguation.get(chat_id)
+    if not data:
+        return
+    candidates = data["candidates"]
+    selected = inventory.resolve_cleanup_admin_disambiguation_reply(
+        text, candidates, _normalize_display_name_for_exact_match,
+    )
+    if selected is None:
+        send_message(
+            chat_id, inventory.format_inventory_admin_ambiguous_message(candidates, _effective_quantity),
+            reply_markup=INVENTORY_KEYBOARD,
+        )
+        return
+
+    pending_cleanup_admin_disambiguation.pop(chat_id, None)
+    household_id = data["household_id"]
+    user_db_id = data["user_db_id"]
+    origin = data["origin"]
+    quantity_text = _effective_quantity(selected)[2]
+    pending_cleanup_notice.pop(chat_id, None)
+
+    if data["action"] == "rename":
+        new_name = inventory.capitalize_first(data["new_phrase"])
+        new_canonical_name = canonicalize_name(new_name)
+        pending_cleanup_admin[chat_id] = {
+            "action": "rename",
+            "household_id": household_id, "user_db_id": user_db_id, "origin": origin,
+            "item_id": selected["id"], "new_name": new_name, "new_canonical_name": new_canonical_name,
+            "target": _inventory_admin_target(selected),
+        }
+        preview = inventory.format_inventory_rename_preview(selected["name"], quantity_text, new_name)
+    else:
+        pending_cleanup_admin[chat_id] = {
+            "action": "delete",
+            "household_id": household_id, "user_db_id": user_db_id, "origin": origin,
+            "item_id": selected["id"], "target": _inventory_admin_target(selected),
+        }
+        preview = inventory.format_inventory_delete_preview(selected["name"], quantity_text)
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
 
 
 def _apply_cleanup_admin_confirm(chat_id):
@@ -3849,6 +3937,7 @@ _interaction_state_deps = interaction_state.InteractionStateDeps(
     pending_inventory_representation_clarification=pending_inventory_representation_clarification,
     pending_add_destination_clarification=pending_add_destination_clarification,
     pending_cleanup_admin=pending_cleanup_admin,
+    pending_cleanup_admin_disambiguation=pending_cleanup_admin_disambiguation,
     pending_undo_action=pending_undo_action,
     active_list_context=active_list_context,
     saved_list_context=saved_list_context,
@@ -3885,6 +3974,8 @@ _pending_route_deps = message_dispatcher.PendingRouteDeps(
     global_household_preview_guard_msg=GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG,
     has_active_pending_operation=lambda *a, **kw: _has_active_pending_clarification_or_preview(*a, **kw),
     cancel_active_pending_operation=lambda *a, **kw: _cancel_active_pending_operation(*a, **kw),
+    pending_cleanup_admin_disambiguation=pending_cleanup_admin_disambiguation,
+    continue_cleanup_admin_disambiguation=lambda *a, **kw: _continue_cleanup_admin_disambiguation(*a, **kw),
 )
 
 # =========================
@@ -4235,6 +4326,56 @@ _UNROUTED_HOUSEHOLD_ACTION_LINE_RE = re.compile(
 )
 
 
+# Destructive Bulk Household Request Guard v1 — a last-resort, LOCAL (no
+# Gemini) safety net checked right before the household-action-line guard
+# above (and, transitively, before general AI-chat). A bare "Видали все"/
+# "Очисти запаси" names no specific product and no existing deterministic
+# route (inventory admin's parse_inventory_delete_request explicitly excludes
+# a bulk "все"/"всі" pronoun, see _DELETE_BULK_PRONOUN_RE; the aliases
+# submenu's own numbered bulk-delete only ever fires while that submenu is
+# open, via active_aliases_context, checked earlier in the same dispatch
+# chain) claims it — without this guard it would silently reach Gemini
+# general chat, which (correctly, per SYSTEM_PROMPT) explains it has no
+# direct database access, a confusing non-answer for what is clearly meant
+# as a destructive household command. Anchored to the WHOLE message (after
+# stripping) on purpose — never a substring match inside a longer sentence —
+# so it only ever catches exactly this bare-imperative shape.
+_DESTRUCTIVE_BULK_HOUSEHOLD_RE = re.compile(
+    r"^\s*(?:видал\w*|приб\w*|очист\w*|стерт\w*)\s+(?:все|всі|усе|усі)"
+    r"(?:\s+(?:запас\w*|покупк\w*))?\s*[.!?]*\s*$"
+    r"|^\s*очист\w*\s+(?:запас\w*|покупк\w*)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG = (
+    "Що саме очистити: покупки чи запаси?\n"
+    "Таку дію можна зробити тільки через окремий preview і підтвердження."
+)
+
+
+def _looks_like_destructive_bulk_household_request(text):
+    """True if `text` (stripped) is ENTIRELY a bare destructive bulk-clear
+    imperative naming no specific product (see _DESTRUCTIVE_BULK_HOUSEHOLD_RE)
+    — pure/local, never calls Gemini."""
+    if not isinstance(text, str):
+        return False
+    return bool(_DESTRUCTIVE_BULK_HOUSEHOLD_RE.match(text.strip()))
+
+
+def _route_destructive_bulk_guard(chat_id, user_id, display_name, text):
+    """message_dispatcher.py's CommandRouteDeps.destructive_bulk_guard — the
+    command-routes-level check that actually keeps a bare "Видали все"/
+    "Очисти запаси" from ever reaching household_read's Phase-D Gemini
+    classifier (see that field's own docstring). _run_general_ai_fallback
+    below runs the SAME guard again for the DIRECT_GENERAL_AI_FALLBACK path
+    (an active batch-edit-router reporting intent "none"), which skips this
+    command-routes slice entirely."""
+    if _looks_like_destructive_bulk_household_request(text):
+        send_message(chat_id, DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG)
+        return True
+    return False
+
+
 def _looks_like_unrouted_household_action(text):
     """True if ANY line of `text` starts with a household-action verb (see
     _UNROUTED_HOUSEHOLD_ACTION_LINE_RE) followed by content — pure/local,
@@ -4261,6 +4402,10 @@ def _run_general_ai_fallback(chat_id, text):
     Phase D for RouteOutcome.CONTINUE. Household-Action-Line Fallback Guard
     v1 (see above) runs first — every household-shaped line still reaching
     here is asked to be more specific instead of ever prompting Gemini."""
+    if _looks_like_destructive_bulk_household_request(text):
+        send_message(chat_id, DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG)
+        return
+
     if _looks_like_unrouted_household_action(text):
         send_message(chat_id, UNROUTED_HOUSEHOLD_ACTION_MSG)
         return
@@ -4547,6 +4692,10 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
             send_message(chat_id, "Вибір місця додавання скасовано.", reply_markup=household_router.origin_keyboard(origin))
         elif chat_id in pending_cleanup_admin:
             data = pending_cleanup_admin.pop(chat_id, None)
+            origin = (data or {}).get("origin", "global")
+            send_message(chat_id, "Зміни скасовано.", reply_markup=household_router.origin_keyboard(origin))
+        elif chat_id in pending_cleanup_admin_disambiguation:
+            data = pending_cleanup_admin_disambiguation.pop(chat_id, None)
             origin = (data or {}).get("origin", "global")
             send_message(chat_id, "Зміни скасовано.", reply_markup=household_router.origin_keyboard(origin))
         elif chat_id in pending_undo_action:
@@ -4898,6 +5047,7 @@ _command_route_deps = message_dispatcher.CommandRouteDeps(
     global_expense_command=lambda *a, **kw: _route_global_expense_command(*a, **kw),
     inventory_cleanup_route=lambda *a, **kw: _route_inventory_cleanup(*a, **kw),
     inventory_admin_route=lambda *a, **kw: _route_inventory_admin(*a, **kw),
+    destructive_bulk_guard=lambda *a, **kw: _route_destructive_bulk_guard(*a, **kw),
     saved_list_router=lambda *a, **kw: _route_saved_list_router(*a, **kw),
     general_ai_fallback=lambda *a, **kw: _run_general_ai_fallback(*a, **kw),
 )

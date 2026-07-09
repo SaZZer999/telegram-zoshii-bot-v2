@@ -45,14 +45,17 @@ import action_history  # noqa: E402
 import bot  # noqa: E402
 from bot import (  # noqa: E402
     pending_cleanup_admin,
+    pending_cleanup_admin_disambiguation,
     pending_cleanup_notice,
     pending_merge,
     canonicalize_name,
+    _normalize_display_name_for_exact_match,
     STALE_PREVIEW_MSG,
     INVENTORY_KEYBOARD,
     GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD,
     GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG,
     INVENTORY_ADMIN_NOT_FOUND_MSG,
+    DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG,
 )
 
 
@@ -71,6 +74,15 @@ def _milk_dirty_row():
 def _cheese_dirty_row():
     return {"id": 5, "name": "ser", "canonical_name": "сир", "category": "Молочне та яйця",
             "quantity_value": Decimal("1"), "quantity_unit": "шт.", "quantity_text": "1 шт."}
+
+
+def _moloko_row():
+    """A DIFFERENT row (id 2) that merely shares canonical_name "молоко" with
+    _milk_dirty_row()'s "mlekо" (id 1) — the live bug: a rename targeting
+    "mlekо" must never also match this row just because both canonicalize
+    to the same product."""
+    return {"id": 2, "name": "Молоко", "canonical_name": "молоко", "category": "Молочне та яйця",
+            "quantity_value": Decimal("11.5"), "quantity_unit": "л", "quantity_text": "11,5 л"}
 
 
 def _sausage_rows():
@@ -194,6 +206,109 @@ class TestResolveInventoryAdminCandidates(unittest.TestCase):
         self.assertEqual({c["id"] for c in candidates}, {50, 51})
 
 
+class TestExactVisibleRowNameMatchWinsOverAlias(unittest.TestCase):
+    """V1.3 fix: "mlekо" must resolve to the row literally named "mlekо",
+    never also to a DIFFERENT "Молоко" row sharing the same canonical_name —
+    the exact live bug reported after the v1 cleanup-admin release."""
+
+    def _rows(self):
+        return [_milk_dirty_row(), _moloko_row()]
+
+    def test_exact_row_wins_no_ambiguity(self):
+        rows = self._rows()
+        candidates = inventory.resolve_inventory_admin_candidates(
+            rows, inventory.cleanup_canonical_name_candidates(canonicalize_name, "mlekо"),
+            canonicalize_name, name_phrase="mlekо", name_normalizer=_normalize_display_name_for_exact_match,
+        )
+        self.assertEqual([c["id"] for c in candidates], [1])
+
+    def test_confusable_o_and_case_variants_all_resolve_to_the_same_row(self):
+        rows = self._rows()
+        for phrase in ("mleko", "Mleko", "mlekо", "Mlekо"):
+            with self.subTest(phrase=phrase):
+                candidates = inventory.resolve_inventory_admin_candidates(
+                    rows, inventory.cleanup_canonical_name_candidates(canonicalize_name, phrase),
+                    canonicalize_name, name_phrase=phrase, name_normalizer=_normalize_display_name_for_exact_match,
+                )
+                self.assertEqual([c["id"] for c in candidates], [1])
+
+    def test_alias_fallback_still_works_when_no_exact_visible_row_exists(self):
+        # No row is literally named "молока" (genitive) — only the cleanup
+        # alias table's "молока" -> "молоко" mapping finds the "Молоко" row
+        # via its canonical_name, exactly like before this fix existed.
+        rows = [_moloko_row()]
+        candidates = inventory.resolve_inventory_admin_candidates(
+            rows, inventory.cleanup_canonical_name_candidates(canonicalize_name, "молока"),
+            canonicalize_name, name_phrase="молока", name_normalizer=_normalize_display_name_for_exact_match,
+        )
+        self.assertEqual([c["id"] for c in candidates], [2])
+
+    def test_omitting_name_phrase_keeps_old_behavior(self):
+        # A caller that doesn't pass name_phrase/name_normalizer at all (the
+        # pre-fix call shape) still goes straight to the alias/canonical
+        # pool — both rows share canonical_name "молоко", so both are
+        # returned (still ambiguous), same as before this fix.
+        rows = self._rows()
+        candidates = inventory.resolve_inventory_admin_candidates(
+            rows, inventory.cleanup_canonical_name_candidates(canonicalize_name, "молоко"), canonicalize_name,
+        )
+        self.assertEqual({c["id"] for c in candidates}, {1, 2})
+
+
+class TestResolveCleanupAdminDisambiguationReply(unittest.TestCase):
+    """Pure follow-up resolver for a previously-shown ambiguous-candidates
+    list — no webhook, no pending state, just the deterministic matching
+    rules against a hand-built candidate list."""
+
+    def _candidates(self):
+        return [_milk_dirty_row(), _moloko_row()]
+
+    def test_name_and_quantity_fragment_selects_the_matching_candidate(self):
+        for text in ("Mleko 1 шт", "mlekо 1 шт", "mlekо — 1 шт"):
+            with self.subTest(text=text):
+                selected = inventory.resolve_cleanup_admin_disambiguation_reply(
+                    text, self._candidates(), _normalize_display_name_for_exact_match,
+                )
+                self.assertIsNotNone(selected)
+                self.assertEqual(selected["id"], 1)
+
+    def test_bare_quantity_selects_the_unique_matching_candidate(self):
+        selected = inventory.resolve_cleanup_admin_disambiguation_reply(
+            "1 шт", self._candidates(), _normalize_display_name_for_exact_match,
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["id"], 1)
+
+    def test_numbered_selector_selects_by_position(self):
+        candidates = self._candidates()
+        self.assertEqual(
+            inventory.resolve_cleanup_admin_disambiguation_reply("№1", candidates, _normalize_display_name_for_exact_match)["id"],
+            1,
+        )
+        self.assertEqual(
+            inventory.resolve_cleanup_admin_disambiguation_reply("2", candidates, _normalize_display_name_for_exact_match)["id"],
+            2,
+        )
+
+    def test_numbered_selector_out_of_range_returns_none(self):
+        selected = inventory.resolve_cleanup_admin_disambiguation_reply(
+            "5", self._candidates(), _normalize_display_name_for_exact_match,
+        )
+        self.assertIsNone(selected)
+
+    def test_still_ambiguous_reply_returns_none(self):
+        # Neither name nor quantity fragment narrows the pool at all.
+        selected = inventory.resolve_cleanup_admin_disambiguation_reply(
+            "щось незрозуміле", self._candidates(), _normalize_display_name_for_exact_match,
+        )
+        self.assertIsNone(selected)
+
+    def test_blank_reply_returns_none(self):
+        self.assertIsNone(
+            inventory.resolve_cleanup_admin_disambiguation_reply("", self._candidates(), _normalize_display_name_for_exact_match)
+        )
+
+
 class TestCapitalizeFirst(unittest.TestCase):
     def test_single_word(self):
         self.assertEqual(inventory.capitalize_first("молоко"), "Молоко")
@@ -241,6 +356,7 @@ def _call_webhook(update):
 class InventoryAdminWebhookTestCase(unittest.TestCase):
     def setUp(self):
         pending_cleanup_admin.clear()
+        pending_cleanup_admin_disambiguation.clear()
         pending_cleanup_notice.clear()
         pending_merge.clear()
         patcher_send = patch.object(bot, "send_message")
@@ -252,6 +368,7 @@ class InventoryAdminWebhookTestCase(unittest.TestCase):
 
     def tearDown(self):
         pending_cleanup_admin.clear()
+        pending_cleanup_admin_disambiguation.clear()
         pending_cleanup_notice.clear()
         pending_merge.clear()
 
@@ -277,6 +394,21 @@ class TestRenamePreview(InventoryAdminWebhookTestCase):
         texts = self._sent_texts()
         self.assertTrue(any("mlekо — 1 шт. → Молоко — 1 шт." in t for t in texts))
         self.assertIn(GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD, self._reply_markups())
+
+    # V1.3 live bug: "mlekо" (mixed-script) must target ONLY the row
+    # literally named "mlekо" — never also "Молоко — 11,5 л" just because
+    # both canonicalize to the same product.
+    def test_rename_exact_row_wins_over_alias_sibling_no_ambiguity(self):
+        chat_id = 771005
+        with patch.object(bot, "get_inventory_items", return_value=[_milk_dirty_row(), _moloko_row()]):
+            _call_webhook(_make_update(771000005, chat_id, "перейменуй mlekо на молоко в запасах"))
+        self.assertIn(chat_id, pending_cleanup_admin)
+        entry = pending_cleanup_admin[chat_id]
+        self.assertEqual(entry["item_id"], 1)
+        texts = self._sent_texts()
+        self.assertTrue(any("mlekо — 1 шт. → Молоко — 1 шт." in t for t in texts))
+        self.assertFalse(any("не хочу вгадувати" in t for t in texts))
+        self.assertFalse(any("11,5 л" in t for t in texts))
 
     # 5. "перейменуй ser на сир" works the same way.
     def test_rename_ser_na_syr(self):
@@ -305,6 +437,14 @@ class TestRenamePreview(InventoryAdminWebhookTestCase):
         self.assertNotIn(chat_id, pending_cleanup_admin)
         texts = self._sent_texts()
         self.assertTrue(any("не хочу вгадувати" in t for t in texts))
+        # Both rows are literally named "Молоко" — an exact-name tie, still
+        # genuinely ambiguous even after the V1.3 exact-row-match fix — so a
+        # pending disambiguation context must be stored for a follow-up.
+        self.assertIn(chat_id, pending_cleanup_admin_disambiguation)
+        entry = pending_cleanup_admin_disambiguation[chat_id]
+        self.assertEqual(entry["action"], "rename")
+        self.assertEqual({c["id"] for c in entry["candidates"]}, {10, 11})
+        self.assertEqual(entry["new_phrase"], "Молоко3.2%")
 
 
 class TestRenameConfirmAndCancel(InventoryAdminWebhookTestCase):
@@ -483,6 +623,90 @@ class TestBlockedByOtherActivePendingState(InventoryAdminWebhookTestCase):
             self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
         finally:
             bot.pending_global_household.pop(chat_id, None)
+
+
+class TestCleanupAdminDisambiguationFollowup(InventoryAdminWebhookTestCase):
+    """V1.3: a rename/delete request matching 2+ rows stores a pending
+    disambiguation context, and a short follow-up reply ("1 л", "№1", "1")
+    continues that SAME command instead of ever falling through to general
+    AI-chat."""
+
+    def _trigger_ambiguous_rename(self, chat_id):
+        with patch.object(bot, "get_inventory_items", return_value=_milk_multi_rows()):
+            _call_webhook(_make_update(chat_id * 10 + 1, chat_id, "перейменуй молоко на Молоко3.2%"))
+        self.mock_send.reset_mock()
+
+    def _trigger_ambiguous_delete(self, chat_id):
+        with patch.object(bot, "get_inventory_items", return_value=_milk_multi_rows()):
+            _call_webhook(_make_update(chat_id * 10 + 1, chat_id, "видали молоко"))
+        self.mock_send.reset_mock()
+
+    # 5. "Mleko 1 шт"-style follow-up (quantity fragment alone is enough
+    # here since both candidates are literally named "Молоко").
+    def test_quantity_followup_selects_candidate_and_shows_rename_preview(self):
+        chat_id = 771060
+        self._trigger_ambiguous_rename(chat_id)
+        _call_webhook(_make_update(chat_id * 10 + 2, chat_id, "1 л"))
+        self.assertNotIn(chat_id, pending_cleanup_admin_disambiguation)
+        self.assertIn(chat_id, pending_cleanup_admin)
+        entry = pending_cleanup_admin[chat_id]
+        self.assertEqual(entry["action"], "rename")
+        self.assertEqual(entry["item_id"], 10)
+        self.assertEqual(entry["new_name"], "Молоко3.2%")
+        texts = self._sent_texts()
+        self.assertTrue(any("Молоко — 1 л → Молоко3.2% — 1 л" in t for t in texts))
+
+    # 6. A follow-up quantity that matches nothing keeps it ambiguous.
+    def test_nonmatching_followup_asks_again_not_general_ai(self):
+        chat_id = 771061
+        self._trigger_ambiguous_rename(chat_id)
+        _call_webhook(_make_update(chat_id * 10 + 2, chat_id, "5 л"))
+        self.assertIn(chat_id, pending_cleanup_admin_disambiguation)
+        self.assertNotIn(chat_id, pending_cleanup_admin)
+        texts = self._sent_texts()
+        self.assertTrue(any("не хочу вгадувати" in t for t in texts))
+
+    # 7. "№1"/"2" numbered selection (candidates numbered in the SAME order
+    # as format_inventory_admin_ambiguous_message shows them).
+    def test_numbered_followup_selects_by_position(self):
+        chat_id = 771062
+        self._trigger_ambiguous_rename(chat_id)
+        _call_webhook(_make_update(chat_id * 10 + 2, chat_id, "№2"))
+        self.assertIn(chat_id, pending_cleanup_admin)
+        self.assertEqual(pending_cleanup_admin[chat_id]["item_id"], 11)
+
+    def test_bare_numbered_followup_selects_by_position(self):
+        chat_id = 771063
+        self._trigger_ambiguous_rename(chat_id)
+        _call_webhook(_make_update(chat_id * 10 + 2, chat_id, "1"))
+        self.assertIn(chat_id, pending_cleanup_admin)
+        self.assertEqual(pending_cleanup_admin[chat_id]["item_id"], 10)
+
+    # Delete-side follow-up works the same way.
+    def test_quantity_followup_selects_candidate_and_shows_delete_preview(self):
+        chat_id = 771064
+        self._trigger_ambiguous_delete(chat_id)
+        _call_webhook(_make_update(chat_id * 10 + 2, chat_id, "2 л"))
+        self.assertIn(chat_id, pending_cleanup_admin)
+        entry = pending_cleanup_admin[chat_id]
+        self.assertEqual(entry["action"], "delete")
+        self.assertEqual(entry["item_id"], 11)
+
+    # 9. Cancel clears the pending disambiguation.
+    def test_cancel_clears_pending_disambiguation(self):
+        chat_id = 771065
+        self._trigger_ambiguous_rename(chat_id)
+        _call_webhook(_make_update(chat_id * 10 + 2, chat_id, "❌ Скасувати"))
+        self.assertNotIn(chat_id, pending_cleanup_admin_disambiguation)
+        self.assertTrue(any("Зміни скасовано." in t for t in self._sent_texts()))
+
+    # Undo-button-cancels-active-operation v1 must reach this state too.
+    def test_undo_button_cancels_pending_disambiguation(self):
+        chat_id = 771066
+        self._trigger_ambiguous_rename(chat_id)
+        _call_webhook(_make_update(chat_id * 10 + 2, chat_id, "↩️ Скасувати останню дію"))
+        self.assertNotIn(chat_id, pending_cleanup_admin_disambiguation)
+        self.assertTrue(any("Поточну дію скасовано." in t for t in self._sent_texts()))
 
 
 # =========================
@@ -759,6 +983,60 @@ class TestExistingRoutesStillWork(InventoryAdminWebhookTestCase):
             self.assertTrue(any("Поточну дію скасовано." in t for t in self._sent_texts()))
         finally:
             bot.pending_inventory_quantity_clarification.pop(chat_id, None)
+
+
+class TestDestructiveBulkHouseholdGuard(InventoryAdminWebhookTestCase):
+    """V1.3: a bare destructive bulk-clear imperative ("Видали все", "Очисти
+    запаси", ...) must never reach general AI-chat (Gemini) — no DB write,
+    no confusing "I don't have DB access" answer, just a controlled
+    Ukrainian clarification."""
+
+    def _assert_guarded(self, text, chat_id):
+        with patch.object(bot, "call_gemini") as mock_gemini:
+            _call_webhook(_make_update(chat_id * 100 + 1, chat_id, text))
+        mock_gemini.assert_not_called()
+        self.assertEqual(self._sent_texts(), [DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG])
+        self.assertNotIn(chat_id, pending_cleanup_admin)
+        self.assertNotIn(chat_id, pending_cleanup_admin_disambiguation)
+
+    def test_vydaly_vse(self):
+        self._assert_guarded("Видали все", 771070)
+
+    def test_vydaly_vsi(self):
+        self._assert_guarded("видали всі", 771071)
+
+    def test_prybery_vse(self):
+        self._assert_guarded("прибери все", 771072)
+
+    def test_ochysty_vse(self):
+        self._assert_guarded("очисти все", 771073)
+
+    def test_sterty_vse(self):
+        self._assert_guarded("стерти все", 771074)
+
+    def test_vydalyty_vse(self):
+        self._assert_guarded("видалити все", 771075)
+
+    def test_ochystyty_zapasy(self):
+        self._assert_guarded("очистити запаси", 771076)
+
+    def test_ochystyty_pokupky(self):
+        self._assert_guarded("очистити покупки", 771077)
+
+    def test_vydaly_vsi_zapasy(self):
+        self._assert_guarded("видали всі запаси", 771078)
+
+    def test_vydaly_vsi_pokupky(self):
+        self._assert_guarded("видали всі покупки", 771079)
+
+    # A genuine single-row delete must still be unaffected (goes through
+    # inventory_admin_route long before this guard is ever reached).
+    def test_specific_delete_request_is_not_guarded(self):
+        chat_id = 771080
+        with patch.object(bot, "get_inventory_items", return_value=[_milk_dirty_row()]):
+            _call_webhook(_make_update(771080001, chat_id, "видали mlekо із запасів"))
+        self.assertIn(chat_id, pending_cleanup_admin)
+        self.assertFalse(any(t == DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG for t in self._sent_texts()))
 
 
 if __name__ == "__main__":

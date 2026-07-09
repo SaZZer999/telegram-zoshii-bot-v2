@@ -64,6 +64,9 @@ class InteractionStateDeps:
     # Inventory Cleanup Admin v1 — awaiting confirm/cancel on a rename/delete
     # preview for ONE inventory row.
     pending_cleanup_admin: dict
+    # Inventory Cleanup Admin v1 — awaiting a follow-up reply that
+    # disambiguates a rename/delete request matching 2+ inventory rows.
+    pending_cleanup_admin_disambiguation: dict
     pending_undo_action: dict
     # bot.py-owned shared context dicts
     active_list_context: dict
@@ -115,6 +118,11 @@ def _alias_gate_blocking_states(deps):
         # pending, no other gate/flow may start a new preview, touch the
         # database, or reach general AI-chat.
         deps.pending_cleanup_admin,
+        # Inventory Cleanup Admin v1's own ambiguous-candidates follow-up —
+        # same reasoning: while a disambiguating reply is still owed, no
+        # other gate/flow may start a new preview, touch the database, or
+        # reach general AI-chat.
+        deps.pending_cleanup_admin_disambiguation,
     )
 
 
@@ -251,6 +259,7 @@ def clear_interaction_state(deps, chat_id):
     deps.pending_inventory_quantity_clarification.pop(chat_id, None)
     deps.pending_inventory_representation_clarification.pop(chat_id, None)
     deps.pending_add_destination_clarification.pop(chat_id, None)
+    deps.pending_cleanup_admin_disambiguation.pop(chat_id, None)
     deps.pending_undo_action.pop(chat_id, None)
 
 

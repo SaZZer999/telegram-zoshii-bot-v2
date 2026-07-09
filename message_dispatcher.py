@@ -187,6 +187,12 @@ class PendingRouteDeps:
     # check at all.
     has_active_pending_operation: Callable = None
     cancel_active_pending_operation: Callable = None
+    # Inventory Cleanup Admin v1 — a follow-up reply disambiguating a
+    # rename/delete request that matched 2+ inventory rows ("Mleko 1 шт",
+    # "1 шт", "№2", "2", ...). Optional (default None), same reasoning as
+    # every other Optional field on this dataclass.
+    pending_cleanup_admin_disambiguation: dict = None
+    continue_cleanup_admin_disambiguation: Callable = None
 
 
 @dataclass
@@ -229,6 +235,17 @@ class CommandRouteDeps:
     # and would otherwise also match "прибери дублікати молока") — see
     # inventory.parse_inventory_delete_request's docstring.
     inventory_admin_route: Callable = None
+    # Destructive Bulk Household Request Guard v1 — optional (default None),
+    # same reasoning as every other Optional field above. Checked FIRST in
+    # this slice: a bare "Видали все"/"Очисти запаси" names no specific
+    # product, so no route below (Global Household Router, expense gates,
+    # inventory_cleanup_route/inventory_admin_route, saved_list_router) ever
+    # claims it anyway — but household_read's OWN Phase-D topic gate would
+    # otherwise burn a real Gemini call and answer as if it were a read-only
+    # question, before general_ai_fallback (which also runs this same guard,
+    # for the DIRECT_GENERAL_AI_FALLBACK path) is ever reached. Checking it
+    # here, ahead of direct_household_read, is what actually prevents that.
+    destructive_bulk_guard: Callable = None
     saved_list_router: Callable = None
     general_ai_fallback: Callable = None
 
@@ -461,6 +478,14 @@ def _dispatch_pending_routes(deps, chat_id, user_id, display_name, text):
         routes.continue_inventory_representation_clarification(chat_id, text)
         return RouteOutcome.HANDLED
 
+    if routes.pending_cleanup_admin_disambiguation is not None and chat_id in routes.pending_cleanup_admin_disambiguation:
+        # Inventory Cleanup Admin v1 — a rename/delete request that matched
+        # 2+ rows is awaiting a disambiguating follow-up ("Mleko 1 шт", "1
+        # шт", "№2", "2", ...). ANY text here is resolved against THAT
+        # candidate list, never a new command, never general AI-chat.
+        routes.continue_cleanup_admin_disambiguation(chat_id, text)
+        return RouteOutcome.HANDLED
+
     if chat_id in routes.pending_global_household:
         # A combined Global Household Router preview is awaiting confirm/
         # cancel — no new text (including one that would otherwise match
@@ -498,6 +523,13 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
     routes = deps.command_routes
     if routes is None:
         return None
+
+    if routes.destructive_bulk_guard is not None and routes.destructive_bulk_guard(chat_id, user_id, display_name, text):
+        # Destructive Bulk Household Request Guard v1 — a bare "Видали все"/
+        # "Очисти запаси" is intercepted before any route below, including
+        # household_read's own Phase-D Gemini classifier (see this field's
+        # own docstring on CommandRouteDeps).
+        return RouteOutcome.HANDLED
 
     if routes.ambiguous_add_route(chat_id, user_id, display_name, text):
         # Ambiguous "Додай ... за суму" guard — a bare "Додай молоко за 10
