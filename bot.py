@@ -4428,7 +4428,12 @@ def _route_destructive_bulk_guard(chat_id, user_id, display_name, text):
     other route-starting function in this file already checks first (see
     _start_inventory_rename/_start_inventory_delete/_start_inventory_
     cleanup) — so this never overwrites/competes with that preview, and
-    never opens a pending_destructive_guard context on top of it."""
+    never opens a pending_destructive_guard context on top of it. That
+    blocked branch deliberately sends NO reply_markup at all (never
+    replaces whatever preview keyboard is already on screen), while the
+    normal "no active preview" branch below attaches MAIN_KEYBOARD (V1.4.2
+    Telegram reply-keyboard persistence fix) — a controlled clarification
+    must never leave the user with no visible keyboard."""
     if not _looks_like_destructive_bulk_household_request(text):
         return False
     if _has_blocking_pending_state_for_reports(chat_id):
@@ -4436,7 +4441,7 @@ def _route_destructive_bulk_guard(chat_id, user_id, display_name, text):
         return True
     origin = household_router.current_origin(chat_id)
     pending_destructive_guard[chat_id] = {"origin": origin}
-    send_message(chat_id, DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG)
+    send_message(chat_id, DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG, reply_markup=MAIN_KEYBOARD)
     return True
 
 
@@ -4496,13 +4501,27 @@ def _run_general_ai_fallback(chat_id, text):
     must skip cooking mode entirely) as well as normally at the end of
     Phase D for RouteOutcome.CONTINUE. Household-Action-Line Fallback Guard
     v1 (see above) runs first — every household-shaped line still reaching
-    here is asked to be more specific instead of ever prompting Gemini."""
+    here is asked to be more specific instead of ever prompting Gemini.
+
+    Telegram reply-keyboard persistence fix: every reply from this function
+    attaches MAIN_KEYBOARD — UNLESS an active pending preview/clarification
+    is still open for this chat (only reachable here via RouteOutcome.
+    DIRECT_GENERAL_AI_FALLBACK, i.e. pending_batch/pending_inventory_batch's
+    own edit-router reported intent "none"), in which case reply_markup
+    stays None so that preview's OWN keyboard is never silently replaced.
+    Without this, a plain AI-chat answer (or this function's own destructive-
+    guard/unrouted-household-action replies) left reply_markup unset
+    entirely, and after any one-time keyboard elsewhere had already
+    collapsed, the user was left with no reply keyboard at all until some
+    OTHER handler happened to resend one."""
+    keyboard = None if _has_blocking_pending_state_for_reports(chat_id) else MAIN_KEYBOARD
+
     if _looks_like_destructive_bulk_household_request(text):
-        send_message(chat_id, DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG)
+        send_message(chat_id, DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG, reply_markup=keyboard)
         return
 
     if _looks_like_unrouted_household_action(text):
-        send_message(chat_id, UNROUTED_HOUSEHOLD_ACTION_MSG)
+        send_message(chat_id, UNROUTED_HOUSEHOLD_ACTION_MSG, reply_markup=keyboard)
         return
 
     if chat_id not in user_history:
@@ -4522,7 +4541,7 @@ def _run_general_ai_fallback(chat_id, text):
     else:
         answer = "AI-помічник тимчасово недоступний. Спробуйте ще раз трохи пізніше."
 
-    send_message(chat_id, answer)
+    send_message(chat_id, answer, reply_markup=keyboard)
 
 
 def _try_handle_special_button(chat_id, user_id, display_name, text):
