@@ -121,6 +121,59 @@ class TestExpensesPureHelpers(unittest.TestCase):
         self.assertEqual(payload, ["щось"])
 
 
+class TestCleanExpenseDescription(unittest.TestCase):
+    """V1.4.2 live bug: Gemini sometimes returns the WHOLE raw command as
+    the expense description instead of a clean name — _clean_expense_
+    description is the single Python-side safety net that strips a leading
+    command verb, any amount+currency span, and a leftover leading
+    preposition before anything is stored."""
+
+    def setUp(self):
+        import expenses
+        self.clean = expenses._clean_expense_description
+
+    # 8/1. "Запиши 120 zł за інтернет" => "інтернет"
+    def test_zapysy_za_strips_verb_amount_and_preposition(self):
+        self.assertEqual(self.clean("Запиши 120 zł за інтернет"), "інтернет")
+
+    # 9/2. "Запиши 120 zł на інтернет" => "інтернет"
+    def test_zapysy_na_strips_verb_amount_and_preposition(self):
+        self.assertEqual(self.clean("Запиши 120 zł на інтернет"), "інтернет")
+
+    # 10/3. "120 zł за інтернет" => "інтернет" (no leading verb at all)
+    def test_bare_amount_and_preposition_strips_to_clean_name(self):
+        self.assertEqual(self.clean("120 zł за інтернет"), "інтернет")
+
+    # 11/4. "Інтернет 120 zł" => "Інтернет" (amount trails the name)
+    def test_trailing_amount_strips_to_clean_name(self):
+        self.assertEqual(self.clean("Інтернет 120 zł"), "Інтернет")
+
+    # 12/5. Already-clean Gemini output (the normal/expected case) passes
+    # through unchanged — no over-stripping.
+    def test_already_clean_description_is_unchanged(self):
+        self.assertEqual(self.clean("Biedronka"), "Biedronka")
+
+    # 13/6. "Кава 14 zł" => "Кава"
+    def test_simple_trailing_amount_strips_cleanly(self):
+        self.assertEqual(self.clean("Кава 14 zł"), "Кава")
+
+    # 7. "запиши 39 злотих за інтернет" — "злотих" currency word recognized
+    # by the description cleaner (independent of whether the numeric amount
+    # parser itself is extended for it).
+    def test_zloty_word_currency_is_recognized_and_stripped(self):
+        self.assertEqual(self.clean("запиши 39 злотих за інтернет"), "інтернет")
+
+    # "Додай" is also a recognized leading command verb, with an optional
+    # "витрату" noun right after it.
+    def test_doday_verb_with_vytratu_noun_is_stripped(self):
+        self.assertEqual(self.clean("Додай витрату 50 zł на бензин"), "бензин")
+
+    def test_blank_and_non_string_inputs_are_safe(self):
+        self.assertEqual(self.clean(""), "")
+        self.assertEqual(self.clean(None), "")
+        self.assertEqual(self.clean("   "), "")
+
+
 class TestExpensesPendingStateSharedWithBot(unittest.TestCase):
     """Confirms the re-export design: bot.<name> and expenses.<name> are the
     exact same objects (not copies), so state mutated through one module is

@@ -407,6 +407,117 @@ class TestExpenseWebhookFlow(unittest.TestCase):
 
 
 # =========================
+# V1.4.2 — expense description cleaning, full webhook path
+# =========================
+class TestExpenseDescriptionCleaningWebhookFlow(unittest.TestCase):
+    """Live bug: Gemini's own `description` field can come back as the WHOLE
+    raw command instead of a clean name — these drive the full webhook()
+    dispatch with a Gemini router mock that returns exactly that dirty
+    value, proving _validate_expense_router_result's _clean_expense_
+    description call is what actually protects the stored/previewed name.
+
+    Deliberately does NOT subclass TestExpenseWebhookFlow — unittest would
+    then also re-run every INHERITED test method under this class, reusing
+    the exact same chat_id/update_id pairs already consumed by that class's
+    own run and tripping bot.py's process-wide update_id dedup cache (same
+    hardcoded ids "already seen" -> webhook() silently no-ops). Same mocks,
+    copied setUp/tearDown instead."""
+
+    def setUp(self):
+        patcher_get_user = patch.object(bot, "get_household_and_user", return_value=(1, 10))
+        self.mock_get_user = patcher_get_user.start()
+        self.addCleanup(patcher_get_user.stop)
+
+        patcher_send = patch.object(bot, "send_message")
+        self.mock_send = patcher_send.start()
+        self.addCleanup(patcher_send.stop)
+
+        patcher_gemini_chat = patch.object(bot, "call_gemini")
+        self.mock_call_gemini = patcher_gemini_chat.start()
+        self.addCleanup(patcher_gemini_chat.stop)
+
+        patcher_saved_router = patch.object(bot, "_ask_gemini_saved_list_router")
+        self.mock_saved_router = patcher_saved_router.start()
+        self.addCleanup(patcher_saved_router.stop)
+
+    def tearDown(self):
+        for d in (bot.pending_expense, bot.pending_delete_batch,
+                  bot.pending_alias_action, bot.active_list_context, bot.saved_list_context):
+            d.clear()
+
+    def _assert_clean_description(self, chat_id, update_id, user_text, dirty_description, expected_clean):
+        with patch.object(
+            bot, "_ask_gemini_expense_router",
+            return_value=_ok_router_result(description=dirty_description),
+        ):
+            _call_webhook(_make_update(update_id, chat_id, user_text))
+        self.assertIn(chat_id, bot.pending_expense)
+        self.assertEqual(bot.pending_expense[chat_id]["description"], expected_clean)
+        sent_texts = [call.args[1] for call in self.mock_send.call_args_list]
+        self.assertTrue(any(f"Опис: {expected_clean}" in t for t in sent_texts))
+        self.assertFalse(any(dirty_description in t for t in sent_texts if dirty_description != expected_clean))
+
+    # 8. "Запиши 120 zł за інтернет" — Gemini returns the whole command back
+    # as description; the stored/previewed name must still be "інтернет".
+    def test_zapysy_za_internet_stores_clean_description(self):
+        self._assert_clean_description(
+            941101, 941100001, "Запиши 120 zł за інтернет", "Запиши 120 zł за інтернет", "інтернет",
+        )
+
+    # 9.
+    def test_zapysy_na_internet_stores_clean_description(self):
+        self._assert_clean_description(
+            941102, 941100002, "Запиши 120 zł на інтернет", "Запиши 120 zł на інтернет", "інтернет",
+        )
+
+    # 10.
+    def test_bare_amount_and_preposition_stores_clean_description(self):
+        self._assert_clean_description(
+            941103, 941100003, "120 zł за інтернет", "120 zł за інтернет", "інтернет",
+        )
+
+    # 11.
+    def test_trailing_amount_stores_clean_description(self):
+        self._assert_clean_description(
+            941104, 941100004, "Інтернет 120 zł", "Інтернет 120 zł", "Інтернет",
+        )
+
+    # 12. Regression — Gemini ALREADY returning a clean description (the
+    # normal/expected case) is unaffected by the new cleanup.
+    def test_biedronka_with_category_dash_stores_clean_merchant_title(self):
+        chat_id = 941105
+        with patch.object(
+            bot, "_ask_gemini_expense_router",
+            return_value=_ok_router_result(description="Biedronka", category="Продукти"),
+        ):
+            _call_webhook(_make_update(941100005, chat_id, "Biedronka 86,40 zł — продукти"))
+        self.assertIn(chat_id, bot.pending_expense)
+        self.assertEqual(bot.pending_expense[chat_id]["description"], "Biedronka")
+        self.assertEqual(bot.pending_expense[chat_id]["category"], "Продукти")
+
+    # 13.
+    def test_kava_stores_clean_description(self):
+        self._assert_clean_description(941106, 941100006, "Кава 14 zł", "Кава 14 zł", "Кава")
+
+    # 14. Regression: confirming after a cleaned description still writes
+    # exactly the clean text, and preview/confirm behavior is unaffected.
+    def test_confirm_after_cleanup_writes_clean_description(self):
+        chat_id = 941107
+        with patch.object(
+            bot, "_ask_gemini_expense_router",
+            return_value=_ok_router_result(description="Запиши 120 zł за інтернет", category="Дім і рахунки"),
+        ):
+            _call_webhook(_make_update(941100007, chat_id, "Запиши 120 zł за інтернет"))
+        self.assertEqual(bot.pending_expense[chat_id]["description"], "інтернет")
+        with patch.object(bot, "add_expense") as mock_add:
+            _call_webhook(_make_update(941100008, chat_id, "✅ Так, додати"))
+            mock_add.assert_called_once_with(
+                1, 10, Decimal("86.40"), "PLN", "Дім і рахунки", "інтернет", date.fromisoformat(_todays_warsaw_date_iso()),
+            )
+        self.assertNotIn(chat_id, bot.pending_expense)
+
+
+# =========================
 # 13 — household isolation at the SQL layer
 # =========================
 class FakeCursor:

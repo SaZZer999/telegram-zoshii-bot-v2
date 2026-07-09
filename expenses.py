@@ -409,11 +409,44 @@ def _validate_expense_category(raw_category):
     return DEFAULT_EXPENSE_CATEGORY, True
 
 
+# V1.4.2 defensive description cleanup — Gemini is EXPECTED to already
+# return a clean description (see EXPENSE_ROUTER_PROMPT's own "без суми й
+# категорії всередині тексту" instruction), but a live bug showed it can
+# instead return the WHOLE raw command ("Запиши 120 zł за інтернет") as
+# description. These three patterns are applied, in order, as the single
+# Python-side safety net that prevents that from ever being stored as the
+# expense name:
+#   1. a leading command verb ("Запиши"/"Додай"/...), optionally followed
+#      by "витрату"/"витрата"/"витрати";
+#   2. an amount+currency span ANYWHERE in the remaining text ("120 zł",
+#      "86,40 zł", "39 злотих") — not just leading, since stripping the
+#      verb can leave the amount at the start;
+#   3. a leftover leading preposition ("за"/"на") once the amount is gone.
+_EXPENSE_LEADING_COMMAND_VERB_RE = re.compile(
+    r"^(?:запиши(?:ть)?|додай(?:те)?|занотуй(?:те)?|зафіксуй(?:те)?)\s+(?:витрат[ауи]\s+)?",
+    re.IGNORECASE,
+)
+_EXPENSE_DESCRIPTION_AMOUNT_SPAN_RE = re.compile(
+    r"\d[\d\s.,]*\s*(?:zł|zl|pln|злот\w*|z\b(?!\s*\d))",
+    re.IGNORECASE,
+)
+_EXPENSE_LEADING_PREPOSITION_RE = re.compile(r"^(?:за|на)\s+", re.IGNORECASE)
+
+
 def _clean_expense_description(raw_description):
-    """Collapse whitespace and cap length; never raises, never None."""
+    """Collapse whitespace, cap length, and strip a leading command verb /
+    any amount+currency span / a leftover leading preposition (see the
+    module-level comment above) — never raises, never None. A description
+    that's ALREADY clean (the normal case) passes through unchanged, since
+    none of the three patterns match plain text."""
     if not isinstance(raw_description, str):
         return ""
-    return re.sub(r"\s+", " ", raw_description.strip())[:EXPENSE_DESCRIPTION_MAX_LEN]
+    cleaned = raw_description.strip()
+    cleaned = _EXPENSE_LEADING_COMMAND_VERB_RE.sub("", cleaned)
+    cleaned = _EXPENSE_DESCRIPTION_AMOUNT_SPAN_RE.sub("", cleaned).strip()
+    cleaned = _EXPENSE_LEADING_PREPOSITION_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned.strip())
+    return cleaned[:EXPENSE_DESCRIPTION_MAX_LEN]
 
 
 def _validate_expense_router_result(router_result, now=None):

@@ -35,6 +35,7 @@ from bot import (  # noqa: E402
     pending_cleanup_admin,
     pending_undo_action,
     MAIN_KEYBOARD,
+    EXPENSES_KEYBOARD,
     GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD,
     UNDO_PREVIEW_KEYBOARD,
     DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG,
@@ -89,6 +90,17 @@ class TestNavigationKeepsMainKeyboard(ReplyKeyboardWebhookTestCase):
         texts = self._sent_texts()
         self.assertTrue(any("Ось головне меню:" == t for t in texts))
         self.assertIn(MAIN_KEYBOARD, self._reply_markups())
+
+    # 3. "💸 Витрати" response includes the appropriate (expenses submenu)
+    # reply_markup — never no keyboard at all — and that submenu keyboard
+    # itself always carries "⬅️ Головне меню", so navigation is never lost.
+    def test_expenses_button_includes_expenses_keyboard(self):
+        chat_id = 780010
+        _call_webhook(_make_update(780000010, chat_id, "💸 Витрати"))
+        markups = self._reply_markups()
+        self.assertIn(EXPENSES_KEYBOARD, markups)
+        self.assertTrue(any(rm is not None for rm in markups))
+        self.assertIn(["⬅️ Головне меню"], EXPENSES_KEYBOARD["keyboard"])
 
 
 class TestGeneralAiFallbackKeepsMainKeyboard(ReplyKeyboardWebhookTestCase):
