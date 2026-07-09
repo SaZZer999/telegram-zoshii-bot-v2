@@ -4419,13 +4419,25 @@ def _route_destructive_bulk_guard(chat_id, user_id, display_name, text):
     command-routes slice entirely. Stores a small ephemeral pending_
     destructive_guard context so a destination follow-up ("покупки"/
     "запаси"/...) is resolved by _continue_destructive_guard instead of
-    ever reaching the ordinary read-list route."""
-    if _looks_like_destructive_bulk_household_request(text):
-        origin = household_router.current_origin(chat_id)
-        pending_destructive_guard[chat_id] = {"origin": origin}
-        send_message(chat_id, DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG)
+    ever reaching the ordinary read-list route.
+
+    V1.4.1: an already-active pending write preview/clarification for this
+    chat (e.g. a cleanup-admin rename/delete preview awaiting "✅ Так,
+    застосувати"/"❌ Скасувати") must win over a NEW destructive-guard
+    question — same _has_blocking_pending_state_for_reports guard every
+    other route-starting function in this file already checks first (see
+    _start_inventory_rename/_start_inventory_delete/_start_inventory_
+    cleanup) — so this never overwrites/competes with that preview, and
+    never opens a pending_destructive_guard context on top of it."""
+    if not _looks_like_destructive_bulk_household_request(text):
+        return False
+    if _has_blocking_pending_state_for_reports(chat_id):
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
         return True
-    return False
+    origin = household_router.current_origin(chat_id)
+    pending_destructive_guard[chat_id] = {"origin": origin}
+    send_message(chat_id, DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG)
+    return True
 
 
 def _continue_destructive_guard(chat_id, text):

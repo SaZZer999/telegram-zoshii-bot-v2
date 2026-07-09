@@ -795,6 +795,112 @@ class TestBlockedByOtherActivePendingState(InventoryAdminWebhookTestCase):
             bot.pending_global_household.pop(chat_id, None)
 
 
+class TestActivePendingBlocksNewActionRoutes(InventoryAdminWebhookTestCase):
+    """V1.4.1 live bug: with an active pending_cleanup_admin preview
+    (e.g. "прибери Молоко 1 шт" awaiting confirm/cancel), a NEW destructive/
+    action command must never start a competing route — the Destructive
+    Bulk Household Request Guard used to fire regardless of an already-
+    active preview, overwriting the user's unconfirmed pending state's
+    "next reply" context with its own "покупки чи запаси?" question."""
+
+    def _set_active_delete_preview(self, chat_id):
+        pending_cleanup_admin[chat_id] = {
+            "action": "delete", "household_id": 1, "user_db_id": 10, "origin": "global",
+            "item_id": 21, "target": {
+                "item_id": 21, "quantity_value": Decimal("1"), "quantity_unit": "шт.",
+                "name": "Молоко", "canonical_name": "молоко",
+            },
+        }
+
+    # 1. "Видали все" must not start the destructive guard while a preview
+    # is pending — no Gemini call, no pending_destructive_guard, the
+    # original preview survives untouched.
+    def test_destructive_guard_blocked_by_active_preview(self):
+        chat_id = 771200
+        self._set_active_delete_preview(chat_id)
+        with patch.object(bot, "call_gemini") as mock_gemini:
+            _call_webhook(_make_update(771200001, chat_id, "Видали все"))
+        mock_gemini.assert_not_called()
+        self.assertEqual(self._sent_texts(), [GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG])
+        self.assertIn(chat_id, pending_cleanup_admin)
+        self.assertEqual(pending_cleanup_admin[chat_id]["action"], "delete")
+        self.assertNotIn(chat_id, pending_destructive_guard)
+
+    # 2. Since "Видали все" is now blocked and never opens pending_
+    # destructive_guard, a later "покупки" is just ordinary text — it must
+    # not be treated as a destructive-guard follow-up, and (per existing
+    # project policy — general AI, not a deterministic shopping-list route,
+    # already answers a bare "покупки") must not show the shopping list.
+    def test_pokupky_after_blocked_guard_does_not_show_shopping_list(self):
+        chat_id = 771201
+        self._set_active_delete_preview(chat_id)
+        _call_webhook(_make_update(771201001, chat_id, "Видали все"))
+        self.mock_send.reset_mock()
+        with patch.object(bot, "get_active_shopping_items") as mock_shopping_items:
+            _call_webhook(_make_update(771201002, chat_id, "покупки"))
+        mock_shopping_items.assert_not_called()
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        self.assertIn(chat_id, pending_cleanup_admin)
+        self.assertEqual(pending_cleanup_admin[chat_id]["action"], "delete")
+
+    # 3. "перейменуй ser на сир" must not start a new rename preview.
+    def test_rename_blocked_by_active_preview(self):
+        chat_id = 771202
+        self._set_active_delete_preview(chat_id)
+        _call_webhook(_make_update(771202001, chat_id, "перейменуй ser на сир"))
+        self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
+        self.assertEqual(pending_cleanup_admin[chat_id]["action"], "delete")
+        self.assertEqual(pending_cleanup_admin[chat_id]["item_id"], 21)
+
+    # 4. "об'єднай молоко в запасах" must not start a cleanup-merge preview.
+    def test_cleanup_merge_blocked_by_active_preview(self):
+        chat_id = 771203
+        self._set_active_delete_preview(chat_id)
+        with patch.object(bot, "get_household_alias_map", return_value={}):
+            _call_webhook(_make_update(771203001, chat_id, "об'єднай молоко в запасах"))
+        self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
+        self.assertNotIn(chat_id, pending_merge)
+        self.assertEqual(pending_cleanup_admin[chat_id]["action"], "delete")
+
+    # 5. "❌ Скасувати" must still cancel the active preview normally.
+    def test_cancel_still_cancels_active_preview(self):
+        chat_id = 771204
+        self._set_active_delete_preview(chat_id)
+        _call_webhook(_make_update(771204001, chat_id, "❌ Скасувати"))
+        self.assertNotIn(chat_id, pending_cleanup_admin)
+        self.assertTrue(any("Зміни скасовано." in t for t in self._sent_texts()))
+
+    # 6. "✅ Так, застосувати" must still confirm the active preview normally.
+    def test_confirm_still_confirms_active_preview(self):
+        chat_id = 771205
+        self._set_active_delete_preview(chat_id)
+        with patch.object(bot, "execute_inventory_delete", return_value=True) as mock_delete:
+            _call_webhook(_make_update(771205001, chat_id, "✅ Так, застосувати"))
+        mock_delete.assert_called_once()
+        self.assertNotIn(chat_id, pending_cleanup_admin)
+        self.assertTrue(any("✅ Зміни застосовано." == t for t in self._sent_texts()))
+
+    # 7. "↩️ Скасувати останню дію" must cancel the CURRENT pending preview
+    # first, never fall through to historical undo.
+    def test_undo_button_cancels_active_preview_first(self):
+        chat_id = 771206
+        self._set_active_delete_preview(chat_id)
+        _call_webhook(_make_update(771206001, chat_id, "↩️ Скасувати останню дію"))
+        self.assertNotIn(chat_id, pending_cleanup_admin)
+        self.assertTrue(any("Поточну дію скасовано." in t for t in self._sent_texts()))
+
+    # 8. After the preview is cancelled, "Видали все" works normally again.
+    def test_destructive_clarification_works_again_after_cancel(self):
+        chat_id = 771207
+        self._set_active_delete_preview(chat_id)
+        _call_webhook(_make_update(771207001, chat_id, "❌ Скасувати"))
+        self.assertNotIn(chat_id, pending_cleanup_admin)
+        self.mock_send.reset_mock()
+        _call_webhook(_make_update(771207002, chat_id, "Видали все"))
+        self.assertEqual(self._sent_texts(), [DESTRUCTIVE_BULK_HOUSEHOLD_GUARD_MSG])
+        self.assertIn(chat_id, pending_destructive_guard)
+
+
 class TestCleanupAdminDisambiguationFollowup(InventoryAdminWebhookTestCase):
     """V1.3: a rename/delete request matching 2+ rows stores a pending
     disambiguation context, and a short follow-up reply ("1 л", "№1", "1")
