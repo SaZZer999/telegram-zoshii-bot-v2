@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unicodedata
 from collections import deque
 from datetime import datetime
@@ -88,6 +89,7 @@ import interaction_state
 import household_read_context
 import meal_ideas
 import preview_editing
+import voice_input
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -5455,6 +5457,110 @@ _dispatcher_deps = message_dispatcher.DispatcherDeps(
 )
 
 
+# =========================
+# VOICE INPUT V1 — Telegram voice message -> Groq Whisper transcript -> the
+# EXACT SAME message_dispatcher.dispatch(...) call a typed text message
+# already goes through (see webhook() below). voice_input.py owns every
+# transcription-provider concern (env config, the Groq call itself,
+# disabled/missing-key errors); this module only owns the Telegram-specific
+# half — downloading the voice file and the duration/download error
+# messages that have nothing to do with the transcription provider.
+# =========================
+VOICE_TOO_LONG_MSG = "Голосове занадто довге. Спробуй коротше повідомлення до 60 секунд."
+VOICE_DOWNLOAD_FAILED_MSG = "Не вдалося завантажити голосове. Спробуй ще раз."
+
+VOICE_DOWNLOAD_TIMEOUT = 20  # seconds; Telegram file downloads can be slower than a plain sendMessage
+
+
+def _telegram_get_file_path(file_id):
+    resp = requests.get(
+        f"https://api.telegram.org/bot{TOKEN}/getFile",
+        params={"file_id": file_id},
+        timeout=VOICE_DOWNLOAD_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError("Telegram getFile failed")
+    return data["result"]["file_path"]
+
+
+def _download_telegram_voice_to_temp(file_id):
+    """Download a Telegram voice file to a fresh temp file and return its
+    local path. Raises on any failure (bad file_id, network error,
+    non-2xx response) — the caller sends VOICE_DOWNLOAD_FAILED_MSG and
+    never calls the transcription provider at all."""
+    remote_path = _telegram_get_file_path(file_id)
+    resp = requests.get(
+        f"https://api.telegram.org/file/bot{TOKEN}/{remote_path}",
+        timeout=VOICE_DOWNLOAD_TIMEOUT,
+    )
+    resp.raise_for_status()
+    suffix = os.path.splitext(remote_path)[1] or ".oga"
+    fd, temp_path = tempfile.mkstemp(prefix="voice_", suffix=suffix)
+    with os.fdopen(fd, "wb") as f:
+        f.write(resp.content)
+    return temp_path
+
+
+def _handle_voice_message(chat_id, voice):
+    """Full Voice Input V1 pipeline for one Telegram `voice` object —
+    disabled/misconfigured check, duration guard, download, transcribe,
+    empty-transcript guard, optional "🎙️ Розпізнав:" echo. Every failure
+    sends its own controlled Ukrainian message and returns None (webhook()
+    stops there, exactly like an empty text message). On success returns
+    the transcript string for webhook() to hand to message_dispatcher.
+    dispatch(...) — the SAME call a typed text message already goes
+    through, so every preview/confirm/cancel/undo/stale-protection route
+    behaves identically regardless of how the text arrived.
+    """
+    try:
+        voice_input.ensure_ready()
+    except voice_input.VoiceInputError as e:
+        send_message(chat_id, str(e))
+        return None
+
+    duration = voice.get("duration") or 0
+    if duration > voice_input.VOICE_MAX_SECONDS:
+        send_message(chat_id, VOICE_TOO_LONG_MSG)
+        return None
+
+    file_id = voice.get("file_id")
+    if not file_id:
+        send_message(chat_id, VOICE_DOWNLOAD_FAILED_MSG)
+        return None
+
+    temp_path = None
+    try:
+        try:
+            temp_path = _download_telegram_voice_to_temp(file_id)
+        except Exception:
+            send_message(chat_id, VOICE_DOWNLOAD_FAILED_MSG)
+            return None
+
+        try:
+            transcript = voice_input.transcribe_audio_file(temp_path)
+        except voice_input.VoiceInputError as e:
+            send_message(chat_id, str(e))
+            return None
+    finally:
+        if temp_path is not None:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+    transcript = (transcript or "").strip()
+    if not transcript:
+        send_message(chat_id, voice_input.TRANSCRIBE_FAILED_MSG)
+        return None
+
+    if voice_input.VOICE_SHOW_TRANSCRIPT:
+        send_message(chat_id, f"🎙️ Розпізнав:\n«{transcript}»")
+
+    return transcript
+
+
 @app.route("/")
 def home():
     return "Bot is running"
@@ -5472,8 +5578,9 @@ def webhook():
 
     chat_id = message["chat"]["id"]
     text = message.get("text", "")
+    voice = message.get("voice")
 
-    if not text:
+    if not text and not voice:
         return "ok"
 
     user_id = message.get("from", {}).get("id")
@@ -5484,11 +5591,27 @@ def webhook():
         return "ok"
 
     # =========================
-    # ACCESS CHECK
+    # ACCESS CHECK — identical for voice and text, checked before either is
+    # processed any further (a voice message is never transcribed for a
+    # disallowed user).
     # =========================
     if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
         send_message(chat_id, "Цей бот приватний і доступний лише для дозволених користувачів.")
         return "ok"
+
+    # =========================
+    # VOICE INPUT V1 — a voice message is transcribed here and then falls
+    # straight into the SAME dispatch(...) call below as `text`, exactly
+    # like a typed message; see _handle_voice_message's own docstring.
+    # Every failure (disabled/misconfigured, too long, download failed,
+    # empty transcript) already sent its own controlled reply and returns
+    # None here, so webhook() just stops — never calls dispatch() with an
+    # empty/missing transcript.
+    # =========================
+    if voice is not None:
+        text = _handle_voice_message(chat_id, voice)
+        if not text:
+            return "ok"
 
     # =========================
     # MESSAGE DISPATCHER V1/V2A/V2B/V3A/V3B (message_dispatcher.py)
