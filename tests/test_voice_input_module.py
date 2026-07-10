@@ -110,6 +110,95 @@ class TestTranscribeAudioFile(unittest.TestCase):
         _, kwargs = mock_client.audio.transcriptions.create.call_args
         self.assertEqual(kwargs["language"], "uk")
 
+    # 4. Groq receives a filename ending in the SAME suffix as the local
+    # file (bot.py's own _normalize_voice_suffix already turned Telegram's
+    # ".oga" into ".ogg" before this function ever runs — this only proves
+    # transcribe_audio_file passes that suffix straight through, never
+    # drops or rewrites it).
+    def test_groq_receives_filename_with_expected_suffix(self):
+        fd, ogg_path = tempfile.mkstemp(suffix=".ogg")
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"fake-ogg-bytes")
+        self.addCleanup(lambda: os.path.exists(ogg_path) and os.remove(ogg_path))
+
+        fake_response = MagicMock()
+        fake_response.text = "Що є вдома?"
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = fake_response
+        with patch.object(voice_input, "Groq", return_value=mock_client):
+            voice_input.transcribe_audio_file(ogg_path, api_key="sk-test")
+        _, kwargs = mock_client.audio.transcriptions.create.call_args
+        sent_filename, sent_bytes = kwargs["file"]
+        self.assertTrue(sent_filename.endswith(".ogg"), sent_filename)
+        self.assertEqual(sent_bytes, b"fake-ogg-bytes")
+
+    def test_groq_receives_response_format_json_and_temperature_zero(self):
+        fake_response = MagicMock()
+        fake_response.text = "hello"
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = fake_response
+        with patch.object(voice_input, "Groq", return_value=mock_client):
+            voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test")
+        _, kwargs = mock_client.audio.transcriptions.create.call_args
+        self.assertEqual(kwargs["response_format"], "json")
+        self.assertEqual(kwargs["temperature"], 0)
+
+    # 6. A dict response shaped like {"text": "..."} is accepted.
+    def test_dict_response_with_text_key_is_accepted(self):
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = {"text": "додай хліб"}
+        with patch.object(voice_input, "Groq", return_value=mock_client):
+            result = voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test")
+        self.assertEqual(result, "додай хліб")
+
+    def test_unsupported_response_shape_returns_empty_and_logs_warning(self):
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = 12345  # not str/dict/has-no-.text object
+        with patch.object(voice_input, "Groq", return_value=mock_client):
+            with self.assertLogs(voice_input.logger, level="WARNING") as log_ctx:
+                result = voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test")
+        self.assertEqual(result, "")
+        self.assertTrue(any("unsupported response shape" in msg for msg in log_ctx.output))
+
+    # 5/8/10. Structured, sanitized diagnostics — no secrets in any log line.
+    def test_success_logs_start_and_success_without_leaking_transcript(self):
+        fake_response = MagicMock()
+        fake_response.text = "додай молоко"
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = fake_response
+        with patch.object(voice_input, "Groq", return_value=mock_client):
+            with self.assertLogs(voice_input.logger, level="INFO") as log_ctx:
+                voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test")
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("voice_transcription_start", joined)
+        self.assertIn("voice_transcription_success", joined)
+        self.assertNotIn("додай молоко", joined)  # transcript content itself never logged
+        self.assertNotIn("sk-test", joined)  # api key never appears in logs
+
+    def test_empty_transcript_logs_empty_event(self):
+        fake_response = MagicMock()
+        fake_response.text = "   "
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = fake_response
+        with patch.object(voice_input, "Groq", return_value=mock_client):
+            with self.assertLogs(voice_input.logger, level="INFO") as log_ctx:
+                voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test")
+        self.assertTrue(any("voice_transcription_empty" in msg for msg in log_ctx.output))
+
+    def test_provider_error_logs_sanitized_exception_no_api_key(self):
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = RuntimeError(
+            "groq 401: invalid_api_key key=sk-test",
+        )
+        with patch.object(voice_input, "Groq", return_value=mock_client):
+            with self.assertLogs(voice_input.logger, level="ERROR") as log_ctx:
+                with self.assertRaises(voice_input.VoiceInputError):
+                    voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test")
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("voice_transcription_error", joined)
+        self.assertIn("RuntimeError", joined)
+        self.assertNotIn("sk-test", joined)
+
 
 class TestEnvDefaults(unittest.TestCase):
     """Reload the module with a clean environment to verify the documented

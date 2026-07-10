@@ -294,17 +294,26 @@ class TestVoiceErrorGuards(VoiceWebhookTestCase):
 # =========================
 # Low-level download helper: getFile + file download, both via requests.
 # =========================
+def _fake_get_file_response(file_path):
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"ok": True, "result": {"file_path": file_path}}
+    return resp
+
+
+def _fake_file_response(content):
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.content = content
+    return resp
+
+
 class TestDownloadTelegramVoiceToTemp(unittest.TestCase):
     def test_downloads_via_get_file_then_file_endpoint_and_writes_bytes(self):
-        get_file_response = MagicMock()
-        get_file_response.raise_for_status.return_value = None
-        get_file_response.json.return_value = {"ok": True, "result": {"file_path": "voice/file_0.oga"}}
-
-        file_response = MagicMock()
-        file_response.raise_for_status.return_value = None
-        file_response.content = b"fake-ogg-bytes"
-
-        with patch.object(bot.requests, "get", side_effect=[get_file_response, file_response]) as mock_get:
+        with patch.object(
+            bot.requests, "get",
+            side_effect=[_fake_get_file_response("voice/file_0.oga"), _fake_file_response(b"fake-ogg-bytes")],
+        ) as mock_get:
             temp_path = bot._download_telegram_voice_to_temp("abc123")
         try:
             self.assertTrue(os.path.exists(temp_path))
@@ -315,6 +324,114 @@ class TestDownloadTelegramVoiceToTemp(unittest.TestCase):
             self.assertEqual(first_call_kwargs.get("params"), {"file_id": "abc123"})
         finally:
             os.remove(temp_path)
+
+    # 1. Telegram file_path with .oga is normalized to .ogg (the likely
+    # live-bug fix: Groq's upload validation didn't recognize ".oga").
+    def test_oga_extension_is_normalized_to_ogg(self):
+        with patch.object(
+            bot.requests, "get",
+            side_effect=[_fake_get_file_response("voice/file_0.oga"), _fake_file_response(b"bytes")],
+        ):
+            temp_path = bot._download_telegram_voice_to_temp("abc123")
+        try:
+            self.assertTrue(temp_path.endswith(".ogg"), temp_path)
+        finally:
+            os.remove(temp_path)
+
+    # An already-".ogg" file_path is preserved as-is.
+    def test_ogg_extension_is_preserved(self):
+        with patch.object(
+            bot.requests, "get",
+            side_effect=[_fake_get_file_response("voice/file_0.ogg"), _fake_file_response(b"bytes")],
+        ):
+            temp_path = bot._download_telegram_voice_to_temp("abc123")
+        try:
+            self.assertTrue(temp_path.endswith(".ogg"), temp_path)
+        finally:
+            os.remove(temp_path)
+
+    # 2. A file_path with no extension at all defaults to .ogg.
+    def test_missing_extension_defaults_to_ogg(self):
+        with patch.object(
+            bot.requests, "get",
+            side_effect=[_fake_get_file_response("voice/file_0"), _fake_file_response(b"bytes")],
+        ):
+            temp_path = bot._download_telegram_voice_to_temp("abc123")
+        try:
+            self.assertTrue(temp_path.endswith(".ogg"), temp_path)
+        finally:
+            os.remove(temp_path)
+
+    # A recognized non-ogg extension (e.g. a forwarded audio file) is kept
+    # unchanged, never forced to .ogg.
+    def test_other_known_extension_is_preserved(self):
+        with patch.object(
+            bot.requests, "get",
+            side_effect=[_fake_get_file_response("voice/file_0.mp3"), _fake_file_response(b"bytes")],
+        ):
+            temp_path = bot._download_telegram_voice_to_temp("abc123")
+        try:
+            self.assertTrue(temp_path.endswith(".mp3"), temp_path)
+        finally:
+            os.remove(temp_path)
+
+    # 3. A 0-byte downloaded body is treated as a download failure, never
+    # silently handed to the transcription provider.
+    def test_empty_download_body_raises(self):
+        with patch.object(
+            bot.requests, "get",
+            side_effect=[_fake_get_file_response("voice/file_0.oga"), _fake_file_response(b"")],
+        ):
+            with self.assertRaises(Exception):
+                bot._download_telegram_voice_to_temp("abc123")
+
+    def test_get_file_success_and_download_success_are_logged_without_secrets(self):
+        with self.assertLogs(bot.logger, level="INFO") as log_ctx:
+            with patch.object(
+                bot.requests, "get",
+                side_effect=[_fake_get_file_response("voice/file_0.oga"), _fake_file_response(b"12345")],
+            ):
+                temp_path = bot._download_telegram_voice_to_temp("abc123")
+        try:
+            joined = "\n".join(log_ctx.output)
+            self.assertIn("voice_get_file_success", joined)
+            self.assertIn("voice_download_success", joined)
+            self.assertNotIn("test_token", joined)  # TOKEN never logged
+            self.assertNotIn("abc123", joined)  # file_id never logged
+        finally:
+            os.remove(temp_path)
+
+
+class TestVoiceDownloadFailureLogging(VoiceWebhookTestCase):
+    # 10. A download failure logs a sanitized error (no token/URL) and
+    # sends the generic controlled message.
+    def test_download_error_is_logged_without_leaking_token(self):
+        chat_id = 991340
+        with self.assertLogs(bot.logger, level="ERROR") as log_ctx:
+            with patch.object(bot, "_download_telegram_voice_to_temp", side_effect=RuntimeError(
+                f"404 for url: https://api.telegram.org/bot{bot.TOKEN}/getFile?file_id=abc",
+            )):
+                _call_webhook(_make_voice_update(991340001, chat_id))
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("voice_download_error", joined)
+        self.assertNotIn(bot.TOKEN, joined)
+        self.assertEqual(self._sent_texts(), [bot.VOICE_DOWNLOAD_FAILED_MSG])
+
+    # 11. Temp file cleanup still happens on transcription failure, and is
+    # itself logged.
+    def test_cleanup_logged_on_transcription_failure(self):
+        chat_id = 991341
+        fd, temp_path = tempfile.mkstemp(suffix=".ogg")
+        os.close(fd)
+        with self.assertLogs(bot.logger, level="INFO") as log_ctx:
+            with patch.object(bot, "_download_telegram_voice_to_temp", return_value=temp_path):
+                with patch.object(
+                    voice_input, "transcribe_audio_file",
+                    side_effect=voice_input.VoiceInputError(voice_input.TRANSCRIBE_FAILED_MSG),
+                ):
+                    _call_webhook(_make_voice_update(991341001, chat_id))
+        self.assertFalse(os.path.exists(temp_path))
+        self.assertTrue(any("voice_temp_cleanup_success" in msg for msg in log_ctx.output))
 
 
 if __name__ == "__main__":

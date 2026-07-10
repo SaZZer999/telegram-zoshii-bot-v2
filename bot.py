@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import sys
@@ -92,6 +93,16 @@ import preview_editing
 import voice_input
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
+
+# =========================
+# LOGGING — no project-wide logger existed before Voice Input V1 (only ad-
+# hoc print()); a basic root config is enough to make module-level
+# logger.info/warning/error calls (see the VOICE INPUT section below and
+# voice_input.py) actually show up in Render's captured stdout. Never logs
+# secrets/tokens/full transcripts — see each call site's own comment.
+# =========================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 # =========================
 # ENV
@@ -5472,6 +5483,48 @@ VOICE_DOWNLOAD_FAILED_MSG = "Не вдалося завантажити голо
 VOICE_DOWNLOAD_TIMEOUT = 20  # seconds; Telegram file downloads can be slower than a plain sendMessage
 
 
+def _sanitize_telegram_error(exc):
+    """Server-side-log-only scrub of a download exception's message — a
+    requests HTTPError's own str() often embeds the full request URL,
+    which for Telegram's API includes the bot TOKEN, so that must never
+    reach a log line verbatim. Bounded length; never sent to the user
+    (VOICE_DOWNLOAD_FAILED_MSG is the only string that reaches Telegram)."""
+    message = str(exc)
+    if TOKEN:
+        message = message.replace(TOKEN, "***")
+    return message[:300]
+
+
+# Extensions Groq's Whisper endpoint is documented to accept as-is.
+_VOICE_KNOWN_SUFFIXES = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".wav", ".webm"}
+# Telegram voice notes are always OGG/Opus audio, but Telegram's own
+# getFile file_path traditionally reports the extension as ".oga" (and
+# occasionally ".opus") — the SAME container/codec as ".ogg", just a
+# filename label some providers' upload validation does not recognize.
+# This was the most likely cause of every live voice message failing
+# transcription (see this module's VOICE INPUT V1 section docstring
+# history / the "stabilize voice transcription upload" fix): the
+# downloaded temp file — and therefore the multipart filename Groq saw —
+# kept Telegram's own ".oga" suffix unchanged.
+_VOICE_SUFFIX_ALIASES = {".oga": ".ogg", ".opus": ".ogg"}
+
+
+def _normalize_voice_suffix(remote_path):
+    """Map a Telegram voice file_path's extension to a filename suffix
+    Groq's Whisper endpoint reliably recognizes (see _VOICE_SUFFIX_ALIASES'
+    own comment). Any other already-known audio extension is preserved
+    as-is; a missing/unrecognized extension defaults to ".ogg" — Telegram
+    voice notes' real format — never a bare tempfile with no extension."""
+    ext = os.path.splitext(remote_path or "")[1].lower()
+    if not ext:
+        return ".ogg"
+    if ext in _VOICE_SUFFIX_ALIASES:
+        return _VOICE_SUFFIX_ALIASES[ext]
+    if ext in _VOICE_KNOWN_SUFFIXES:
+        return ext
+    return ".ogg"
+
+
 def _telegram_get_file_path(file_id):
     resp = requests.get(
         f"https://api.telegram.org/bot{TOKEN}/getFile",
@@ -5488,18 +5541,29 @@ def _telegram_get_file_path(file_id):
 def _download_telegram_voice_to_temp(file_id):
     """Download a Telegram voice file to a fresh temp file and return its
     local path. Raises on any failure (bad file_id, network error,
-    non-2xx response) — the caller sends VOICE_DOWNLOAD_FAILED_MSG and
-    never calls the transcription provider at all."""
+    non-2xx response, empty body) — the caller sends VOICE_DOWNLOAD_FAILED_
+    MSG and never calls the transcription provider at all. Never logs the
+    tokenized Telegram API URL — only the file_path's own extension, the
+    resulting local suffix, and the downloaded size."""
     remote_path = _telegram_get_file_path(file_id)
+    original_ext = os.path.splitext(remote_path or "")[1].lower() or "(none)"
+    logger.info("voice_get_file_success: extension=%s", original_ext)
+
     resp = requests.get(
         f"https://api.telegram.org/file/bot{TOKEN}/{remote_path}",
         timeout=VOICE_DOWNLOAD_TIMEOUT,
     )
     resp.raise_for_status()
-    suffix = os.path.splitext(remote_path)[1] or ".oga"
+    content = resp.content
+    if not content:
+        logger.error("voice_download_failed: empty response body")
+        raise RuntimeError("Telegram voice download returned an empty body")
+
+    suffix = _normalize_voice_suffix(remote_path)
     fd, temp_path = tempfile.mkstemp(prefix="voice_", suffix=suffix)
     with os.fdopen(fd, "wb") as f:
-        f.write(resp.content)
+        f.write(content)
+    logger.info("voice_download_success: suffix=%s size_bytes=%d", suffix, len(content))
     return temp_path
 
 
@@ -5514,13 +5578,15 @@ def _handle_voice_message(chat_id, voice):
     through, so every preview/confirm/cancel/undo/stale-protection route
     behaves identically regardless of how the text arrived.
     """
+    duration = voice.get("duration") or 0
+    logger.info("voice_received: chat_id=%s duration=%ss", chat_id, duration)
+
     try:
         voice_input.ensure_ready()
     except voice_input.VoiceInputError as e:
         send_message(chat_id, str(e))
         return None
 
-    duration = voice.get("duration") or 0
     if duration > voice_input.VOICE_MAX_SECONDS:
         send_message(chat_id, VOICE_TOO_LONG_MSG)
         return None
@@ -5534,7 +5600,8 @@ def _handle_voice_message(chat_id, voice):
     try:
         try:
             temp_path = _download_telegram_voice_to_temp(file_id)
-        except Exception:
+        except Exception as e:
+            logger.error("voice_download_error: %s: %s", type(e).__name__, _sanitize_telegram_error(e))
             send_message(chat_id, VOICE_DOWNLOAD_FAILED_MSG)
             return None
 
@@ -5547,8 +5614,9 @@ def _handle_voice_message(chat_id, voice):
         if temp_path is not None:
             try:
                 os.remove(temp_path)
-            except OSError:
-                pass
+                logger.info("voice_temp_cleanup_success")
+            except OSError as cleanup_err:
+                logger.warning("voice_temp_cleanup_failure: %s", type(cleanup_err).__name__)
 
     transcript = (transcript or "").strip()
     if not transcript:
