@@ -87,6 +87,7 @@ import message_dispatcher
 import interaction_state
 import household_read_context
 import meal_ideas
+import preview_editing
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -3177,7 +3178,8 @@ def _start_inventory_transform(chat_id, user_id, display_name, source_phrases, t
 
     targets = [
         {
-            "item_id": row["id"], "quantity_value": row.get("quantity_value"), "quantity_unit": row.get("quantity_unit"),
+            "item_id": row["id"], "name": row["name"],
+            "quantity_value": row.get("quantity_value"), "quantity_unit": row.get("quantity_unit"),
             "canonical_name": row.get("canonical_name"), "category": row.get("category") or DEFAULT_CATEGORY,
         }
         for row in resolved_rows
@@ -3227,6 +3229,41 @@ def _apply_inventory_transform_confirm(chat_id):
         send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=keyboard)
     except Exception:
         send_message(chat_id, "Не вдалося застосувати зміни. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+
+
+# =========================
+# PREVIEW EDIT V1 — safe text edits to an ACTIVE pending_inventory_transform
+# preview (see preview_editing.py's own module docstring for the parser/
+# patch catalog). Called from message_dispatcher.py's pending-routes slice
+# (Dispatcher V2A) BEFORE any command/context route, general AI fallback or
+# destructive guard is ever reached for a chat with an active preview — see
+# message_dispatcher._dispatch_pending_routes. Only mutates the SAME
+# pending_inventory_transform[chat_id] dict in place; never touches the
+# database, never pops it (confirm/cancel still own that, unchanged).
+# =========================
+def _handle_inventory_transform_edit_text(chat_id, text):
+    data = pending_inventory_transform.get(chat_id)
+    if data is None:
+        return
+    patch = preview_editing.parse_inventory_transform_edit(text)
+    if patch is None:
+        send_message(chat_id, preview_editing.UNPARSEABLE_EDIT_MSG)
+        return
+    ok, error = preview_editing.apply_inventory_transform_patch(
+        data, patch, canonicalize_name, inventory.capitalize_first,
+    )
+    if not ok:
+        send_message(chat_id, error)
+        return
+    source_rows = [
+        {"name": t.get("name") or "", "quantity_value": t.get("quantity_value"), "quantity_unit": t.get("quantity_unit")}
+        for t in data["targets"]
+    ]
+    preview = inventory.format_inventory_transform_preview(
+        source_rows, _effective_quantity, data["target_name"], data["target_quantity_text"],
+        header="Оновив план:",
+    )
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
 
 
 # _should_restore_persisted_context's real logic now lives in
@@ -4163,6 +4200,14 @@ _pending_route_deps = message_dispatcher.PendingRouteDeps(
     continue_cleanup_admin_disambiguation=lambda *a, **kw: _continue_cleanup_admin_disambiguation(*a, **kw),
     pending_destructive_guard=pending_destructive_guard,
     continue_destructive_guard=lambda *a, **kw: _continue_destructive_guard(*a, **kw),
+    # Preview Edit V1 — pending_inventory_transform supports safe text
+    # edits (see preview_editing.py); pending_cleanup_admin (single-row
+    # rename/delete preview) does not yet, but still must never leak
+    # arbitrary text to general AI/any other route while active.
+    pending_inventory_transform=pending_inventory_transform,
+    handle_inventory_transform_edit=lambda *a, **kw: _handle_inventory_transform_edit_text(*a, **kw),
+    pending_cleanup_admin=pending_cleanup_admin,
+    unsupported_preview_edit_msg=preview_editing.UNSUPPORTED_PREVIEW_TYPE_MSG,
 )
 
 # =========================

@@ -30,6 +30,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import inventory
+import preview_editing
 
 _database_path = os.path.join(os.path.dirname(__file__), "..", "database.py")
 _spec = importlib.util.spec_from_file_location("real_database_for_inventory_transform_test", _database_path)
@@ -47,7 +48,9 @@ import bot  # noqa: E402
 from bot import (  # noqa: E402
     pending_inventory_transform,
     pending_cleanup_admin,
+    pending_cleanup_admin_disambiguation,
     pending_global_household,
+    pending_destructive_guard,
     GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD,
     GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG,
     STALE_PREVIEW_MSG,
@@ -327,6 +330,248 @@ class TestTransformConfirmAndCancel(InventoryTransformWebhookTestCase):
 
 
 # =========================
+# PREVIEW EDIT V1 — safe text edits to an active pending_inventory_transform
+# preview (message_dispatcher._dispatch_pending_routes + bot._handle_
+# inventory_transform_edit_text + preview_editing.py). Every entry below is
+# shaped exactly like _start_inventory_transform now builds it (targets
+# carry "name", see bot.py), so these tests exercise the real production
+# data shape, not a hand-trimmed one.
+# =========================
+def _pending_transform_entry():
+    targets = [
+        {"item_id": 50, "name": "Сосиски", "quantity_value": Decimal("6"), "quantity_unit": "шт.",
+         "canonical_name": "сосиски", "category": "М'ясо та риба"},
+        {"item_id": 60, "name": "Мисливські ковбаски", "quantity_value": Decimal("2"), "quantity_unit": "шт.",
+         "canonical_name": "мисливські ковбаски", "category": "М'ясо та риба"},
+    ]
+    return {
+        "household_id": 1, "user_db_id": 10, "origin": "global",
+        "source_item_ids": [50, 60], "targets": targets,
+        "target_name": "М'ясні вироби", "target_canonical_name": "м'ясні вироби",
+        "target_category": "М'ясо та риба",
+        "target_quantity_value": Decimal("8"), "target_quantity_unit": "шт.",
+        "target_quantity_text": "8 шт.",
+    }
+
+
+class TestPreviewEditV1(InventoryTransformWebhookTestCase):
+    def _seed(self, chat_id):
+        entry = _pending_transform_entry()
+        pending_inventory_transform[chat_id] = entry
+        return entry
+
+    # 1. "так.тільки зроби М'ясних виробів — 2 шт" updates target quantity
+    # only and re-renders the preview.
+    def test_yes_only_change_quantity_updates_target_and_rerenders(self):
+        chat_id = 772100
+        self._seed(chat_id)
+        _call_webhook(_make_update(772100001, chat_id, "так.тільки зроби М'ясних виробів — 2 шт"))
+        entry = pending_inventory_transform[chat_id]
+        self.assertEqual(entry["target_quantity_value"], Decimal("2"))
+        self.assertEqual(entry["target_quantity_unit"], "шт.")
+        self.assertEqual(entry["target_quantity_text"], "2 шт.")
+        self.assertEqual(entry["target_name"], "М'ясні вироби")
+        texts = self._sent_texts()
+        self.assertTrue(any("Оновив план:" in t for t in texts))
+        self.assertTrue(any("• Додати М'ясні вироби — 2 шт." in t for t in texts))
+        self.assertIn(GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD, self._reply_markups())
+
+    # 2. "зроби М'ясні вироби 2 шт" also only changes the quantity.
+    def test_bare_zroby_name_and_quantity_only_changes_quantity(self):
+        chat_id = 772101
+        self._seed(chat_id)
+        _call_webhook(_make_update(772101001, chat_id, "зроби М'ясні вироби 2 шт"))
+        entry = pending_inventory_transform[chat_id]
+        self.assertEqual(entry["target_quantity_value"], Decimal("2"))
+        self.assertEqual(entry["target_name"], "М'ясні вироби")
+
+    # 3. "назви це М'ясо" renames the target, quantity untouched.
+    def test_nazvy_tse_renames_target(self):
+        chat_id = 772102
+        self._seed(chat_id)
+        _call_webhook(_make_update(772102001, chat_id, "назви це М'ясо"))
+        entry = pending_inventory_transform[chat_id]
+        self.assertEqual(entry["target_name"], "М'ясо")
+        self.assertEqual(entry["target_quantity_value"], Decimal("8"))
+        self.assertTrue(any("• Додати М'ясо — 8 шт." in t for t in self._sent_texts()))
+
+    # 4. "замість М'ясні вироби зроби М'ясо" also renames the target.
+    def test_zamist_old_name_zroby_new_name_renames_target(self):
+        chat_id = 772103
+        self._seed(chat_id)
+        _call_webhook(_make_update(772103001, chat_id, "замість М'ясні вироби зроби М'ясо"))
+        entry = pending_inventory_transform[chat_id]
+        self.assertEqual(entry["target_name"], "М'ясо")
+        self.assertEqual(entry["target_quantity_value"], Decimal("8"))
+
+    # 5. "замість 8 шт зроби 2 шт" updates the quantity.
+    def test_zamist_old_qty_zroby_new_qty_updates_quantity(self):
+        chat_id = 772104
+        self._seed(chat_id)
+        _call_webhook(_make_update(772104001, chat_id, "замість 8 шт зроби 2 шт"))
+        entry = pending_inventory_transform[chat_id]
+        self.assertEqual(entry["target_quantity_value"], Decimal("2"))
+        self.assertEqual(entry["target_name"], "М'ясні вироби")
+
+    # Cross-unit rewrite: "зроби 500 мл замість 0,5 л".
+    def test_zroby_new_qty_zamist_old_qty_supports_unit_change(self):
+        chat_id = 772105
+        entry = self._seed(chat_id)
+        entry["target_quantity_value"] = Decimal("0.5")
+        entry["target_quantity_unit"] = "л"
+        entry["target_quantity_text"] = "0,5 л"
+        _call_webhook(_make_update(772105001, chat_id, "зроби 500 мл замість 0,5 л"))
+        updated = pending_inventory_transform[chat_id]
+        self.assertEqual(updated["target_quantity_value"], Decimal("500"))
+        self.assertEqual(updated["target_quantity_unit"], "мл")
+        self.assertEqual(updated["target_quantity_text"], "500 мл")
+
+    # 6. Unparseable edit text — controlled message, pending preview
+    # unchanged, never falls through to general AI.
+    def test_unparseable_edit_text_leaves_preview_unchanged(self):
+        chat_id = 772106
+        entry = self._seed(chat_id)
+        original = dict(entry)
+        with patch.object(bot, "call_gemini") as mock_gemini:
+            _call_webhook(_make_update(772106001, chat_id, "хм, не знаю, подумай сам"))
+        mock_gemini.assert_not_called()
+        self.assertEqual(pending_inventory_transform[chat_id], original)
+        self.assertTrue(any(preview_editing.UNPARSEABLE_EDIT_MSG == t for t in self._sent_texts()))
+
+    # 7. "Видали все" during an active transform preview is blocked by the
+    # preview — never opens the destructive guard.
+    def test_destructive_command_blocked_by_active_preview(self):
+        chat_id = 772107
+        self._seed(chat_id)
+        with patch.object(bot, "call_gemini") as mock_gemini:
+            _call_webhook(_make_update(772107001, chat_id, "Видали все"))
+        mock_gemini.assert_not_called()
+        self.assertNotIn(chat_id, pending_destructive_guard)
+        self.assertIn(chat_id, pending_inventory_transform)
+        self.assertTrue(any(preview_editing.UNPARSEABLE_EDIT_MSG == t for t in self._sent_texts()))
+
+    # 8. Another action command ("перейменуй ser на сир") during an active
+    # transform preview is blocked, no new cleanup-admin preview starts.
+    def test_other_action_command_blocked_by_active_preview(self):
+        chat_id = 772108
+        self._seed(chat_id)
+        _call_webhook(_make_update(772108001, chat_id, "перейменуй ser на сир"))
+        self.assertNotIn(chat_id, pending_cleanup_admin)
+        self.assertNotIn(chat_id, pending_cleanup_admin_disambiguation)
+        self.assertIn(chat_id, pending_inventory_transform)
+        self.assertTrue(any(preview_editing.UNPARSEABLE_EDIT_MSG == t for t in self._sent_texts()))
+
+
+class TestPreviewEditV1ConfirmCancelUndo(InventoryTransformWebhookTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._original_stale_error = bot.StaleSnapshotError
+        bot.StaleSnapshotError = real_database.StaleSnapshotError
+
+    @classmethod
+    def tearDownClass(cls):
+        bot.StaleSnapshotError = cls._original_stale_error
+
+    # 9. Confirming an EDITED preview writes the edited target, not the
+    # original one.
+    def test_confirm_after_edit_writes_edited_target(self):
+        chat_id = 772110
+        entry = _pending_transform_entry()
+        pending_inventory_transform[chat_id] = entry
+        _call_webhook(_make_update(772110001, chat_id, "так.тільки зроби М'ясних виробів — 2 шт"))
+        with patch.object(bot, "execute_inventory_transform", return_value=True) as mock_transform:
+            _call_webhook(_make_update(772110002, chat_id, "✅ Так, застосувати"))
+        mock_transform.assert_called_once_with(
+            1, 10, [50, 60], "М'ясні вироби", "м'ясні вироби", "М'ясо та риба",
+            Decimal("2"), "шт.", "2 шт.", entry["targets"],
+        )
+        self.assertNotIn(chat_id, pending_inventory_transform)
+
+    # 10. Cancelling after an edit writes nothing.
+    def test_cancel_after_edit_writes_nothing(self):
+        chat_id = 772111
+        pending_inventory_transform[chat_id] = _pending_transform_entry()
+        _call_webhook(_make_update(772111001, chat_id, "назви це М'ясо"))
+        with patch.object(bot, "execute_inventory_transform") as mock_transform:
+            _call_webhook(_make_update(772111002, chat_id, "❌ Скасувати"))
+        mock_transform.assert_not_called()
+        self.assertNotIn(chat_id, pending_inventory_transform)
+        self.assertTrue(any("Зміни скасовано." in t for t in self._sent_texts()))
+
+    # 11. Confirming an edited preview journals the EDITED target as the
+    # "after" state (and the original source rows as "before") — the same
+    # generic before/after-bucket restore apply_undo_action already uses
+    # for every other global_household operation (see
+    # test_safe_undo_global_action.TestUndoInventoryMergeAndInsert) then
+    # restores the ORIGINAL source rows and removes the edited target;
+    # this only re-verifies that the write itself journals the edited
+    # values, since the restore mechanism itself is untouched by Preview
+    # Edit V1 and already covered elsewhere.
+    def test_confirm_after_edit_journals_edited_target_for_undo(self):
+        chat_id = 772112
+        entry = _pending_transform_entry()
+        pending_inventory_transform[chat_id] = entry
+        _call_webhook(_make_update(772112001, chat_id, "назви це М'ясо"))
+
+        class FakeCursor:
+            def __init__(self):
+                self.queries = []
+                self._fetchall_results = [
+                    [(50, Decimal("6"), "шт.", "сосиски", "М'ясо та риба"),
+                     (60, Decimal("2"), "шт.", "мисливські ковбаски", "М'ясо та риба")],
+                    [(50, "Сосиски", "сосиски", "6 шт.", Decimal("6"), "шт.", False, "М'ясо та риба")],
+                    [(60, "Мисливські ковбаски", "мисливські ковбаски", "2 шт.", Decimal("2"), "шт.", False, "М'ясо та риба")],
+                    [],
+                    [],
+                    [], [],
+                    [(70, "М'ясо", "м'ясо", "8 шт.", Decimal("8"), "шт.", False, "М'ясо та риба")],
+                ]
+
+            def execute(self, sql, params=None):
+                self.queries.append((sql, params))
+
+            def fetchall(self):
+                return self._fetchall_results.pop(0) if self._fetchall_results else []
+
+            def fetchone(self):
+                return None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class FakeConnection:
+            def __init__(self, cursor):
+                self._cursor = cursor
+                self.committed = False
+
+            def cursor(self):
+                return self._cursor
+
+            def commit(self):
+                self.committed = True
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        cursor = FakeCursor()
+        conn = FakeConnection(cursor)
+        with patch.object(real_database, "get_connection", return_value=conn):
+            with patch.object(bot, "execute_inventory_transform", side_effect=real_database.execute_inventory_transform):
+                _call_webhook(_make_update(772112002, chat_id, "✅ Так, застосувати"))
+        self.assertTrue(conn.committed)
+        insert_item_queries = [q for q in cursor.queries if "INSERT INTO inventory_items" in q[0]]
+        self.assertEqual(len(insert_item_queries), 1)
+        self.assertIn("М'ясо", insert_item_queries[0][1])
+        self.assertNotIn("М'ясні вироби", insert_item_queries[0][1])
+
+
+# =========================
 # 13/14/15/16. Existing routes/guards still win; general AI unaffected.
 # =========================
 class TestExistingRoutesStillWinOverTransform(InventoryTransformWebhookTestCase):
@@ -375,6 +620,20 @@ class TestExistingRoutesStillWinOverTransform(InventoryTransformWebhookTestCase)
             _call_webhook(_make_update(772000023, chat_id, "Поясни коротко, чому молоко згортається в каві?"))
         mock_gemini.assert_called_once()
         self.assertNotIn(chat_id, pending_inventory_transform)
+
+    # 15. After a pending_inventory_transform preview is cancelled, general
+    # AI works again for a normal question — the block only applies while
+    # the preview is actually active.
+    def test_general_ai_works_again_after_transform_preview_cancelled(self):
+        chat_id = 772024
+        pending_inventory_transform[chat_id] = _pending_transform_entry()
+        _call_webhook(_make_update(772000024, chat_id, "❌ Скасувати"))
+        self.assertNotIn(chat_id, pending_inventory_transform)
+        with patch.object(bot, "call_gemini", return_value="Бо це білок казеїн реагує на кислоту.") as mock_gemini:
+            _call_webhook(_make_update(
+                772000025, chat_id, "Поясни коротко, чому молоко згортається в каві?",
+            ))
+        mock_gemini.assert_called_once()
 
 
 # =========================

@@ -1228,13 +1228,15 @@ def parse_inventory_transform_request(text):
     return source_phrases, target_phrase
 
 
-def format_inventory_transform_preview(source_rows, effective_quantity, target_name, target_quantity_text):
+def format_inventory_transform_preview(source_rows, effective_quantity, target_name, target_quantity_text, header="План змін:"):
     """Render the Inventory Transform V1 preview — every source row removed,
     the new target record added, plus a fixed warning that different
     products are being collapsed into one general record (always shown here,
     never conditional, since Inventory Transform V1 only ever runs for a
-    genuine multi-source combine)."""
-    lines = ["План змін:", "", "🧊 Запаси"]
+    genuine multi-source combine). `header` defaults to the original preview
+    header; Preview Edit V1 passes "Оновив план:" instead when re-rendering
+    an edited preview, without changing anything else about the layout."""
+    lines = [header, "", "🧊 Запаси"]
     for row in source_rows:
         qty = effective_quantity(row)[2]
         label = row["name"] + (f" — {qty}" if qty else "")

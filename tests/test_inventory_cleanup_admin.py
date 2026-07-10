@@ -24,6 +24,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import inventory
+import preview_editing
 
 # Load the REAL database.py fresh, under its own module name — see
 # tests/test_merge_stale_snapshot_protection.py's identical docstring for
@@ -820,7 +821,15 @@ class TestActivePendingBlocksNewActionRoutes(InventoryAdminWebhookTestCase):
     action command must never start a competing route — the Destructive
     Bulk Household Request Guard used to fire regardless of an already-
     active preview, overwriting the user's unconfirmed pending state's
-    "next reply" context with its own "покупки чи запаси?" question."""
+    "next reply" context with its own "покупки чи запаси?" question.
+
+    Preview Edit V1 (message_dispatcher._dispatch_pending_routes) now
+    intercepts EVERY text while pending_cleanup_admin is active, before any
+    of these routes are even tried — pending_cleanup_admin doesn't support
+    text edits, so it replies with preview_editing.UNSUPPORTED_PREVIEW_TYPE_MSG
+    instead of each route's own GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG fallback
+    (still reachable in principle, just never actually hit anymore for these
+    three command-shaped texts — the earlier, universal block always wins)."""
 
     def _set_active_delete_preview(self, chat_id):
         pending_cleanup_admin[chat_id] = {
@@ -840,7 +849,7 @@ class TestActivePendingBlocksNewActionRoutes(InventoryAdminWebhookTestCase):
         with patch.object(bot, "call_gemini") as mock_gemini:
             _call_webhook(_make_update(771200001, chat_id, "Видали все"))
         mock_gemini.assert_not_called()
-        self.assertEqual(self._sent_texts(), [GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG])
+        self.assertEqual(self._sent_texts(), [preview_editing.UNSUPPORTED_PREVIEW_TYPE_MSG])
         self.assertIn(chat_id, pending_cleanup_admin)
         self.assertEqual(pending_cleanup_admin[chat_id]["action"], "delete")
         self.assertNotIn(chat_id, pending_destructive_guard)
@@ -867,7 +876,7 @@ class TestActivePendingBlocksNewActionRoutes(InventoryAdminWebhookTestCase):
         chat_id = 771202
         self._set_active_delete_preview(chat_id)
         _call_webhook(_make_update(771202001, chat_id, "перейменуй ser на сир"))
-        self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
+        self.assertTrue(any(preview_editing.UNSUPPORTED_PREVIEW_TYPE_MSG == t for t in self._sent_texts()))
         self.assertEqual(pending_cleanup_admin[chat_id]["action"], "delete")
         self.assertEqual(pending_cleanup_admin[chat_id]["item_id"], 21)
 
@@ -877,8 +886,22 @@ class TestActivePendingBlocksNewActionRoutes(InventoryAdminWebhookTestCase):
         self._set_active_delete_preview(chat_id)
         with patch.object(bot, "get_household_alias_map", return_value={}):
             _call_webhook(_make_update(771203001, chat_id, "об'єднай молоко в запасах"))
-        self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
+        self.assertTrue(any(preview_editing.UNSUPPORTED_PREVIEW_TYPE_MSG == t for t in self._sent_texts()))
         self.assertNotIn(chat_id, pending_merge)
+        self.assertEqual(pending_cleanup_admin[chat_id]["action"], "delete")
+
+    # 5. Preview Edit V1 test 12 — plain, unrelated free text (not shaped
+    # like any known command) must ALSO never reach general AI-chat while
+    # pending_cleanup_admin is active: pending_cleanup_admin doesn't support
+    # text edits, so it gets the shared "editing not supported" message.
+    def test_unrelated_free_text_blocked_from_general_ai(self):
+        chat_id = 771209
+        self._set_active_delete_preview(chat_id)
+        with patch.object(bot, "call_gemini") as mock_gemini:
+            _call_webhook(_make_update(771209001, chat_id, "Привіт, як справи?"))
+        mock_gemini.assert_not_called()
+        self.assertEqual(self._sent_texts(), [preview_editing.UNSUPPORTED_PREVIEW_TYPE_MSG])
+        self.assertIn(chat_id, pending_cleanup_admin)
         self.assertEqual(pending_cleanup_admin[chat_id]["action"], "delete")
 
     # 5. "❌ Скасувати" must still cancel the active preview normally.

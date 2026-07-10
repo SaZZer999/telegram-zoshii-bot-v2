@@ -202,6 +202,25 @@ class PendingRouteDeps:
     # through to normal routing instead of being treated as handled here.
     pending_destructive_guard: dict = None
     continue_destructive_guard: Callable = None
+    # Preview Edit V1 — awaiting confirm/cancel on a pending_inventory_
+    # transform preview. Optional (default None), same reasoning as every
+    # other Optional field above. While active, ANY text (that isn't the
+    # shared confirm/cancel button, checked earlier in V3B, or the exact
+    # undo button, checked earlier in this same V2A slice) is claimed here:
+    # handle_inventory_transform_edit(chat_id, text) either updates the
+    # SAME pending dict in place and re-renders the preview, or sends a
+    # controlled "couldn't parse that edit" message — never general AI,
+    # never a new command/route, never a database write.
+    pending_inventory_transform: dict = None
+    handle_inventory_transform_edit: Callable = None
+    # Preview Edit V1 — awaiting confirm/cancel on a pending_cleanup_admin
+    # (single-row rename/delete) preview. Optional (default None). This
+    # preview type does not support text edits yet — any text here still
+    # gets fully claimed (never general AI, never a new command) but with
+    # the shared "editing not supported yet" message instead of an edit
+    # attempt.
+    pending_cleanup_admin: dict = None
+    unsupported_preview_edit_msg: str = None
 
 
 @dataclass
@@ -512,6 +531,27 @@ def _dispatch_pending_routes(deps, chat_id, user_id, display_name, text):
         # normal routing instead of being silently swallowed.
         if routes.continue_destructive_guard(chat_id, text):
             return RouteOutcome.HANDLED
+
+    if routes.pending_inventory_transform is not None and chat_id in routes.pending_inventory_transform:
+        # Preview Edit V1 — an active pending_inventory_transform preview
+        # supports safe text edits (target quantity/name) via a
+        # deterministic patch parser (see preview_editing.py). ANY text
+        # here is claimed: a successful edit re-renders the SAME pending
+        # preview in place (never touches the database); a failed parse
+        # sends a controlled message and leaves the preview unchanged. No
+        # other route (general AI, destructive guard, a new transform/
+        # rename/delete command, ...) is ever reached while this is active.
+        routes.handle_inventory_transform_edit(chat_id, text)
+        return RouteOutcome.HANDLED
+
+    if routes.pending_cleanup_admin is not None and chat_id in routes.pending_cleanup_admin:
+        # Inventory Cleanup Admin v1's own rename/delete preview does not
+        # support text edits in Preview Edit V1 — any text here is still
+        # fully claimed (never general AI, never a new command) but gets
+        # the shared "editing not supported yet" message instead of an
+        # edit attempt.
+        deps.send_message(chat_id, routes.unsupported_preview_edit_msg)
+        return RouteOutcome.HANDLED
 
     if chat_id in routes.pending_global_household:
         # A combined Global Household Router preview is awaiting confirm/
