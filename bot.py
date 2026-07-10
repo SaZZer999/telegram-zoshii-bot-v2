@@ -91,6 +91,7 @@ import household_read_context
 import meal_ideas
 import preview_editing
 import voice_input
+import photo_receipts
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -5629,6 +5630,210 @@ def _handle_voice_message(chat_id, voice):
     return transcript
 
 
+# =========================
+# PHOTO RECEIPT INPUT V1 — Telegram receipt photo -> Gemini Vision
+# extraction (photo_receipts.py) -> the SAME pending_expense preview/
+# confirm/cancel a typed "Biedronka 86,40 zł" command already uses (see
+# expenses.build_receipt_expense_preview). Unlike voice, a photo never
+# feeds text into message_dispatcher.dispatch(...) — it builds the expense
+# preview directly, since "read this receipt" has no other meaningful text
+# form to route. photo_receipts.py owns every extraction-provider concern
+# (env config, the Gemini Vision call itself, JSON parsing/validation,
+# disabled/missing-key errors); this module only owns the Telegram-
+# specific half (picking the largest photo size / image document,
+# downloading it, size guard) plus the final mapping from photo_receipts'
+# abstract category_hint to one of expenses.EXPENSE_CATEGORIES' own fixed
+# strings.
+# =========================
+PHOTO_TOO_LARGE_MSG = "Фото завелике. Спробуй стиснути або надіслати коротше фото чека."
+PHOTO_DOWNLOAD_FAILED_MSG = "Не вдалося завантажити фото. Спробуй ще раз."
+PHOTO_PROCESSING_FAILED_MSG = "Не вдалося обробити чек. Спробуй ще раз трохи пізніше."
+
+# photo_receipts.py never needs to know expenses.py's own fixed category
+# list (see its own module docstring) — this is the one place that maps
+# its abstract category_hint to a real expenses.EXPENSE_CATEGORIES value.
+# Anything not listed here (None, "other", or an unrecognized hint) falls
+# through to expenses.DEFAULT_EXPENSE_CATEGORY ("Інше") via .get()'s own
+# default below, which is also what marks the preview's category as
+# "не вдалося визначити точно" (see expenses._format_expense_preview).
+_PHOTO_CATEGORY_HINT_TO_EXPENSE_CATEGORY = {
+    "grocery": "Продукти",
+    "pharmacy": "Здоров'я",
+}
+
+_PHOTO_DOCUMENT_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
+_PHOTO_KNOWN_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+_PHOTO_MIME_TO_SUFFIX = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+}
+
+
+def _extract_photo_file_id(message):
+    """Returns (file_id, mime_type) for a supported Telegram photo or
+    image document, or (None, None) if `message` carries neither.
+    message.photo is a list of PhotoSize objects (Telegram's own several
+    resegmentations of the same image) — the largest one (by file_size,
+    falling back to width*height when file_size is missing) is always
+    used, never assuming any particular array order. message.document is
+    only accepted when its mime_type is a supported image type (never a
+    PDF or other document — see this feature's own "out of scope" list)."""
+    photo_sizes = message.get("photo")
+    if photo_sizes:
+        largest = max(
+            photo_sizes,
+            key=lambda size: size.get("file_size") or (size.get("width") or 0) * (size.get("height") or 0),
+        )
+        return largest.get("file_id"), None
+
+    document = message.get("document")
+    if document and document.get("mime_type") in _PHOTO_DOCUMENT_MIME_TYPES:
+        return document.get("file_id"), document.get("mime_type")
+
+    return None, None
+
+
+def _normalize_photo_suffix(remote_path, mime_type=None):
+    """Mirrors _normalize_voice_suffix: preserve a known image extension
+    from Telegram's own file_path, fall back to a hint from the message's
+    own mime_type (message.photo never carries one), and otherwise default
+    to ".jpg" — Telegram's own most common photo encoding — never a bare
+    tempfile with no extension at all."""
+    ext = os.path.splitext(remote_path or "")[1].lower()
+    if ext in _PHOTO_KNOWN_SUFFIXES:
+        return ext
+    if mime_type and mime_type in _PHOTO_MIME_TO_SUFFIX:
+        return _PHOTO_MIME_TO_SUFFIX[mime_type]
+    return ".jpg"
+
+
+def _download_telegram_photo_to_temp(file_id, mime_type=None):
+    """Download a Telegram photo/image-document to a fresh temp file and
+    return its local path. Raises on any failure (bad file_id, network
+    error, non-2xx response, empty body) — the caller sends PHOTO_
+    DOWNLOAD_FAILED_MSG and never calls Gemini Vision at all. Never logs
+    the tokenized Telegram API URL — only the file_path's own extension,
+    the resulting local suffix, and the downloaded size (mirrors
+    _download_telegram_voice_to_temp exactly, duplicated on purpose rather
+    than shared, so Voice Input V1's own behavior/logs stay untouched)."""
+    remote_path = _telegram_get_file_path(file_id)
+    original_ext = os.path.splitext(remote_path or "")[1].lower() or "(none)"
+    logger.info("photo_get_file_success: extension=%s", original_ext)
+
+    resp = requests.get(
+        f"https://api.telegram.org/file/bot{TOKEN}/{remote_path}",
+        timeout=VOICE_DOWNLOAD_TIMEOUT,
+    )
+    resp.raise_for_status()
+    content = resp.content
+    if not content:
+        logger.error("photo_download_failed: empty response body")
+        raise RuntimeError("Telegram photo download returned an empty body")
+
+    suffix = _normalize_photo_suffix(remote_path, mime_type)
+    fd, temp_path = tempfile.mkstemp(prefix="photo_", suffix=suffix)
+    with os.fdopen(fd, "wb") as f:
+        f.write(content)
+    logger.info("photo_download_success: suffix=%s size_bytes=%d", suffix, len(content))
+    return temp_path
+
+
+def _handle_photo_message(chat_id, user_id, display_name, file_id, mime_type=None):
+    """Full Photo Receipt Input V1 pipeline for one Telegram photo/image-
+    document. Every failure sends its own controlled Ukrainian message and
+    returns — never writes to the database itself, never falls through to
+    message_dispatcher.dispatch(...) or general AI-chat. On a genuine
+    receipt with a usable amount, builds the SAME expenses.pending_expense
+    preview a typed expense command would, via expenses.
+    build_receipt_expense_preview — the actual DB write still only ever
+    happens through that preview's existing "✅ Так, додати" confirm.
+    """
+    logger.info("photo_received: chat_id=%s", chat_id)
+
+    if _has_blocking_pending_state_for_reports(chat_id):
+        # Another flow's preview/clarification (inventory transform,
+        # global household, an expense add/delete preview, ...) is already
+        # open — never silently process a NEW photo on top of it, same
+        # guard message the Global Household Router already uses for the
+        # same situation.
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return
+
+    try:
+        photo_receipts.ensure_ready()
+    except photo_receipts.PhotoInputError as e:
+        send_message(chat_id, str(e))
+        return
+
+    temp_path = None
+    try:
+        try:
+            temp_path = _download_telegram_photo_to_temp(file_id, mime_type)
+        except Exception as e:
+            logger.error("photo_download_error: %s: %s", type(e).__name__, _sanitize_telegram_error(e))
+            send_message(chat_id, PHOTO_DOWNLOAD_FAILED_MSG)
+            return
+
+        max_bytes = photo_receipts.PHOTO_MAX_SIZE_MB * 1024 * 1024
+        try:
+            size_bytes = os.path.getsize(temp_path)
+        except OSError:
+            size_bytes = 0
+        if size_bytes > max_bytes:
+            send_message(chat_id, PHOTO_TOO_LARGE_MSG)
+            return
+
+        try:
+            candidate = photo_receipts.extract_receipt_from_image(temp_path)
+        except photo_receipts.PhotoInputError as e:
+            send_message(chat_id, str(e))
+            return
+    finally:
+        if temp_path is not None:
+            try:
+                os.remove(temp_path)
+                logger.info("photo_temp_cleanup_success")
+            except OSError as cleanup_err:
+                logger.warning("photo_temp_cleanup_failure: %s", type(cleanup_err).__name__)
+
+    kind, payload = photo_receipts.decide_receipt_outcome(candidate)
+    if kind == "not_a_receipt":
+        send_message(chat_id, photo_receipts.NOT_A_RECEIPT_MSG)
+        return
+    if kind == "missing_amount":
+        send_message(chat_id, photo_receipts.MISSING_AMOUNT_MSG)
+        return
+
+    # kind == "ok"
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+    except Exception:
+        send_message(chat_id, PHOTO_PROCESSING_FAILED_MSG)
+        return
+
+    category = _PHOTO_CATEGORY_HINT_TO_EXPENSE_CATEGORY.get(payload["category_hint"], expenses.DEFAULT_EXPENSE_CATEGORY)
+    category_was_defaulted = category == expenses.DEFAULT_EXPENSE_CATEGORY
+
+    if photo_receipts.PHOTO_SHOW_EXTRACTED:
+        lines = [
+            "📸 Розпізнав чек:", "",
+            f"Магазин: {payload['merchant']}",
+            f"Сума: {_format_expense_amount(payload['amount'])}",
+            f"Дата: {payload['expense_date'].strftime('%d.%m.%Y')}",
+            f"Категорія: {category}",
+        ]
+        if payload["confidence"] == "low":
+            lines.append("")
+            lines.append(photo_receipts.LOW_CONFIDENCE_WARNING)
+        send_message(chat_id, "\n".join(lines))
+
+    origin = _current_expense_origin(chat_id)
+    expenses.build_receipt_expense_preview(
+        chat_id, household_id, user_db_id, origin,
+        payload["amount"], category, payload["merchant"], payload["expense_date"],
+        category_was_defaulted=category_was_defaulted,
+    )
+
+
 @app.route("/")
 def home():
     return "Bot is running"
@@ -5647,8 +5852,9 @@ def webhook():
     chat_id = message["chat"]["id"]
     text = message.get("text", "")
     voice = message.get("voice")
+    photo_file_id, photo_mime_type = _extract_photo_file_id(message)
 
-    if not text and not voice:
+    if not text and not voice and not photo_file_id:
         return "ok"
 
     user_id = message.get("from", {}).get("id")
@@ -5659,12 +5865,23 @@ def webhook():
         return "ok"
 
     # =========================
-    # ACCESS CHECK — identical for voice and text, checked before either is
-    # processed any further (a voice message is never transcribed for a
-    # disallowed user).
+    # ACCESS CHECK — identical for voice/photo/text, checked before any of
+    # them are processed any further (nothing is ever downloaded or
+    # transcribed/extracted for a disallowed user).
     # =========================
     if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
         send_message(chat_id, "Цей бот приватний і доступний лише для дозволених користувачів.")
+        return "ok"
+
+    # =========================
+    # PHOTO RECEIPT INPUT V1 — a receipt photo builds its own pending_
+    # expense preview directly (see _handle_photo_message's own docstring)
+    # and never falls through to message_dispatcher.dispatch(...) at all,
+    # unlike voice (which produces routable text). Checked ahead of voice/
+    # dispatch since a message carries at most one of photo/voice/text.
+    # =========================
+    if photo_file_id is not None:
+        _handle_photo_message(chat_id, user_id, display_name, photo_file_id, photo_mime_type)
         return "ok"
 
     # =========================

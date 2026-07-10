@@ -718,6 +718,34 @@ def _handle_expense_command(chat_id, user_id, display_name, text):
         return True
 
 
+# =========================
+# PHOTO RECEIPT INPUT V1 — reuses the SAME pending_expense preview/confirm/
+# cancel a typed expense command already builds (see _handle_expense_
+# command's own "ok" branch above); no parallel confirm/cancel system,
+# no new DB-write path. bot.py's photo_receipts.py integration calls this
+# ONLY after re-validating every field in Python (a positive Decimal
+# amount, a category from EXPENSE_CATEGORIES, a real non-future date) —
+# never a raw Gemini payload.
+# =========================
+def build_receipt_expense_preview(chat_id, household_id, user_db_id, origin, amount, category, description,
+                                   expense_date, category_was_defaulted=False):
+    """Build a pending_expense preview from an already-validated receipt
+    photo extraction and send it with the EXACT existing EXPENSE_PREVIEW_
+    KEYBOARD ("✅ Так, додати"/"❌ Скасувати") — handle_add_confirm/
+    handle_cancel (unchanged) then apply/discard it exactly like any other
+    pending_expense entry, DB write included."""
+    pending_expense[chat_id] = {
+        "household_id": household_id, "user_db_id": user_db_id,
+        "amount": amount, "currency": "PLN", "category": category,
+        "description": description, "expense_date": expense_date, "origin": origin,
+    }
+    payload = {
+        "amount": amount, "category": category, "category_was_defaulted": category_was_defaulted,
+        "description": description, "expense_date": expense_date,
+    }
+    _bot.send_message(chat_id, _format_expense_preview(payload), reply_markup=EXPENSE_PREVIEW_KEYBOARD)
+
+
 def _normalize_expense_match_text(s):
     """Lower/trim/collapse whitespace and strip punctuation — used only for
     exact-equality comparison, never substring/fuzzy matching."""
