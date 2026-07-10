@@ -51,13 +51,21 @@ Household Read Context V1: two read-only slots, both optional. A direct/
     modes, pending states, ambiguous-add/explicit-add/bare-add) already
     claimed, since all of those return before either slot is ever reached.
 Meal Ideas V1: one read-only optional slot (`DispatcherDeps.meal_ideas`) in
-    Phase D, tried after `household_read` and before the general AI
-    fallback, so a plain read-question ("Що треба купити?") is always
-    answered by household_read first, never reinterpreted as a request for
-    meal suggestions. The dedicated "🍽 Що приготувати"/"🍽️ Що приготувати"
-    button does NOT go through this slot — bot.py's special-button route
-    calls `meal_ideas.try_handle_meal_ideas` directly, before this slot (or
-    any other Phase D route) is ever reached for that message.
+    Phase D, tried BEFORE `household_read` (Routing Stabilization v1 —
+    household_read's own Gemini classifier has no "meal_ideas" intent of
+    its own, so a meal-shaped question mentioning "вдома"/"є" — e.g. "Що
+    можна приготувати на вечерю з того, що є вдома?" — used to pass
+    household_read's topic gate and get misclassified as inventory_
+    overview before meal_ideas ever got a chance to claim it) and before
+    the general AI fallback. Safe because meal_ideas' own gate
+    (`_looks_like_meal_ideas_request`) is narrow and fully deterministic —
+    a plain read-question ("Що треба купити?", "Що є вдома?", "Чи є
+    молоко?") never matches it at all, so it still falls through to
+    household_read exactly as before. The dedicated "🍽 Що приготувати"/
+    "🍽️ Що приготувати" button does NOT go through this slot — bot.py's
+    special-button route calls `meal_ideas.try_handle_meal_ideas` directly,
+    before this slot (or any other Phase D route) is ever reached for that
+    message.
 
 Route contract: `dispatch(...)` returns a `RouteOutcome` — kept for the
 pre-V3A test suite and for `_resolve_route_outcome`'s own internal
@@ -773,10 +781,12 @@ def dispatch(deps, chat_id, user_id, display_name, text):
       `waiting_for_ingredients` state is always consumed by cooking mode
       itself, never left dangling because household_read/meal_ideas
       answered instead); if it reports it handled the message, nothing
-      else runs. Otherwise `deps.household_read` (Household Read Context
-      V1, optional) is tried next; then `deps.meal_ideas` (Meal Ideas V1,
-      optional); if either handled the message, general AI fallback never
-      runs. Otherwise `deps.command_routes.general_ai_fallback` runs
+      else runs. Otherwise `deps.meal_ideas` (Meal Ideas V1, optional) is
+      tried next; then `deps.household_read` (Household Read Context V1,
+      optional) — see meal_ideas' own module-docstring entry above for why
+      meal_ideas now wins this order; if either handled the message,
+      general AI fallback never runs. Otherwise `deps.command_routes.
+      general_ai_fallback` runs
       exactly once.
 
     The return value is kept as a `RouteOutcome` for callers/tests built
@@ -804,10 +814,23 @@ def dispatch(deps, chat_id, user_id, display_name, text):
     if deps.cooking_mode(chat_id, user_id, display_name, text):
         return RouteOutcome.HANDLED
 
-    if deps.household_read is not None and deps.household_read(chat_id, user_id, display_name, text):
+    # Meal Ideas V1's own gate (meal_ideas._looks_like_meal_ideas_request)
+    # is narrow and fully deterministic — no Gemini call decides whether a
+    # message matches it, only whether the household's real inventory
+    # snapshot can be turned into suggestions once it already has. Tried
+    # BEFORE household_read on purpose (live bug: household_read's own
+    # Gemini classifier has no "meal_ideas" intent of its own, so a phrase
+    # like "Що можна приготувати на вечерю з того, що є вдома?" — which
+    # mentions "вдома"/"є" and therefore passes household_read's topic
+    # gate — used to get misclassified as inventory_overview and answered
+    # with the plain inventory list instead of ever reaching meal ideas).
+    # Every other read-question ("Що є вдома?", "Що треба купити?", "Чи є
+    # молоко?") never matches meal_ideas' own narrow gate at all, so this
+    # reordering never intercepts anything household_read used to handle.
+    if deps.meal_ideas is not None and deps.meal_ideas(chat_id, user_id, display_name, text):
         return RouteOutcome.HANDLED
 
-    if deps.meal_ideas is not None and deps.meal_ideas(chat_id, user_id, display_name, text):
+    if deps.household_read is not None and deps.household_read(chat_id, user_id, display_name, text):
         return RouteOutcome.HANDLED
 
     deps.command_routes.general_ai_fallback(chat_id, text)

@@ -275,13 +275,36 @@ class TestCookingModeHasPriorityOverMealIdeas(MealIdeasWebhookTestCase):
 
 
 # 13. Household read has priority over meal_ideas
-class TestHouseholdReadHasPriorityOverMealIdeas(MealIdeasWebhookTestCase):
-    def test_household_read_claiming_the_message_blocks_meal_ideas(self):
+class TestMealIdeasHasPriorityOverHouseholdRead(MealIdeasWebhookTestCase):
+    """Routing Stabilization v1: meal_ideas is now tried BEFORE household_
+    read (was the reverse before this fix — see message_dispatcher.dispatch's
+    own docstring for the live-bug this reordering fixes). A meal-ideas-
+    shaped phrase must claim the message via meal_ideas' own narrow
+    deterministic gate before household_read.try_handle_household_read is
+    ever called at all — never the other way around."""
+    def test_meal_ideas_claims_the_message_before_household_read_runs(self):
         chat_id = 850013
-        with patch.object(household_read_context, "try_handle_household_read", return_value=True), \
-                patch.object(meal_ideas, "try_handle_meal_ideas") as mock_meal_ideas:
+        with patch.object(meal_ideas, "try_handle_meal_ideas", return_value=True), \
+                patch.object(household_read_context, "try_handle_household_read") as mock_household_read:
             _call_webhook(_make_update(850000013, chat_id, "Що можна приготувати?"))
-            mock_meal_ideas.assert_not_called()
+            mock_household_read.assert_not_called()
+
+    # A plain read-question that does NOT match meal_ideas' own gate still
+    # reaches household_read's Phase-D slot exactly as before — meal_ideas'
+    # REAL gate (not mocked here) correctly falls through for this text, so
+    # this exercises the actual _looks_like_meal_ideas_request logic, not a
+    # stubbed-out always-true/false mock. Uses a non-standard phrasing that
+    # needs household_read's Gemini-classifier fallback (see
+    # tests/test_household_read_context.py's GeminiClassifierTests) rather
+    # than "Що треба купити?" — that exact phrase is already claimed by the
+    # EARLIER direct_household_read command-route slot before Phase D (and
+    # therefore before both meal_ideas and household_read) is ever reached
+    # at all, so it can't tell the two Phase-D routes' relative order apart.
+    def test_plain_read_question_still_reaches_household_read(self):
+        chat_id = 850015
+        with patch.object(household_read_context, "try_handle_household_read", return_value=True) as mock_household_read:
+            _call_webhook(_make_update(850000015, chat_id, "Молока у нас ще хоч трохи лишилося?"))
+            mock_household_read.assert_called_once()
 
 
 # 14. Write command "Купив хліб за 10 zł" never reaches meal_ideas

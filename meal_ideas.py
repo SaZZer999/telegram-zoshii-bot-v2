@@ -62,6 +62,12 @@ _MEAL_IDEAS_RE_LIST = [
     re.compile(r"^що\s+(б|ж)?\s*приготувати\b", re.IGNORECASE),
     re.compile(r"^що\s+зробити\s+на\s+(вечерю|обід|сніданок)\b", re.IGNORECASE),
     re.compile(r"^порадь.*на\s+(вечерю|обід|сніданок)\b", re.IGNORECASE),
+    # Routing Stabilization v1 — "запропонуй вечерю"/"запропонуй вечерю з
+    # того що є" (a live voice-transcript phrasing "порадь"/"зробити" above
+    # didn't cover). Requires "вечерю"/"обід"/"сніданок" to appear
+    # somewhere after "запропонуй" so a genuinely unrelated "запропонуй
+    # щось цікаве" never matches.
+    re.compile(r"^запропонуй\b.*\b(вечерю|обід|сніданок)\b", re.IGNORECASE),
 ]
 
 

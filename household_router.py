@@ -1143,12 +1143,40 @@ def _strip_line_add_verbs(text):
     return "\n".join(_LINE_ADD_VERB_RE.sub("", line, count=1) for line in text.splitlines())
 
 
+# Every recognized destination phrase, shared between the LEADING form
+# ("Додай до покупок молоко") and the TRAILING form ("Додай молоко до
+# покупок") below — a live voice-transcript bug showed users very often
+# say the destination LAST, not first, so both orders must recognize the
+# exact same fixed phrase list.
+_SHOPPING_DESTINATION_PHRASES = (
+    r"до\s+покупок|в\s+покупки|у\s+покупки|"
+    r"до\s+списку\s+покупок|в\s+список\s+покупок|у\s+список\s+покупок"
+)
+_INVENTORY_DESTINATION_PHRASES = r"до\s+запасів|в\s+запаси|у\s+запаси"
+
 _EXPLICIT_SHOPPING_DESTINATION_RE = re.compile(
-    r"^" + _ADD_VERB_RE + r"\s+(?:до\s+покупок|у\s+покупки|в\s+список\s+покупок)[:\-]?\s+",
+    r"^" + _ADD_VERB_RE + r"\s+(?:" + _SHOPPING_DESTINATION_PHRASES + r")[:\-]?\s+",
     re.IGNORECASE,
 )
 _EXPLICIT_INVENTORY_DESTINATION_RE = re.compile(
-    r"^" + _ADD_VERB_RE + r"\s+(?:в\s+запаси|у\s+запаси|до\s+запасів)[:\-]?\s+",
+    r"^" + _ADD_VERB_RE + r"\s+(?:" + _INVENTORY_DESTINATION_PHRASES + r")[:\-]?\s+",
+    re.IGNORECASE,
+)
+
+# TRAILING form — same add-verb, then the item text (non-greedy, so the
+# destination phrase always wins the shortest possible match), then one of
+# the SAME destination phrases, optionally followed by voice-transcript-
+# style trailing punctuation (".", ",", "!", "?") and whitespace to end of
+# string. Single-line only (see detect_explicit_add_destination's own
+# multi-line guard) — a trailing-phrase match against a multi-line paste-
+# back would be ambiguous, and that shape is already handled by
+# detect_header_add_destination instead.
+_TRAILING_SHOPPING_DESTINATION_RE = re.compile(
+    r"^" + _ADD_VERB_RE + r"\s+(?P<items>.+?)\s+(?:" + _SHOPPING_DESTINATION_PHRASES + r")\s*[.,!?]*\s*$",
+    re.IGNORECASE,
+)
+_TRAILING_INVENTORY_DESTINATION_RE = re.compile(
+    r"^" + _ADD_VERB_RE + r"\s+(?P<items>.+?)\s+(?:" + _INVENTORY_DESTINATION_PHRASES + r")\s*[.,!?]*\s*$",
     re.IGNORECASE,
 )
 
@@ -1176,8 +1204,12 @@ def _strip_header_variation_selectors(line):
 
 def detect_explicit_add_destination(text):
     """Deterministically detect an EXPLICIT shopping/inventory destination
-    phrase at the very start of `text` — the fixed phrase list only (see
-    module docstring above), never fuzzy matching or guessing at intent.
+    phrase in `text` — the fixed phrase list only (see module docstring
+    above), never fuzzy matching or guessing at intent. Recognizes the
+    phrase either LEADING ("Додай до покупок молоко і сир") or, as a
+    fallback, TRAILING ("Додай молоко і сир до покупок.") — see
+    _TRAILING_SHOPPING_DESTINATION_RE/_TRAILING_INVENTORY_DESTINATION_RE's
+    own comment for why the trailing form exists.
 
     Returns ("add_shopping"|"add_inventory", item_text) with the phrase
     already stripped off, or (None, None) if no exact phrase matches, or
@@ -1196,6 +1228,17 @@ def detect_explicit_add_destination(text):
     if match:
         rest = _strip_line_add_verbs(stripped[match.end():].strip())
         return ("add_inventory", rest) if rest else (None, None)
+
+    if "\n" not in stripped:
+        match = _TRAILING_SHOPPING_DESTINATION_RE.match(stripped)
+        if match:
+            rest = match.group("items").strip()
+            return ("add_shopping", rest) if rest else (None, None)
+        match = _TRAILING_INVENTORY_DESTINATION_RE.match(stripped)
+        if match:
+            rest = match.group("items").strip()
+            return ("add_inventory", rest) if rest else (None, None)
+
     return None, None
 
 
