@@ -87,6 +87,28 @@ class TestParseStructuredQuantity(unittest.TestCase):
         self.assertNotIsInstance(value, float)
         self.assertEqual(unit, "шт.")
 
+    def test_unspaced_grams_lowercase_g(self):
+        value, unit = quantities.parse_structured_quantity("500g")
+        self.assertEqual(value, Decimal("500"))
+        self.assertIsInstance(value, Decimal)
+        self.assertEqual(unit, "г")
+
+    def test_spaced_gram_word(self):
+        value, unit = quantities.parse_structured_quantity("500 gram")
+        self.assertEqual(value, Decimal("500"))
+        self.assertEqual(unit, "г")
+
+    def test_spaced_grams_word(self):
+        value, unit = quantities.parse_structured_quantity("500 grams")
+        self.assertEqual(value, Decimal("500"))
+        self.assertEqual(unit, "г")
+
+    def test_unspaced_kilograms_kg(self):
+        value, unit = quantities.parse_structured_quantity("2kg")
+        self.assertEqual(value, Decimal("2"))
+        self.assertIsInstance(value, Decimal)
+        self.assertEqual(unit, "кг")
+
 
 class TestMergeQuantityValues(unittest.TestCase):
     def test_liters_plus_milliliters(self):

@@ -179,5 +179,161 @@ class TestApplyInventoryTransformPatch(unittest.TestCase):
         self.assertEqual(data, original)
 
 
+def _shopping_items():
+    """Two freshly-assumed shopping-add items, same shape household_router.
+    build_add_preview_from_items/build_household_operations_preview produce:
+    quantity_inferred=True, "1 шт." default."""
+    return [
+        {
+            "name": "Молоко", "canonical_name": "молоко", "category": "Молочне та яйця",
+            "quantity_value": Decimal("1"), "quantity_unit": "шт.", "quantity_text": "1 шт.",
+            "quantity_inferred": True, "is_consumable": True,
+        },
+        {
+            "name": "Сир", "canonical_name": "сир", "category": "Молочне та яйця",
+            "quantity_value": Decimal("1"), "quantity_unit": "шт.", "quantity_text": "1 шт.",
+            "quantity_inferred": True, "is_consumable": True,
+        },
+    ]
+
+
+class TestParseHouseholdAddPreviewEdit(unittest.TestCase):
+    def test_two_named_edits_with_a_conjunction(self):
+        items = _shopping_items()
+        ok, edits = preview_editing.parse_household_add_preview_edit("молока 1 л, а сиру 500 г", items)
+        self.assertTrue(ok)
+        preview_editing.apply_household_add_preview_edits(items, edits, _canonicalize_stub, _capitalize_stub)
+        self.assertEqual(items[0]["quantity_text"], "1 л")
+        self.assertEqual(items[0]["quantity_inferred"], False)
+        self.assertEqual(items[1]["quantity_text"], "500 г")
+        self.assertEqual(items[1]["quantity_inferred"], False)
+
+    def test_two_named_edits_plain(self):
+        items = _shopping_items()
+        ok, edits = preview_editing.parse_household_add_preview_edit("молоко 1 л, сир 500 г", items)
+        self.assertTrue(ok)
+        preview_editing.apply_household_add_preview_edits(items, edits, _canonicalize_stub, _capitalize_stub)
+        self.assertEqual(items[0]["quantity_text"], "1 л")
+        self.assertEqual(items[1]["quantity_text"], "500 г")
+
+    def test_tilky_prefix_with_conjunction(self):
+        items = _shopping_items()
+        ok, edits = preview_editing.parse_household_add_preview_edit("тільки молока 1 л, а сиру 500 г", items)
+        self.assertTrue(ok)
+        preview_editing.apply_household_add_preview_edits(items, edits, _canonicalize_stub, _capitalize_stub)
+        self.assertEqual(items[0]["quantity_text"], "1 л")
+        self.assertEqual(items[1]["quantity_text"], "500 г")
+
+    def test_positional_shorthand_maps_by_order(self):
+        items = _shopping_items()
+        ok, edits = preview_editing.parse_household_add_preview_edit("1 л, 500 г", items)
+        self.assertTrue(ok)
+        preview_editing.apply_household_add_preview_edits(items, edits, _canonicalize_stub, _capitalize_stub)
+        self.assertEqual(items[0]["quantity_text"], "1 л")
+        self.assertEqual(items[1]["quantity_text"], "500 г")
+
+    def test_positional_shorthand_english_units(self):
+        items = _shopping_items()
+        ok, edits = preview_editing.parse_household_add_preview_edit("1L, 500g", items)
+        self.assertTrue(ok)
+        preview_editing.apply_household_add_preview_edits(items, edits, _canonicalize_stub, _capitalize_stub)
+        self.assertEqual(items[0]["quantity_text"], "1 л")
+        self.assertEqual(items[1]["quantity_text"], "500 г")
+
+    def test_zroby_single_item_no_name_needed(self):
+        items = _shopping_items()[:1]
+        ok, edits = preview_editing.parse_household_add_preview_edit("зроби молоко 1 л", items)
+        self.assertTrue(ok)
+        preview_editing.apply_household_add_preview_edits(items, edits, _canonicalize_stub, _capitalize_stub)
+        self.assertEqual(items[0]["quantity_text"], "1 л")
+
+    def test_zamist_old_qty_zroby_new_qty(self):
+        items = _shopping_items()
+        ok, edits = preview_editing.parse_household_add_preview_edit("замість молока 1 шт зроби 1 л", items)
+        self.assertTrue(ok)
+        preview_editing.apply_household_add_preview_edits(items, edits, _canonicalize_stub, _capitalize_stub)
+        self.assertEqual(items[0]["quantity_text"], "1 л")
+        self.assertEqual(items[1]["quantity_text"], "1 шт.")  # untouched
+
+    def test_zamist_zroby_renames(self):
+        items = _shopping_items()
+        ok, edits = preview_editing.parse_household_add_preview_edit("замість сир зроби творог", items)
+        self.assertTrue(ok)
+        preview_editing.apply_household_add_preview_edits(items, edits, _canonicalize_stub, _capitalize_stub)
+        self.assertEqual(items[1]["name"], "Творог")
+        self.assertEqual(items[1]["canonical_name"], "творог")
+        self.assertEqual(items[0]["name"], "Молоко")  # untouched
+
+    def test_pereimenuy_na_renames(self):
+        items = _shopping_items()
+        ok, edits = preview_editing.parse_household_add_preview_edit("перейменуй сир на творог", items)
+        self.assertTrue(ok)
+        preview_editing.apply_household_add_preview_edits(items, edits, _canonicalize_stub, _capitalize_stub)
+        self.assertEqual(items[1]["name"], "Творог")
+
+    def test_word_numbers_are_not_overbuilt_returns_unparseable(self):
+        items = _shopping_items()
+        ok, result = preview_editing.parse_household_add_preview_edit("один літр, пʼятсот грам", items)
+        self.assertFalse(ok)
+        self.assertIsNone(result)
+
+    def test_invalid_quantity_word_returns_unparseable(self):
+        items = _shopping_items()
+        original = [dict(it) for it in items]
+        ok, result = preview_editing.parse_household_add_preview_edit("молока багато", items)
+        self.assertFalse(ok)
+        self.assertIsNone(result)
+        self.assertEqual(items, original)
+
+    def test_ambiguous_name_matching_two_items_asks_to_clarify(self):
+        items = [
+            {"name": "Молоко", "canonical_name": "молоко", "quantity_value": Decimal("1"),
+             "quantity_unit": "шт.", "quantity_text": "1 шт.", "quantity_inferred": True},
+            {"name": "Молоко", "canonical_name": "молоко", "quantity_value": Decimal("1"),
+             "quantity_unit": "шт.", "quantity_text": "1 шт.", "quantity_inferred": True},
+        ]
+        original = [dict(it) for it in items]
+        ok, message = preview_editing.parse_household_add_preview_edit("молоко 1 л", items)
+        self.assertFalse(ok)
+        self.assertEqual(message, preview_editing.HOUSEHOLD_EDIT_AMBIGUOUS_MSG)
+        self.assertEqual(items, original)
+
+    def test_positional_count_mismatch_does_not_guess(self):
+        items = _shopping_items()
+        original = [dict(it) for it in items]
+        ok, message = preview_editing.parse_household_add_preview_edit("1 л, 500 г, 2 шт", items)
+        self.assertFalse(ok)
+        self.assertEqual(message, preview_editing.HOUSEHOLD_EDIT_POSITIONAL_MISMATCH_MSG)
+        self.assertEqual(items, original)
+
+    def test_item_not_found_returns_controlled_message(self):
+        items = _shopping_items()
+        ok, message = preview_editing.parse_household_add_preview_edit("банан 1 л", items)
+        self.assertFalse(ok)
+        self.assertEqual(message, preview_editing.HOUSEHOLD_EDIT_NOT_FOUND_MSG)
+
+    def test_inventory_add_preview_single_item_edit(self):
+        items = [{
+            "name": "Молоко", "canonical_name": "молоко", "category": "Молочне та яйця",
+            "quantity_value": Decimal("1"), "quantity_unit": "шт.", "quantity_text": "1 шт.",
+            "quantity_inferred": True,
+        }]
+        ok, edits = preview_editing.parse_household_add_preview_edit("молока 1 л", items)
+        self.assertTrue(ok)
+        preview_editing.apply_household_add_preview_edits(items, edits, _canonicalize_stub, _capitalize_stub)
+        self.assertEqual(items[0]["quantity_text"], "1 л")
+        self.assertEqual(items[0]["quantity_inferred"], False)
+
+    def test_blank_text_unparseable(self):
+        ok, result = preview_editing.parse_household_add_preview_edit("", _shopping_items())
+        self.assertFalse(ok)
+        self.assertIsNone(result)
+
+    def test_unrelated_text_unparseable(self):
+        ok, result = preview_editing.parse_household_add_preview_edit("Купив банани", _shopping_items())
+        self.assertFalse(ok)
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3703,6 +3703,40 @@ def _apply_global_household_confirm(chat_id):
         send_message(chat_id, "Не вдалося застосувати зміни. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
 
 
+# =========================
+# PREVIEW EDIT V2 — safe text edits to an ACTIVE pending_global_household
+# "add" preview (see preview_editing.py's own "PREVIEW EDIT V2" section for
+# the parser/apply functions). Called from message_dispatcher.py's pending-
+# routes slice (Dispatcher V2A) BEFORE any command/context route, general AI
+# fallback or destructive guard is ever reached for a chat with an active
+# preview — see message_dispatcher._dispatch_pending_routes. Only mutates
+# the SAME pending_global_household[chat_id]["add_shopping_items"]/
+# ["add_inventory_items"] item dicts in place; never touches the database,
+# never pops the pending preview (confirm/cancel still own that, unchanged).
+# consume_changes/new_expenses/delete_expense on the same pending preview
+# are never touched here — out of scope for V2.
+# =========================
+def _handle_global_household_edit_text(chat_id, text):
+    data = pending_global_household.get(chat_id)
+    if data is None:
+        return
+    items = data["add_shopping_items"] + data["add_inventory_items"]
+    if not items:
+        # Nothing addable in this preview (consume-only/expense-only) —
+        # there's no add-item target to edit at all, so fall straight back
+        # to the original "unfinished plan" guard, exactly as before
+        # Preview Edit V2 existed.
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return
+    ok, result = preview_editing.parse_household_add_preview_edit(text, items)
+    if not ok:
+        send_message(chat_id, result or GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return
+    preview_editing.apply_household_add_preview_edits(items, result, canonicalize_name, inventory.capitalize_first)
+    preview = household_router.format_preview(data, header="Оновив план:")
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+
+
 def _start_undo_flow(chat_id, user_id, display_name):
     """"↩️ Скасувати останню дію" button or one of the recognized natural
     phrasings. Looks up ONLY this user's own latest active Global Household
@@ -4222,6 +4256,9 @@ _pending_route_deps = message_dispatcher.PendingRouteDeps(
     handle_inventory_transform_edit=lambda *a, **kw: _handle_inventory_transform_edit_text(*a, **kw),
     pending_cleanup_admin=pending_cleanup_admin,
     unsupported_preview_edit_msg=preview_editing.UNSUPPORTED_PREVIEW_TYPE_MSG,
+    # Preview Edit V2 — pending_global_household add previews (shopping_add/
+    # inventory_add) support safe text edits (see preview_editing.py).
+    handle_global_household_edit=lambda *a, **kw: _handle_global_household_edit_text(*a, **kw),
 )
 
 # =========================
@@ -5837,6 +5874,17 @@ def _handle_photo_message(chat_id, user_id, display_name, file_id, mime_type=Non
 @app.route("/")
 def home():
     return "Bot is running"
+
+
+@app.route("/health")
+def health():
+    """Lightweight uptime-ping endpoint — plain 200 + {"ok": true}. Never
+    calls Gemini/Groq, never touches Postgres/Supabase, never touches
+    Telegram — safe for an external monitor (UptimeRobot/cron-job.org) to
+    poll every 5-10 minutes without generating any load beyond this
+    process."""
+    return {"ok": True}, 200
+
 
 @app.route(f"/webhook/{TOKEN}", methods=["POST"])
 def webhook():

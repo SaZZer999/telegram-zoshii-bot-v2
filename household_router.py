@@ -978,8 +978,13 @@ def _format_new_item_line(item):
     return f"• Додати {label}"
 
 
-def format_preview(payload):
-    lines = ["План змін:"]
+def format_preview(payload, header="План змін:"):
+    """`header` defaults to the original preview header; Preview Edit V2
+    passes "Оновив план:" instead when re-rendering an edited
+    pending_global_household preview, without changing anything else about
+    the layout (same convention as inventory.format_inventory_transform_
+    preview's own `header` param)."""
+    lines = [header]
 
     if payload["add_shopping_items"]:
         lines.append("")

@@ -229,6 +229,17 @@ class PendingRouteDeps:
     # attempt.
     pending_cleanup_admin: dict = None
     unsupported_preview_edit_msg: str = None
+    # Preview Edit V2 — awaiting confirm/cancel on a pending_global_household
+    # preview. Optional (default None) so DispatcherDeps built before this
+    # existed keeps working unchanged, same reasoning as every other
+    # Optional field above: when it's None, the pending_global_household
+    # guard below falls back to its original behavior (send
+    # global_household_preview_guard_msg, never touch the pending preview).
+    # When set, handle_global_household_edit(chat_id, text) owns the whole
+    # decision — a recognized add-item edit re-renders the SAME pending
+    # preview in place, anything else still sends a controlled message —
+    # never general AI, never a new command/route, never a database write.
+    handle_global_household_edit: Callable = None
 
 
 @dataclass
@@ -565,8 +576,17 @@ def _dispatch_pending_routes(deps, chat_id, user_id, display_name, text):
         # A combined Global Household Router preview is awaiting confirm/
         # cancel — no new text (including one that would otherwise match
         # household_router.gate(text)) can start a new global router pass
-        # while a plan of changes is still awaiting confirmation.
-        deps.send_message(chat_id, routes.global_household_preview_guard_msg)
+        # while a plan of changes is still awaiting confirmation. Preview
+        # Edit V2: if an edit handler is wired, ANY text here is first
+        # offered to it — a recognized add-item edit (quantity/name,
+        # including "1 л, 500 г"-style positional shorthand) re-renders the
+        # SAME pending preview in place; anything it doesn't recognize still
+        # falls back to the original guard message, never a new command,
+        # never general AI, never a database write.
+        if routes.handle_global_household_edit is not None:
+            routes.handle_global_household_edit(chat_id, text)
+        else:
+            deps.send_message(chat_id, routes.global_household_preview_guard_msg)
         return RouteOutcome.HANDLED
 
     if chat_id in routes.pending_add_destination_clarification:

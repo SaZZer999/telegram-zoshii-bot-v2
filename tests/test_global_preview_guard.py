@@ -95,7 +95,13 @@ class TestPendingGlobalHouseholdBlocksNewText(unittest.TestCase):
     def _sent_texts(self):
         return [call.args[1] for call in self.mock_send.call_args_list]
 
-    # Case 6 — plain quantity-looking text never reaches general AI-chat
+    # Case 6 — plain quantity-looking text never reaches general AI-chat.
+    # Preview Edit V2: with exactly one add_inventory_items entry, a bare
+    # "1 Л" is now a recognized positional-shorthand edit (see
+    # tests/test_preview_editing_module.py and tests/test_global_household_
+    # preview_edit.py for the parser/apply coverage) — it re-renders the
+    # SAME pending preview in place instead of the old static guard message,
+    # but still never reaches Gemini/the household router/the database.
     def test_bare_quantity_text_does_not_reach_ai_chat(self):
         chat_id = 991001
         _pending_milk_preview(chat_id)
@@ -105,7 +111,7 @@ class TestPendingGlobalHouseholdBlocksNewText(unittest.TestCase):
         self.mock_hr.assert_not_called()
         self.mock_apply.assert_not_called()
         self.assertIn(chat_id, pending_global_household)
-        self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
+        self.assertTrue(any("Оновив план:" in t for t in self._sent_texts()))
 
     # Case 7 — a new household-shaped command does not start another preview
     def test_new_household_command_does_not_create_another_preview(self):
