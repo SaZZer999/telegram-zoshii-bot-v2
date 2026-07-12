@@ -101,9 +101,20 @@ RECEIPT_PROMPT = (
     "currency — валюта чека, зазвичай \"PLN\".\n"
     "confidence — \"high\", \"medium\" або \"low\", наскільки ти впевнений у розпізнаних даних.\n"
     "warnings — короткий масив рядків з застереженнями (може бути порожній).\n"
+    "line_items — масив окремих ТОВАРІВ, куплених за цим чеком (може бути порожній, якщо позиції нерозбірливі "
+    "чи чек їх не показує). Для кожного товару:\n"
+    "  - name: коротка назва товару, як на чеку (без кількості/одиниці всередині назви).\n"
+    "  - quantity: ЛИШЕ число (напр. \"2\", \"0.5\"), або null якщо кількість нечітка чи не вказана.\n"
+    "  - unit: ОДНЕ з рівно п'яти значень — \"шт\", \"кг\", \"г\", \"л\", \"мл\" (переклади польську/іншу "
+    "одиницю на ці — напр. \"szt\"→\"шт\", \"kg\"→\"кг\"), або null якщо неясно.\n"
+    "  - line_price: сума за ЦЮ позицію (число, як на чеку), або null якщо не видно.\n"
+    "НІКОЛИ не додавай у line_items: знижки/rabat/promocja, заставу/kaucja, пакет/торбу/reklamówkę, бонусні "
+    "бали/картку лояльності, ПДВ/готівку/решту/суму карткою — це не товари, це рядки оплати чи знижок.\n"
     "Формат відповіді:\n"
     '{"is_receipt": true, "merchant": "Biedronka", "total_amount": "86.40", "currency": "PLN", '
-    '"date": "2026-07-10", "category": "grocery", "confidence": "high", "warnings": []}'
+    '"date": "2026-07-10", "category": "grocery", "confidence": "high", "warnings": [], "line_items": '
+    '[{"name": "Mleko 2%", "quantity": "2", "unit": "л", "line_price": "8.00"}, '
+    '{"name": "Jajka", "quantity": "10", "unit": "шт", "line_price": "12.00"}]}'
 )
 
 
@@ -111,7 +122,12 @@ RECEIPT_PROMPT = (
 class ReceiptCandidate:
     """Already-parsed (but not yet business-validated — see
     decide_receipt_outcome) Gemini output. `amount` is a positive Decimal
-    or None (never a raw string/float)."""
+    or None (never a raw string/float). `line_items` (Receipt V2) is
+    always a list — empty for a plain Photo Receipt V1 candidate (every
+    existing caller that builds a ReceiptCandidate without passing
+    line_items gets this default, so decide_receipt_outcome's original
+    "ok"/"missing_amount"/"not_a_receipt" behavior is completely
+    unaffected when there are none)."""
     is_receipt: bool = False
     merchant: str = None
     amount: object = None
@@ -120,6 +136,7 @@ class ReceiptCandidate:
     category_hint: str = None  # "grocery" | "pharmacy" | "other" | None
     confidence: str = "low"
     warnings: list = field(default_factory=list)
+    line_items: list = field(default_factory=list)  # [{"name", "quantity_text", "line_price"}, ...]
 
 
 def _resolve_api_key(api_key):
@@ -207,6 +224,94 @@ def _parse_amount(raw_amount):
     return amount.quantize(Decimal("0.01"))
 
 
+# Receipt V2 — line items. `unit` is restricted to this exact vocabulary
+# (the same STRUCTURED_UNITS/aliases bot.py's own item-quantity parsing
+# already speaks — see quantities.py) rather than trusting whatever raw
+# Polish/other unit word Gemini saw on the receipt; the prompt itself asks
+# Gemini to translate into one of these five, so a value outside this set
+# is treated as "unit unclear" (quantity_text stays "", which downstream
+# normalize_item_quantity(allow_default_unit=True) safely defaults to
+# "1 шт." — the exact "safe default with a note" the work order asks for).
+_VALID_ITEM_UNITS = {"шт", "кг", "г", "л", "мл"}
+
+# Defense-in-depth against a discount/deposit/bag/loyalty line slipping
+# into line_items despite the prompt's own explicit instruction not to
+# include them — never trust a single layer of "Gemini was told not to".
+# Deliberately a plain case-insensitive substring match (Polish AND
+# Ukrainian spellings) rather than an exact-word list, since receipt OCR
+# text commonly has no clean word boundaries.
+_NON_INVENTORY_NAME_KEYWORDS = (
+    "rabat", "znizka", "zniżka", "знижка", "promocja", "промо",
+    "kaucja", "застава", "deposit", "depozyt",
+    "reklamówka", "reklamowka", "torba", "торба", "пакет",
+    "punkty", "bonus", "бонус", "lojalnoś", "лояльност",
+    "opłata", "oplata", "opłata",
+    "gotówka", "gotowka", "готівка", "reszta", "решта", "karta płat", "картою",
+    "vat", "pdv", "пдв", "suma", "razem", "total", "разом", "підсумок",
+    "paragon", "rachunek", "чек",
+)
+
+
+def _looks_like_non_inventory_name(name):
+    lowered = name.lower()
+    return any(keyword in lowered for keyword in _NON_INVENTORY_NAME_KEYWORDS)
+
+
+def _format_plain_number(value):
+    """A Decimal as plain fixed-point text, trailing zeros/dot trimmed —
+    never scientific notation (Decimal.normalize() would turn "10.00" into
+    "1E+1", which the downstream quantity parser can't read at all)."""
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _parse_line_item(raw):
+    """One raw Gemini line_items entry -> {"name", "quantity_text",
+    "line_price"} or None if malformed/blank/obviously not an inventory
+    item (see _looks_like_non_inventory_name). `quantity_text` is either a
+    clean "<number> <unit>" string (only when BOTH parsed cleanly) or ""
+    (an unclear quantity — safely defaults downstream, never guessed
+    here). Never raises."""
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    name = name.strip()
+    if _looks_like_non_inventory_name(name):
+        return None
+
+    quantity_text = ""
+    quantity_value = _parse_amount(raw.get("quantity"))
+    raw_unit = raw.get("unit")
+    if quantity_value is not None and isinstance(raw_unit, str) and raw_unit.strip().lower() in _VALID_ITEM_UNITS:
+        quantity_text = f"{_format_plain_number(quantity_value)} {raw_unit.strip().lower()}"
+
+    return {
+        "name": name,
+        "quantity_text": quantity_text,
+        "line_price": _parse_amount(raw.get("line_price")),
+    }
+
+
+def _parse_line_items(raw_items):
+    """Every well-formed, inventory-looking entry in `raw_items` — silently
+    drops (never rejects the whole receipt for) an individual malformed or
+    denylisted entry, since a receipt commonly has many items and one bad
+    OCR line/discount row must never block the others. Returns [] if
+    `raw_items` itself isn't a list at all."""
+    if not isinstance(raw_items, list):
+        return []
+    items = []
+    for raw in raw_items:
+        item = _parse_line_item(raw)
+        if item is not None:
+            items.append(item)
+    return items
+
+
 def _normalize_category_hint(raw_category):
     if not isinstance(raw_category, str):
         return None
@@ -255,6 +360,7 @@ def _parse_receipt_json(raw_text):
         category_hint=_normalize_category_hint(data.get("category")),
         confidence=confidence,
         warnings=warnings,
+        line_items=_parse_line_items(data.get("line_items")),
     )
 
 
@@ -343,24 +449,43 @@ def decide_receipt_outcome(candidate, now=None):
     mirrors expenses._validate_expense_router_result's own (kind, payload)
     shape/spirit. Returns one of:
       ("not_a_receipt", None)
-      ("missing_amount", None)
+      ("missing_amount", None)  -- no usable total AND no usable line items
       ("ok", {"amount": Decimal, "merchant": str, "expense_date": date,
                "category_hint": str|None, "confidence": str, "warnings": [...]})
-    `merchant` in the "ok" payload always falls back to "Чек" when Gemini
-    didn't report one; `expense_date` is always a concrete date (see
-    _resolve_expense_date). Never raises — a malformed candidate (Gemini
-    JSON that didn't parse at all) is PhotoInputError'd by
-    extract_receipt_from_image BEFORE this is ever called.
+          -- Photo Receipt V1's original shape, UNCHANGED, used whenever
+          there are no line items at all (candidate.line_items empty) —
+          every existing caller/test that never sets line_items keeps
+          getting exactly this, regardless of any Receipt V2 code below.
+      ("ok_with_items", {**same keys as "ok", "line_items": [...]})
+          -- Receipt V2: a usable total AND 1+ usable line items.
+      ("items_only", {"merchant": str, "expense_date": date,
+                       "category_hint": str|None, "confidence": str,
+                       "warnings": [...], "line_items": [...]})
+          -- Receipt V2: 1+ usable line items but NO usable total — an
+          inventory-only preview, never an invented expense amount.
+    `merchant` always falls back to "Чек" when Gemini didn't report one;
+    `expense_date` is always a concrete date (see _resolve_expense_date).
+    Never raises — a malformed candidate (Gemini JSON that didn't parse at
+    all) is PhotoInputError'd by extract_receipt_from_image BEFORE this is
+    ever called.
     """
     if not candidate.is_receipt:
         return "not_a_receipt", None
-    if candidate.amount is None:
+
+    line_items = candidate.line_items or []
+    if candidate.amount is None and not line_items:
         return "missing_amount", None
-    return "ok", {
-        "amount": candidate.amount,
+
+    base_payload = {
         "merchant": candidate.merchant or "Чек",
         "expense_date": _resolve_expense_date(candidate.date, now=now),
         "category_hint": candidate.category_hint,
         "confidence": candidate.confidence,
         "warnings": candidate.warnings,
     }
+
+    if not line_items:
+        return "ok", {**base_payload, "amount": candidate.amount}
+    if candidate.amount is not None:
+        return "ok_with_items", {**base_payload, "amount": candidate.amount, "line_items": line_items}
+    return "items_only", {**base_payload, "line_items": line_items}

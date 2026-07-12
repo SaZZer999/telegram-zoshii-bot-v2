@@ -6108,16 +6108,20 @@ def _handle_voice_message(chat_id, voice, user_id=None):
 
 
 # =========================
-# PHOTO RECEIPT INPUT V1 — Telegram receipt photo -> Gemini Vision
-# extraction (photo_receipts.py) -> the SAME pending_expense preview/
-# confirm/cancel a typed "Biedronka 86,40 zł" command already uses (see
-# expenses.build_receipt_expense_preview). Unlike voice, a photo never
-# feeds text into message_dispatcher.dispatch(...) — it builds the expense
-# preview directly, since "read this receipt" has no other meaningful text
-# form to route. photo_receipts.py owns every extraction-provider concern
-# (env config, the Gemini Vision call itself, JSON parsing/validation,
-# disabled/missing-key errors); this module only owns the Telegram-
-# specific half (picking the largest photo size / image document,
+# PHOTO RECEIPT INPUT V1/V2 — Telegram receipt photo -> Gemini Vision
+# extraction (photo_receipts.py) -> either the SAME pending_expense
+# preview/confirm/cancel a typed "Biedronka 86,40 zł" command already uses
+# (V1, see expenses.build_receipt_expense_preview — used whenever the
+# receipt has no usable line items) or a combined pending_global_household
+# preview (V2, see _build_receipt_line_items_preview — used whenever the
+# receipt has 1+ usable product line items, reusing the exact same
+# machinery a typed mixed household command already uses). Unlike voice, a
+# photo never feeds text into message_dispatcher.dispatch(...) — it builds
+# its preview directly, since "read this receipt" has no other meaningful
+# text form to route. photo_receipts.py owns every extraction-provider
+# concern (env config, the Gemini Vision call itself, JSON parsing/
+# validation, disabled/missing-key errors); this module only owns the
+# Telegram-specific half (picking the largest photo size / image document,
 # downloading it, size guard) plus the final mapping from photo_receipts'
 # abstract category_hint to one of expenses.EXPENSE_CATEGORIES' own fixed
 # strings.
@@ -6280,13 +6284,19 @@ def _handle_photo_message(chat_id, user_id, display_name, file_id, mime_type=Non
         send_message(chat_id, photo_receipts.MISSING_AMOUNT_MSG)
         return
 
-    # kind == "ok"
     try:
         household_id, user_db_id = get_household_and_user(user_id, display_name)
     except Exception:
         send_message(chat_id, PHOTO_PROCESSING_FAILED_MSG)
         return
 
+    if kind in ("ok_with_items", "items_only"):
+        # Receipt V2 — see _build_receipt_line_items_preview's own docstring.
+        _build_receipt_line_items_preview(chat_id, household_id, user_db_id, kind, payload)
+        return
+
+    # kind == "ok" — Photo Receipt V1's original single-expense flow,
+    # completely unchanged (no line items were extracted from this receipt).
     category = _PHOTO_CATEGORY_HINT_TO_EXPENSE_CATEGORY.get(payload["category_hint"], expenses.DEFAULT_EXPENSE_CATEGORY)
     category_was_defaulted = category == expenses.DEFAULT_EXPENSE_CATEGORY
 
@@ -6309,6 +6319,57 @@ def _handle_photo_message(chat_id, user_id, display_name, file_id, mime_type=Non
         payload["amount"], category, payload["merchant"], payload["expense_date"],
         category_was_defaulted=category_was_defaulted,
     )
+
+
+def _build_receipt_line_items_preview(chat_id, household_id, user_db_id, kind, payload):
+    """Receipt V2 — `kind` is "ok_with_items" (a usable total AND 1+ usable
+    line items) or "items_only" (1+ usable line items but no usable
+    total). Builds ONE combined pending_global_household preview (💸
+    Витрати for the receipt total, when present, plus 🧊 Запаси for the
+    line items) by reusing the EXACT SAME machinery a typed mixed command
+    already uses for "add these items to inventory" — household_router.
+    validate_mini_planner_add_items/build_add_preview_from_items/bot.
+    _handle_household_router_result — so confirm/cancel, the Pending
+    Preview Edit Planner, the Inventory Representation Guard, and the DB
+    write path (apply_global_household_operations) all keep working
+    completely unchanged; nothing about this preview shape is new, only
+    where its input items came from.
+
+    Falls back to PHOTO_PROCESSING_FAILED_MSG (no preview at all) only if
+    EVERY line item turns out unsafe to add (validate_mini_planner_add_
+    items' own all-or-nothing contract — the same one a typed explicit-add
+    command already has) — never silently drops the items and falls back
+    to an expense-only preview instead, since that would silently discard
+    exactly what the user pointed the camera at.
+    """
+    alias_map = get_household_alias_map(household_id)
+    raw_items = [{"name": li["name"], "quantity_text": li["quantity_text"]} for li in payload["line_items"]]
+    validated_items = household_router.validate_mini_planner_add_items(raw_items, alias_map)
+    if not validated_items:
+        send_message(chat_id, PHOTO_PROCESSING_FAILED_MSG)
+        return
+
+    inventory_items = get_inventory_items(household_id)
+    item_kind, item_payload = household_router.build_add_preview_from_items(
+        "add_inventory", validated_items, inventory_items,
+    )
+
+    if kind == "ok_with_items":
+        category = _PHOTO_CATEGORY_HINT_TO_EXPENSE_CATEGORY.get(payload["category_hint"], expenses.DEFAULT_EXPENSE_CATEGORY)
+        expense_entry = {
+            "amount": payload["amount"], "currency": "PLN", "category": category,
+            "category_was_defaulted": category == expenses.DEFAULT_EXPENSE_CATEGORY,
+            "description": payload["merchant"], "expense_date": payload["expense_date"],
+        }
+        item_payload["new_expenses"] = [expense_entry]
+        item_payload["new_expense"] = expense_entry
+
+    if payload["confidence"] == "low":
+        send_message(chat_id, photo_receipts.LOW_CONFIDENCE_WARNING)
+
+    origin = household_router.current_origin(chat_id)
+    keyboard = household_router.origin_keyboard(origin)
+    _handle_household_router_result(chat_id, item_kind, item_payload, household_id, user_db_id, origin, keyboard)
 
 
 @app.route("/")
