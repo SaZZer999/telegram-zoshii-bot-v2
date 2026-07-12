@@ -41,6 +41,7 @@ _NAME_SYNONYMS = {
     "śmietanka": "вершки",
     "smietana": "сметана",
     "śmietana": "сметана",
+    "печення": "печиво",
 }
 
 # Narrow, deterministic Latin/Cyrillic homoglyph whitelist — only the classic

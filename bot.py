@@ -985,6 +985,16 @@ GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG = (
     "Підтвердь його або скасуй перед новою командою."
 )
 
+# Price Clarification V1 — see _try_apply_price_clarification's own
+# docstring. Sent instead of silently guessing when a per-unit price
+# clarification's quantity can't be safely compared against the pending
+# item's own quantity (incompatible units, or the pending quantity is
+# itself only a guessed/inferred default, never an explicit one).
+PRICE_CLARIFICATION_AMBIGUOUS_MSG = (
+    "Не можу безпечно порахувати суму для цього товару за такою кількістю.\n\n"
+    "Напиши остаточну сплачену суму напряму, наприклад «заплатив 10 zł»."
+)
+
 UNDO_PREVIEW_KEYBOARD = {
     "keyboard": [
         ["✅ Так, скасувати"],
@@ -1554,6 +1564,7 @@ _NAME_SYNONYMS = {
     "śmietanka": "вершки",
     "smietana": "сметана",
     "śmietana": "сметана",
+    "печення": "печиво",
 }
 
 # Narrow, deterministic Latin/Cyrillic homoglyph whitelist — mirrors
@@ -3850,8 +3861,71 @@ def _apply_global_household_confirm(chat_id):
 # ["add_inventory_items"] item dicts in place; never touches the database,
 # never pops the pending preview (confirm/cancel still own that, unchanged).
 # consume_changes/new_expenses/delete_expense on the same pending preview
-# are never touched here — out of scope for V2.
+# are never touched here — out of scope for V2, EXCEPT for Price
+# Clarification V1 (_try_apply_price_clarification below), which only ever
+# touches new_expenses/new_expense and only when there wasn't one already.
 # =========================
+def _try_apply_price_clarification(chat_id, data, items, text):
+    """Price Clarification V1 — a follow-up to Purchase Event Planner V1's
+    "ambiguous_expense"/discount-marker handling (see household_router.py's
+    HOUSEHOLD_ROUTER_PROMPT type 7, and preview_editing.py's own "PRICE
+    CLARIFICATION V1" section). While a pending_global_household preview
+    has an add item but NO expense yet (the amount was left ambiguous on
+    purpose — a discount, an original/per-unit price, or omitted entirely),
+    a short reply like "за пів кілограма 5 zl" or "заплатив 10 zł" updates
+    the SAME preview with a real expense instead of being rejected as an
+    unrelated new command — that rejection (the generic pending-plan guard
+    message) was the actual live bug this function fixes.
+
+    Only ever applies when the preview has exactly ONE addable item (never
+    guesses which item an unnamed clarification refers to) and no expense
+    yet — two or more items, or an already-resolved expense, both fall
+    through to the caller's existing behavior unchanged. Returns True if
+    `text` was fully handled (an updated preview, or a targeted "can't
+    safely calculate" message, was already sent) — False if `text` doesn't
+    look like a price clarification at all.
+    """
+    if (data.get("new_expenses") or []) or len(items) != 1:
+        return False
+    parsed = preview_editing.parse_price_clarification(text)
+    if parsed is None:
+        return False
+
+    item = items[0]
+    extra_note = None
+    if parsed["kind"] == "total_paid":
+        # The user stated the final paid amount directly — used as-is, no
+        # math, so no clean explicit-pieces requirement applies here.
+        amount = parsed["amount"]
+    else:
+        multiplier = preview_editing.compute_quantity_multiplier(
+            item.get("quantity_value"), item.get("quantity_unit"),
+            parsed["unit_quantity_value"], parsed["unit_quantity_unit"],
+        )
+        if multiplier is None or item.get("quantity_inferred"):
+            # Incompatible units, or the pending quantity is itself only a
+            # guessed default (never explicit) — never invent a multiplier.
+            send_message(chat_id, PRICE_CLARIFICATION_AMBIGUOUS_MSG, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+            return True
+        amount = (parsed["unit_amount"] * multiplier).quantize(Decimal("0.01"))
+        extra_note = (
+            f"{expenses._format_expense_amount(parsed['unit_amount'])} за "
+            f"{format_quantity_display(parsed['unit_quantity_value'], parsed['unit_quantity_unit'])} × "
+            f"{format_quantity_display(multiplier, None)}"
+        )
+
+    today = datetime.now(ZoneInfo("Europe/Warsaw")).date()
+    new_expense_entry = {
+        "amount": amount, "currency": "PLN", "category": "Продукти",
+        "category_was_defaulted": True, "description": item["name"], "expense_date": today,
+    }
+    data["new_expenses"] = [new_expense_entry]
+    data["new_expense"] = new_expense_entry
+    preview = household_router.format_preview(data, header="Оновив план:", extra_note=extra_note)
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+    return True
+
+
 def _handle_global_household_edit_text(chat_id, text):
     data = pending_global_household.get(chat_id)
     if data is None:
@@ -3865,12 +3939,14 @@ def _handle_global_household_edit_text(chat_id, text):
         send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
         return
     ok, result = preview_editing.parse_household_add_preview_edit(text, items)
-    if not ok:
-        send_message(chat_id, result or GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+    if ok:
+        preview_editing.apply_household_add_preview_edits(items, result, canonicalize_name, inventory.capitalize_first)
+        preview = household_router.format_preview(data, header="Оновив план:")
+        send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
         return
-    preview_editing.apply_household_add_preview_edits(items, result, canonicalize_name, inventory.capitalize_first)
-    preview = household_router.format_preview(data, header="Оновив план:")
-    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+    if _try_apply_price_clarification(chat_id, data, items, text):
+        return
+    send_message(chat_id, result or GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
 
 
 def _start_undo_flow(chat_id, user_id, display_name):

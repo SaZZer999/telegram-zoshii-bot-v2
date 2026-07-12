@@ -1146,12 +1146,20 @@ def _format_new_item_line(item):
     return f"• Додати {label}"
 
 
-def format_preview(payload, header="План змін:"):
+def format_preview(payload, header="План змін:", extra_note=None):
     """`header` defaults to the original preview header; Preview Edit V2
     passes "Оновив план:" instead when re-rendering an edited
     pending_global_household preview, without changing anything else about
     the layout (same convention as inventory.format_inventory_transform_
-    preview's own `header` param)."""
+    preview's own `header` param).
+
+    `extra_note` (Price Clarification V1) is an optional plain-text line —
+    e.g. "5 zł за 0,5 кг × 2", explaining how a per-unit price clarification
+    was turned into the expense amount now shown above — rendered in the
+    same slot as expense_notes but WITHOUT the "⚠️" prefix (this is a
+    resolved calculation, not an unresolved warning). None (the default)
+    renders nothing extra, unchanged from every caller before this param
+    existed."""
     lines = [header]
 
     if payload["add_shopping_items"]:
@@ -1242,6 +1250,10 @@ def format_preview(payload, header="План змін:"):
         lines.append("")
         for note in expense_notes:
             lines.append(f"⚠️ {note}")
+
+    if extra_note:
+        lines.append("")
+        lines.append(extra_note)
 
     lines.append("")
     lines.append("✅ Так, застосувати")

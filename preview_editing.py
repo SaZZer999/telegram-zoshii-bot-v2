@@ -35,8 +35,12 @@ own product-name synonym table lives in bot.py and must stay there, same
 reasoning as quantities.py's own module docstring).
 """
 import re
+from decimal import Decimal
 
-from quantities import parse_structured_quantity, format_quantity_display
+import expenses
+from quantities import (
+    parse_structured_quantity, format_quantity_display, STRUCTURED_UNITS, _UNIT_CONVERSION_GROUPS,
+)
 
 UNSUPPORTED_PREVIEW_TYPE_MSG = (
     "Редагування цього плану текстом ще не підтримується. "
@@ -499,3 +503,183 @@ def apply_household_add_preview_edits(items, edits, canonicalize_name, capitaliz
             item["quantity_unit"] = edit["quantity_unit"]
             item["quantity_text"] = edit["quantity_text"]
             item["quantity_inferred"] = False
+
+
+# =========================
+# PRICE CLARIFICATION V1 — a follow-up to Purchase Event Planner V1
+# (household_router.py's "ambiguous_expense"/discount-marker handling): once
+# a pending_global_household preview has an inventory add but no expense
+# (an amount was ambiguous — a discount, an original/per-unit price, or
+# omitted entirely), a short clarification reply like "за пів кілограма
+# 5 zl", "0,5 кг було 5 злотих", or "заплатив 10 zł" must update the SAME
+# preview with a real expense instead of being rejected as an unrelated new
+# command — that rejection (the generic pending-plan guard message) was the
+# actual live bug this section fixes.
+#
+# `expenses._parse_expense_amount` is reused (never a second amount parser)
+# so every accepted spelling/rounding/max-amount rule stays identical to
+# the rest of the expense flow — expenses.py never imports bot.py or this
+# module (see its own imports: only database.StaleSnapshotError and
+# action_history), so importing it here creates no cycle, same reasoning as
+# household_router.py's own direct `import expenses`.
+#
+# Deterministic only, no Gemini call, no database write: parse_price_
+# clarification + compute_quantity_multiplier only ever return numbers that
+# are exact, explicit, and safe (see compute_quantity_multiplier's own
+# "never guessed" contract) — anything not cleanly resolvable returns None,
+# and the caller (bot.py) must fall back to its existing guard/clarification
+# message rather than ever inventing an amount.
+# =========================
+
+_TOTAL_PAID_VERB_RE = re.compile(
+    r"^(?:заплатив|заплатила|заплатили|оплатив|оплатила|оплатили|сплатив|сплатила|сплатили)\s+(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+
+_UNIT_PRICE_ZA_RE = re.compile(r"^за\s+(?P<rest>.+)$", re.IGNORECASE)
+
+_UNIT_PRICE_BULO_RE = re.compile(r"^(?P<qty>.+?)\s+(?:було|була|був)\s+(?P<rest>.+)$", re.IGNORECASE)
+
+# "пів кіло"/"пів кілограма"/"пів кг"/"пів літра"/"пів л" -> (0.5, "кг"/"л").
+# Deliberately local to this one clarification flow rather than widening
+# quantities.py's own _WORD_NUMBER_QUANTITIES (a general-purpose table used
+# far beyond price clarification) — same reasoning as this module's V1
+# section keeping its own narrow patch-shape catalog.
+_HALF_QUANTITY_RE = re.compile(r"^пів\s*(кіло(?:грам\w*)?|кг|л(?:ітр\w*)?|л)$", re.IGNORECASE)
+
+# expenses._parse_expense_amount already strips "zł"/"zl"/"pln"/a bare "z"
+# marker, but NOT the spelled-out Ukrainian word ("злотих"/"злотий"/
+# "злоті") a typed clarification is just as likely to use — stripped here
+# first so every amount extraction in this section accepts both forms
+# identically.
+_ZLOTY_WORD_RE = re.compile(r"злот\w*", re.IGNORECASE)
+
+
+def _parse_clarification_amount(text):
+    return expenses._parse_expense_amount(_ZLOTY_WORD_RE.sub("", text or ""))
+
+
+def _resolve_clarification_quantity(text):
+    """Parse a quantity phrase for a price clarification — a normal
+    structured quantity ("0,5 кг", "500 г") via parse_structured_quantity,
+    or the narrow word-fraction _HALF_QUANTITY_RE above. Returns
+    (value, unit) or (None, None) — never guessed beyond these two exact
+    shapes."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return None, None
+    value, unit = parse_structured_quantity(stripped)
+    if value is not None:
+        return value, unit
+    m = _HALF_QUANTITY_RE.match(stripped)
+    if m:
+        return Decimal("0.5"), ("л" if m.group(1).lower().startswith("л") else "кг")
+    return None, None
+
+
+def _split_trailing_amount(text):
+    """Like _split_trailing_quantity_words above, but for a trailing
+    amount+currency span ("5 zł", "5,00 zł", "5 злотих") instead of a
+    quantity — returns (leading_text, Decimal) for the LONGEST trailing
+    1..3-word run _parse_clarification_amount accepts, or (None, None) if
+    none does."""
+    words = (text or "").strip().split()
+    if not words:
+        return None, None
+    for n in (3, 2, 1):
+        if len(words) < n:
+            continue
+        candidate = " ".join(words[-n:])
+        amount = _parse_clarification_amount(candidate)
+        if amount is not None:
+            leading = " ".join(words[:-n]).strip()
+            return leading, amount
+    return None, None
+
+
+def parse_price_clarification(text):
+    """Deterministically parse a free-text reply while a pending_global_
+    household preview's expense amount is ambiguous/missing, into ONE of:
+
+      {"kind": "total_paid", "amount": Decimal}
+          — the user stated the FINAL paid amount directly ("заплатив
+            10 zł") — the caller uses it AS-IS, no math.
+      {"kind": "unit_price", "unit_quantity_value": Decimal,
+       "unit_quantity_unit": str, "unit_amount": Decimal}
+          — a PER-UNIT price ("за пів кілограма 5 zl", "0,5 кг було 5
+            злотих") — the caller must still multiply unit_amount by
+            compute_quantity_multiplier(pending item's own quantity,
+            this unit) before it is safe to use as an expense amount.
+
+    Returns None if `text` doesn't match any recognized shape at all — the
+    caller must treat that exactly like an unrecognized preview edit (fall
+    back to its own existing guard/clarification message), never guess.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+
+    m = _TOTAL_PAID_VERB_RE.match(stripped)
+    if m:
+        amount = _parse_clarification_amount(m.group("rest").strip())
+        if amount is None:
+            return None
+        return {"kind": "total_paid", "amount": amount}
+
+    m = _UNIT_PRICE_ZA_RE.match(stripped)
+    if m:
+        leading, amount = _split_trailing_amount(m.group("rest"))
+        if amount is None or not leading:
+            return None
+        qty_value, qty_unit = _resolve_clarification_quantity(leading)
+        if qty_value is None:
+            return None
+        return {
+            "kind": "unit_price", "unit_quantity_value": qty_value,
+            "unit_quantity_unit": qty_unit, "unit_amount": amount,
+        }
+
+    m = _UNIT_PRICE_BULO_RE.match(stripped)
+    if m:
+        qty_value, qty_unit = _resolve_clarification_quantity(m.group("qty"))
+        if qty_value is None:
+            return None
+        amount = _parse_clarification_amount(m.group("rest").strip())
+        if amount is None:
+            return None
+        return {
+            "kind": "unit_price", "unit_quantity_value": qty_value,
+            "unit_quantity_unit": qty_unit, "unit_amount": amount,
+        }
+
+    return None
+
+
+def compute_quantity_multiplier(pending_value, pending_unit, unit_value, unit_unit):
+    """How many `unit_value unit_unit`-sized units fit into `pending_value
+    pending_unit` — e.g. (1, "кг") against (0.5, "кг") -> Decimal("2"). Same
+    compatibility rule as quantities.merge_quantity_values: identical unit,
+    or same mass/volume conversion group; "шт." only ever matches itself.
+
+    Returns None (never guessed) if either value is missing, either unit is
+    not a known structured unit, the units are incompatible, or unit_value
+    is zero — the caller must fall back to a clarification/guard message
+    rather than ever inventing a multiplier.
+    """
+    if pending_value is None or unit_value is None:
+        return None
+    if pending_unit not in STRUCTURED_UNITS or unit_unit not in STRUCTURED_UNITS:
+        return None
+    dec_pending = pending_value if isinstance(pending_value, Decimal) else Decimal(str(pending_value))
+    dec_unit = unit_value if isinstance(unit_value, Decimal) else Decimal(str(unit_value))
+    if dec_unit == 0:
+        return None
+    if pending_unit == unit_unit:
+        return dec_pending / dec_unit
+    group_pending = _UNIT_CONVERSION_GROUPS.get(pending_unit)
+    group_unit = _UNIT_CONVERSION_GROUPS.get(unit_unit)
+    if group_pending is None or group_unit is None or group_pending[0] != group_unit[0]:
+        return None
+    base_pending = dec_pending * group_pending[1]
+    base_unit = dec_unit * group_unit[1]
+    return base_pending / base_unit
