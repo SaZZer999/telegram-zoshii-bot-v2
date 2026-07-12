@@ -1261,11 +1261,11 @@ class TestExistingRoutesStillWork(InventoryAdminWebhookTestCase):
         chat_id = 771055
         with patch.object(bot, "call_gemini", return_value="Бо це білок казеїн реагує на кислоту.") as mock_gemini:
             _call_webhook(_make_update(771000055, chat_id, "Поясни коротко, чому молоко згортається в каві?"))
-        # Unified Mini Action Planner V1 classifies first (falls back to
-        # "unknown" — this fixed string isn't valid JSON), then general
-        # AI-chat runs and answers with the same mocked text — 2 calls,
-        # final answer unchanged.
-        self.assertEqual(mock_gemini.call_count, 2)
+        # Unified Mini Action Planner V1's pre-gate rejects this text (an
+        # explanatory question mentioning a product, not a household
+        # action) before ever calling Gemini — only general AI-chat's own
+        # single call happens.
+        mock_gemini.assert_called_once()
         self.assertTrue(any("Бо це білок казеїн реагує на кислоту." == t for t in self._sent_texts()))
         self.assertNotIn(chat_id, pending_destructive_guard)
         self.assertNotIn(chat_id, pending_cleanup_admin)

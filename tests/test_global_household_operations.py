@@ -450,10 +450,10 @@ class TestGlobalHouseholdRouterWebhookFlow(unittest.TestCase):
         chat_id = 970010
         _call_webhook(_make_update(970000011, chat_id, "Яка сьогодні погода?"))
         self.mock_household_router.assert_not_called()
-        # Unified Mini Action Planner V1 classifies first (falls back to
-        # "unknown" for this mock), then general AI-chat runs — 2 calls is
-        # the expected shape now, neither of them the household router.
-        self.assertEqual(self.mock_call_gemini.call_count, 2)
+        # Unified Mini Action Planner V1's pre-gate rejects this text
+        # (no household vocabulary/quantity signal) before ever calling
+        # Gemini — only general AI-chat's own single call happens.
+        self.mock_call_gemini.assert_called_once()
         self.assertNotIn(chat_id, pending_global_household)
 
     # Case 14 — existing single-expense flow keeps using the legacy dict/preview unchanged

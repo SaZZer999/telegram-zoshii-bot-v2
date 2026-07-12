@@ -37,10 +37,31 @@ No import of bot.py, database.py, Flask, Telegram, psycopg or any Gemini
 SDK — `configure(bot_module)` injects bot.py's own `call_gemini` at runtime,
 same DI pattern household_router.py already uses for the exact same reason
 (patch.object(bot, "call_gemini", ...) in tests must keep affecting this
-module's own Gemini call).
+module's own Gemini call). `quantities` is safe to import directly (it also
+never imports bot.py) — its own unit-word list is reused for the pre-gate
+below instead of a second, drifting copy.
+
+Pre-gate: `looks_household_like(text)`, a cheap, deterministic, no-Gemini
+check `bot.py`'s `_try_mini_action_planner` runs BEFORE ever calling
+`classify()`. Without it, every genuinely unrelated message (small talk,
+"поясни, чому...", coding/history questions) would still cost a real
+Gemini call just to be classified "unknown" — this bot already treats a
+plain AI-chat answer as the cheap, common case, so the planner itself must
+stay opt-in for messages that at least LOOK household-shaped. Deliberately
+high-recall, not exhaustive: a false negative here only means a genuinely
+household-shaped message falls through to general AI-chat instead of a
+preview (exactly today's pre-planner behavior — never a regression, only a
+missed opportunity); a false positive only costs one extra classify() call
+that then safely resolves to "unknown". Matches on VERBS/CONTEXT words
+(buying, missing, needing, cooking, home-inventory) and quantity/unit
+patterns — deliberately NOT on bare product nouns ("молоко", "сир", ...),
+so an explanatory question that happens to mention a product ("Поясни,
+чому молоко згортається в каві?") never matches on the word "молоко" alone.
 """
 import json
 import re
+
+import quantities
 
 _bot = None
 
@@ -120,3 +141,55 @@ def classify(text):
     if not isinstance(text, str) or not text.strip():
         return dict(_FALLBACK)
     return _ask_gemini(text)
+
+
+# =========================
+# PRE-GATE — see this module's own docstring ("Pre-gate") for the full
+# reasoning. Pure/local, never calls Gemini.
+# =========================
+
+# Quantity/unit pattern ("1 л", "500г", "2 шт.") — reuses quantities.py's
+# own unit-word list (Ukrainian + English aliases already maintained there)
+# instead of a second, drifting copy. Longest-first so e.g. "грамів" is
+# tried before "грам" would otherwise short-circuit inside a longer word.
+_QUANTITY_UNIT_WORDS = sorted(
+    set(quantities._UNIT_ALIASES.keys()) | quantities.STRUCTURED_UNITS, key=len, reverse=True,
+)
+_QUANTITY_PATTERN_RE = re.compile(
+    r"\d+[.,]?\d*\s*(?:" + "|".join(re.escape(u) for u in _QUANTITY_UNIT_WORDS) + r")\b",
+    re.IGNORECASE,
+)
+
+# Household/shopping/inventory/meal VERB and CONTEXT roots — deliberately
+# substrings, not whole-word regexes, so common Ukrainian/Russian/Polish
+# inflections ("купити"/"купив"/"купила"/"докупити", "kupić"/"kupiłem")
+# all match through a single short root without an exhaustive conjugation
+# list. Deliberately EXCLUDES bare product/food nouns ("молоко", "сир",
+# "хліб", ...) — see the module docstring's worked example
+# ("Поясни, чому молоко згортається в каві?" must NOT match on "молоко").
+_HOUSEHOLD_VOCAB_SUBSTRINGS = (
+    # Ukrainian — buying/needing/missing/adding/home-inventory
+    "купи", "треба", "потрібн", "закінч", "немає", "нема ", "дода",
+    "запас", "покупк", "холодильник", "комор", "продукт", "вдома",
+    # Ukrainian — cooking/meal
+    "вечер", "обід", "сніданок", "готу", "страв", "рецепт",
+    # Polish
+    "kupi", "brakuj", "potrzeb", "zakup", "lodówk", "spiżarni",
+    "obiad", "kolacj", "śniadani", "gotow",
+    # Russian
+    "нужно", "надо", "законч", "ужин", "обед", "завтрак", "готов",
+)
+
+
+def looks_household_like(text):
+    """True if `text` plausibly names a household/shopping/inventory/meal
+    request and is therefore worth one real `classify()` Gemini call; False
+    means the caller should skip straight to general AI-chat without ever
+    calling Gemini here. High-recall by design (see module docstring) — a
+    quantity/unit pattern OR any one vocabulary root is enough."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    normalized = text.strip().lower()
+    if _QUANTITY_PATTERN_RE.search(normalized):
+        return True
+    return any(root in normalized for root in _HOUSEHOLD_VOCAB_SUBSTRINGS)

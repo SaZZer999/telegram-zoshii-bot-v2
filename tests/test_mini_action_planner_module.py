@@ -101,5 +101,67 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(result, {"action": "unknown", "items": []})
 
 
+class TestLooksHouseholdLike(unittest.TestCase):
+    """Pure unit tests for the pre-gate `_try_mini_action_planner` runs
+    BEFORE ever calling classify() — see mini_action_planner.py's own
+    "Pre-gate" docstring section."""
+
+    def test_plain_greeting_rejected(self):
+        self.assertFalse(mini_action_planner.looks_household_like("Привіт, як справи?"))
+
+    def test_explanatory_question_mentioning_a_product_rejected(self):
+        # The worked example from this module's own docstring — must NOT
+        # match on the bare product noun "молоко" alone.
+        self.assertFalse(mini_action_planner.looks_household_like(
+            "Поясни, чому молоко згортається в каві?",
+        ))
+
+    def test_coding_question_rejected(self):
+        self.assertFalse(mini_action_planner.looks_household_like(
+            "Як написати функцію сортування списку на Python?",
+        ))
+
+    def test_history_question_rejected(self):
+        self.assertFalse(mini_action_planner.looks_household_like(
+            "Розкажи коротко історію Київської Русі.",
+        ))
+
+    def test_general_cooking_explanation_rejected(self):
+        self.assertFalse(mini_action_planner.looks_household_like(
+            "Чому тісто для хліба довго підходить?",
+        ))
+
+    def test_ambiguous_treba_without_household_context_is_an_accepted_false_positive(self):
+        # "треба" alone (a general "need to") is a deliberately broad
+        # high-recall signal — it also fires on non-shopping sentences like
+        # this one. That's an accepted tradeoff (see this module's own
+        # "Pre-gate" docstring): the cost is one extra classify() call that
+        # safely resolves to "unknown", never a wrong preview.
+        self.assertTrue(mini_action_planner.looks_household_like(
+            "Чому тісто для хліба треба довго місити?",
+        ))
+
+    def test_buying_intent_accepted(self):
+        self.assertTrue(mini_action_planner.looks_household_like("молока б докупити"))
+
+    def test_dinner_request_accepted(self):
+        self.assertTrue(mini_action_planner.looks_household_like("щось треба на вечерю"))
+
+    def test_quantity_pattern_accepted(self):
+        self.assertTrue(mini_action_planner.looks_household_like("500г сиру"))
+
+    def test_inventory_missing_word_accepted(self):
+        self.assertTrue(mini_action_planner.looks_household_like("сир закінчився"))
+
+    def test_ask_inventory_phrase_accepted(self):
+        self.assertTrue(mini_action_planner.looks_household_like("що є в холодильнику"))
+
+    def test_blank_text_rejected(self):
+        self.assertFalse(mini_action_planner.looks_household_like(""))
+
+    def test_non_string_rejected(self):
+        self.assertFalse(mini_action_planner.looks_household_like(None))
+
+
 if __name__ == "__main__":
     unittest.main()

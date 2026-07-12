@@ -3501,8 +3501,19 @@ def _try_mini_action_planner(chat_id, user_id, display_name, text):
     household_action) — without this, a bare "Видали все" or a household-
     action-shaped line ("Прибрати Чай — 1 шт.") this bot deliberately never
     sends to Gemini for would otherwise burn a real planner call first,
-    only to still land on the exact same controlled message afterward."""
+    only to still land on the exact same controlled message afterward.
+
+    Also defers to mini_action_planner.looks_household_like(text) — a
+    cheap, deterministic pre-gate (see that function's own docstring) that
+    keeps ordinary small-talk ("Привіт, як справи?", "Поясни, чому молоко
+    згортається в каві?") down to the ONE Gemini call general_ai_fallback
+    already makes, instead of burning a second, wasted classify() call on a
+    message this planner was never going to recognize as one of its five
+    actions anyway."""
     if _looks_like_destructive_bulk_household_request(text) or _looks_like_unrouted_household_action(text):
+        return False
+
+    if not mini_action_planner.looks_household_like(text):
         return False
 
     result = mini_action_planner.classify(text)

@@ -68,7 +68,7 @@ class TestAddToShopping(MiniActionPlannerWebhookTestCase):
             "items": [{"name": "Молоко", "quantity_text": "1 л"}],
         }):
             with patch.object(bot, "apply_global_household_operations") as mock_apply:
-                _call_webhook(_make_update(991701001, chat_id, "щось нестандартне про молоко"))
+                _call_webhook(_make_update(991701001, chat_id, "треба докупити молока"))
         mock_apply.assert_not_called()
         self.assertIn(chat_id, pending_global_household)
         entry = pending_global_household[chat_id]
@@ -85,7 +85,7 @@ class TestAddToShopping(MiniActionPlannerWebhookTestCase):
             "action": "add_to_shopping",
             "items": [{"name": "Молоко", "quantity_text": "1 л"}],
         }):
-            _call_webhook(_make_update(991702001, chat_id, "щось нестандартне про молоко"))
+            _call_webhook(_make_update(991702001, chat_id, "треба докупити молока"))
         with patch.object(bot, "apply_global_household_operations") as mock_apply:
             mock_apply.return_value = {
                 "shopping_added": 1, "inventory_added": 0, "inventory_updated": 0,
@@ -103,7 +103,7 @@ class TestAddToShopping(MiniActionPlannerWebhookTestCase):
             "action": "add_to_shopping",
             "items": [{"name": "Молоко", "quantity_text": "1 л"}],
         }):
-            _call_webhook(_make_update(991703001, chat_id, "щось нестандартне про молоко"))
+            _call_webhook(_make_update(991703001, chat_id, "треба докупити молока"))
         with patch.object(bot, "apply_global_household_operations") as mock_apply:
             _call_webhook(_make_update(991703002, chat_id, "❌ Скасувати"))
         mock_apply.assert_not_called()
@@ -129,7 +129,7 @@ class TestAddToInventory(MiniActionPlannerWebhookTestCase):
         }):
             with patch.object(bot, "get_inventory_items", return_value=[]):
                 with patch.object(bot, "apply_global_household_operations") as mock_apply:
-                    _call_webhook(_make_update(991711001, chat_id, "щось нестандартне про сир"))
+                    _call_webhook(_make_update(991711001, chat_id, "треба докупити сиру"))
         mock_apply.assert_not_called()
         self.assertIn(chat_id, pending_global_household)
         entry = pending_global_household[chat_id]
@@ -180,21 +180,40 @@ class TestMealIdeas(MiniActionPlannerWebhookTestCase):
 
 class TestUnknownFallsBackToGeneralAi(MiniActionPlannerWebhookTestCase):
     def test_unknown_action_falls_through_to_general_ai(self):
+        # Household-like enough to pass the pre-gate (so classify()'s own
+        # mocked "unknown" result is what's actually exercised here) but
+        # genuinely ambiguous — a realistic case for Gemini itself to
+        # classify as "unknown".
         chat_id = 991741
-        with patch.object(mini_action_planner, "classify", return_value={"action": "unknown", "items": []}):
+        text = "треба щось на вечерю, ще не знаю що саме"
+        with patch.object(mini_action_planner, "classify", return_value={"action": "unknown", "items": []}) as mock_classify:
             with patch.object(bot, "call_gemini", return_value="Звичайна відповідь.") as mock_gemini:
-                _call_webhook(_make_update(991741001, chat_id, "Яка сьогодні погода?"))
+                _call_webhook(_make_update(991741001, chat_id, text))
+        mock_classify.assert_called_once()
         mock_gemini.assert_called_once()
         self.assertNotIn(chat_id, pending_global_household)
         self.assertTrue(any("Звичайна відповідь." == t for t in self._sent_texts()))
 
+    def test_ungated_text_never_reaches_classify(self):
+        chat_id = 991743
+        with patch.object(mini_action_planner, "classify") as mock_classify:
+            with patch.object(bot, "call_gemini", return_value="Звичайна відповідь.") as mock_gemini:
+                _call_webhook(_make_update(991743001, chat_id, "Яка сьогодні погода?"))
+        mock_classify.assert_not_called()
+        mock_gemini.assert_called_once()
+
     def test_invalid_gemini_json_falls_back_safely(self):
         # No mocking of classify() itself here — call_gemini returns
-        # unparseable text for BOTH the planner call and (if reached) the
-        # general-chat call, exercising the real end-to-end fallback path.
+        # unparseable text for BOTH the planner call and the general-chat
+        # call, exercising the real end-to-end fallback path. Text is
+        # household-like enough to pass the pre-gate on purpose, and
+        # deliberately avoids household_read's OWN (broader, pre-existing)
+        # topic gate — "закінч"/"холодильник" aren't in it, unlike "купити"/
+        # "запас"/"вдома" — so exactly 2 calls happen (planner + general
+        # chat), not a 3rd from household_read's own classifier.
         chat_id = 991742
         with patch.object(bot, "call_gemini", return_value="це геть не json") as mock_gemini:
-            _call_webhook(_make_update(991742001, chat_id, "щось геть незрозуміле і дивне"))
+            _call_webhook(_make_update(991742001, chat_id, "закінчився сир, не пам'ятаю що робити"))
         self.assertEqual(mock_gemini.call_count, 2)
         self.assertNotIn(chat_id, pending_global_household)
         self.assertTrue(any("це геть не json" == t for t in self._sent_texts()))
@@ -225,6 +244,47 @@ class TestDeterministicRouteWinsOverPlanner(MiniActionPlannerWebhookTestCase):
             mock_classify.assert_not_called()
         finally:
             pending_global_household.pop(chat_id, None)
+
+
+class TestPreGateWebhookLevel(MiniActionPlannerWebhookTestCase):
+    """The four exact cases from the Mini Action Planner pre-gate work
+    order — webhook-level, real (unmocked) looks_household_like."""
+
+    def test_greeting_does_not_call_planner_reaches_general_ai(self):
+        chat_id = 991761
+        with patch.object(mini_action_planner, "classify") as mock_classify:
+            with patch.object(bot, "call_gemini", return_value="Привіт! Усе добре.") as mock_gemini:
+                _call_webhook(_make_update(991761001, chat_id, "Привіт, як справи?"))
+        mock_classify.assert_not_called()
+        mock_gemini.assert_called_once()
+        self.assertTrue(any("Привіт! Усе добре." == t for t in self._sent_texts()))
+
+    def test_explanatory_product_question_does_not_call_planner(self):
+        chat_id = 991762
+        with patch.object(mini_action_planner, "classify") as mock_classify:
+            with patch.object(bot, "call_gemini", return_value="Бо це білок казеїн.") as mock_gemini:
+                _call_webhook(_make_update(991762001, chat_id, "Поясни, чому молоко згортається в каві?"))
+        mock_classify.assert_not_called()
+        mock_gemini.assert_called_once()
+
+    def test_buying_intent_calls_planner(self):
+        chat_id = 991763
+        with patch.object(mini_action_planner, "classify", return_value={
+            "action": "add_to_shopping", "items": [{"name": "Молоко", "quantity_text": ""}],
+        }) as mock_classify:
+            _call_webhook(_make_update(991763001, chat_id, "молока б докупити"))
+        mock_classify.assert_called_once()
+        self.assertIn(chat_id, pending_global_household)
+
+    def test_dinner_request_calls_planner_and_routes_to_meal_ideas(self):
+        chat_id = 991764
+        items = [{"name": "Яйця", "quantity_value": Decimal("6"), "quantity_unit": "шт.", "quantity_text": "6 шт."}]
+        with patch.object(mini_action_planner, "classify", return_value={"action": "meal_ideas", "items": []}) as mock_classify:
+            with patch.object(bot, "get_inventory_items", return_value=items):
+                with patch.object(bot, "call_gemini", return_value="🍽️ Ідеї з того, що є вдома:\n\n1. Омлет"):
+                    _call_webhook(_make_update(991764001, chat_id, "щось треба на вечерю"))
+        mock_classify.assert_called_once()
+        self.assertTrue(any("Омлет" in t for t in self._sent_texts()))
 
 
 if __name__ == "__main__":
