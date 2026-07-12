@@ -716,7 +716,23 @@ def parse_text_correction(text):
     if m:
         old = _strip_trailing_punct(m.group("old"))
         new = _strip_trailing_punct(m.group("new"))
-        return {"old": old, "new": new} if old and new else None
+        if not old or not new:
+            return None
+        # Pending Preview Edit Planner V2 — a combined correction message
+        # ("Х не A, а Х B, і ціна за Y не N, а M") has TWO independent "не
+        # ..., а ..." clauses; since `new` above is lazy but still anchored
+        # to end-of-string, it greedily swallows the SECOND clause whole
+        # instead of stopping after the first one (e.g. new ends up
+        # "дочці, і ціна за комод не 527, а 528" instead of just "дочці").
+        # Rather than trying to teach this deterministic regex to safely
+        # split multiple independent corrections apart, detect that it
+        # happened (the swallowed `new` itself contains another full
+        # contrast clause) and decline entirely — the caller then falls
+        # through to the semantic AI planner, which DOES support multiple
+        # patches in one message and applies each to its own correct target.
+        if _CONTRAST_CORRECTION_RE.search(new):
+            return None
+        return {"old": old, "new": new}
 
     return None
 

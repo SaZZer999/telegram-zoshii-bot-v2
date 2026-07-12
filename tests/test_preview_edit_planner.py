@@ -1,14 +1,23 @@
-"""Pending Preview Edit Planner V1 — the semantic LAST-RESORT fallback tried
+"""Pending Preview Edit Planner — the semantic LAST-RESORT fallback tried
 only after every deterministic preview-edit handler (quantity/rename
 parser, text correction, price clarification) has already failed to
-recognize the user's correction text. Fixes the live bug where a genuine
-Ukrainian case/wording difference ("для сестри" [genitive] in the pending
-expense description vs "сестрі" [dative] in the user's correction) defeats
-deterministic substring matching entirely, even though a person instantly
-sees both refer to the same gift/recipient.
+recognize the user's correction text.
 
-Two layers of coverage, same posture as tests/test_price_clarification.py
-and tests/test_text_correction.py:
+V1 fixed the live bug where a genuine Ukrainian case/wording difference
+("для сестри" [genitive] in the pending expense description vs "сестрі"
+[dative] in the user's correction) defeats deterministic substring
+matching entirely, but only ever supported ONE rename patch per message
+and had no way to touch an expense's amount at all.
+
+V2 (this file) extends that to a LIST of patches per correction message
+(so one message can rename one expense AND fix another expense's amount
+together), and adds two new operations: update_expense_amount and
+update_expense_context_note — fixing the second live bug, where "Я
+згадала, що комод коштував оригінальна ціна 628, а ми купили його за
+528." was rejected outright, since V1's own prompt explicitly forbade any
+operation from ever touching an amount.
+
+Two layers of coverage, same posture as tests/test_price_clarification.py:
   - Pure unit tests for preview_edit_planner.plan_preview_edit itself, no
     webhook, no bot.py involved — only preview_edit_planner.configure()'d
     with a tiny stub module.
@@ -60,7 +69,7 @@ def _call_webhook(update):
 
 
 def _gift_expense_preview_genitive():
-    """The EXACT live bug shape: pending expense description uses the
+    """The EXACT V1 live bug shape: pending expense description uses the
     genitive "для сестри", while the user's correction below names the
     dative "сестрі" — no substring match exists between them at all, so
     every deterministic handler must fail before the planner ever runs."""
@@ -91,6 +100,49 @@ def _two_gifts_preview():
                 "amount": Decimal("40.00"), "currency": "PLN", "category": "Інше",
                 "category_was_defaulted": True, "description": "Подарунок для мами",
                 "expense_date": date(2026, 7, 12),
+            },
+        ],
+        "new_expense": None, "delete_expense": None,
+        "household_id": 1, "user_db_id": 10, "origin": "global",
+    }
+
+
+def _komod_expense_preview():
+    """The EXACT V2 live bug shape: a pending "Комод" expense with an
+    explicit original-vs-paid context_note, both of which need their
+    numbers updated together by a single correction message."""
+    return {
+        "add_shopping_items": [], "add_inventory_items": [], "consume_changes": [],
+        "inventory_targets": [],
+        "new_expenses": [{
+            "amount": Decimal("527.00"), "currency": "PLN", "category": "Меблі",
+            "category_was_defaulted": True, "description": "Комод",
+            "expense_date": date(2026, 7, 12),
+            "context_note": "Оригінальна ціна 627 zł, куплено за 527 zł",
+        }],
+        "new_expense": None, "delete_expense": None,
+        "household_id": 1, "user_db_id": 10, "origin": "global",
+    }
+
+
+def _gift_and_komod_preview():
+    """The exact combined-correction live shape: two independent pending
+    expenses, "Подарунок сестрі" and "Комод" — a single correction message
+    can target both at once with two unrelated patches."""
+    return {
+        "add_shopping_items": [], "add_inventory_items": [], "consume_changes": [],
+        "inventory_targets": [],
+        "new_expenses": [
+            {
+                "amount": Decimal("60.00"), "currency": "PLN", "category": "Інше",
+                "category_was_defaulted": True, "description": "Подарунок сестрі",
+                "expense_date": date(2026, 7, 12),
+            },
+            {
+                "amount": Decimal("527.00"), "currency": "PLN", "category": "Меблі",
+                "category_was_defaulted": True, "description": "Комод",
+                "expense_date": date(2026, 7, 12),
+                "context_note": "Оригінальна ціна 627 zł, куплено за 527 zł",
             },
         ],
         "new_expense": None, "delete_expense": None,
@@ -159,75 +211,187 @@ class PlanPreviewEditUnitTestCase(unittest.TestCase):
         preview_edit_planner.configure(bot)
 
     def test_case_mismatch_renames_expense_description(self):
-        stub = _StubBot('{"operation": "rename_expense_description", "index": 0, "new_value": "Подарунок дочці"}')
+        stub = _StubBot(
+            '{"patches": [{"operation": "rename_expense_description", "target_id": "exp_1", '
+            '"new_value": "Подарунок дочці"}]}'
+        )
         preview_edit_planner.configure(stub)
         result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "не сестрі, а дочці")
-        self.assertEqual(result, {"operation": "rename_expense_description", "index": 0, "new_value": "Подарунок дочці"})
+        self.assertEqual(result, {
+            "status": "patches",
+            "patches": [{"operation": "rename_expense_description", "list_key": "new_expenses", "index": 0, "new_value": "Подарунок дочці"}],
+        })
 
-    def test_markdown_fenced_json_is_accepted(self):
-        stub = _StubBot('```json\n{"operation": "no_change"}\n```')
+    def test_amount_and_context_note_patches_together(self):
+        stub = _StubBot(
+            '{"patches": ['
+            '{"operation": "update_expense_amount", "target_id": "exp_1", "new_amount": "528"},'
+            '{"operation": "update_expense_context_note", "target_id": "exp_1", '
+            '"new_context_note": "Оригінальна ціна 628 zł, куплено за 528 zł"}'
+            ']}'
+        )
         preview_edit_planner.configure(stub)
-        result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "щось геть інше")
-        self.assertEqual(result, {"operation": "no_change"})
+        result = preview_edit_planner.plan_preview_edit(
+            _komod_expense_preview(),
+            "Я згадала, що комод коштував оригінальна ціна 628, а ми купили його за 528.",
+        )
+        self.assertEqual(result["status"], "patches")
+        self.assertEqual(len(result["patches"]), 2)
+        amounts = {p["operation"]: p for p in result["patches"]}
+        self.assertEqual(amounts["update_expense_amount"]["new_amount"], Decimal("528.00"))
+        self.assertEqual(amounts["update_expense_amount"]["index"], 0)
+        self.assertEqual(
+            amounts["update_expense_context_note"]["new_context_note"],
+            "Оригінальна ціна 628 zł, куплено за 528 zł",
+        )
+
+    def test_combined_rename_and_amount_patches_on_different_targets(self):
+        stub = _StubBot(
+            '{"patches": ['
+            '{"operation": "rename_expense_description", "target_id": "exp_1", "new_value": "Подарунок дочці"},'
+            '{"operation": "update_expense_amount", "target_id": "exp_2", "new_amount": "528"}'
+            ']}'
+        )
+        preview_edit_planner.configure(stub)
+        result = preview_edit_planner.plan_preview_edit(
+            _gift_and_komod_preview(),
+            "Подарунок має бути не сестрі, а дочці, і ціна за комод не 527, а 528.",
+        )
+        self.assertEqual(result["status"], "patches")
+        by_op = {p["operation"]: p for p in result["patches"]}
+        self.assertEqual(by_op["rename_expense_description"]["index"], 0)
+        self.assertEqual(by_op["rename_expense_description"]["new_value"], "Подарунок дочці")
+        self.assertEqual(by_op["update_expense_amount"]["index"], 1)
+        self.assertEqual(by_op["update_expense_amount"]["new_amount"], Decimal("528.00"))
+
+    def test_amount_not_present_in_text_falls_back_to_clarification(self):
+        stub = _StubBot(
+            '{"patches": [{"operation": "update_expense_amount", "target_id": "exp_1", "new_amount": "999"}]}'
+        )
+        preview_edit_planner.configure(stub)
+        result = preview_edit_planner.plan_preview_edit(_komod_expense_preview(), "зроби комод дешевшим")
+        self.assertEqual(result["status"], "ask_clarification")
+
+    def test_non_positive_amount_falls_back_to_clarification(self):
+        stub = _StubBot(
+            '{"patches": [{"operation": "update_expense_amount", "target_id": "exp_1", "new_amount": "0"}]}'
+        )
+        preview_edit_planner.configure(stub)
+        result = preview_edit_planner.plan_preview_edit(_komod_expense_preview(), "постав 0 zł за комод")
+        self.assertEqual(result["status"], "ask_clarification")
+
+    def test_one_invalid_patch_discards_the_whole_batch(self):
+        # rename is perfectly valid, but the amount patch's new_amount
+        # ("999") never appears in the user's text — the ENTIRE batch is
+        # discarded (see module docstring's "safer/simpler" choice), so the
+        # otherwise-valid rename is never silently half-applied either.
+        stub = _StubBot(
+            '{"patches": ['
+            '{"operation": "rename_expense_description", "target_id": "exp_1", "new_value": "Подарунок дочці"},'
+            '{"operation": "update_expense_amount", "target_id": "exp_2", "new_amount": "999"}'
+            ']}'
+        )
+        preview_edit_planner.configure(stub)
+        result = preview_edit_planner.plan_preview_edit(
+            _gift_and_komod_preview(), "не сестрі, а дочці, і зроби комод дешевшим",
+        )
+        self.assertEqual(result["status"], "ask_clarification")
 
     def test_ask_clarification_passthrough(self):
-        stub = _StubBot('{"operation": "ask_clarification", "question": "Яку саме витрату виправити?"}')
+        stub = _StubBot('{"patches": [{"operation": "ask_clarification", "question": "Яку саме витрату виправити?"}]}')
         preview_edit_planner.configure(stub)
         result = preview_edit_planner.plan_preview_edit(_two_gifts_preview(), "не сестрі, а дочці")
-        self.assertEqual(result, {"operation": "ask_clarification", "question": "Яку саме витрату виправити?"})
+        self.assertEqual(result, {"status": "ask_clarification", "question": "Яку саме витрату виправити?"})
+
+    def test_ask_clarification_wins_even_mixed_with_a_real_patch(self):
+        stub = _StubBot(
+            '{"patches": ['
+            '{"operation": "rename_expense_description", "target_id": "exp_1", "new_value": "Х"},'
+            '{"operation": "ask_clarification", "question": "Який саме подарунок?"}'
+            ']}'
+        )
+        preview_edit_planner.configure(stub)
+        result = preview_edit_planner.plan_preview_edit(_two_gifts_preview(), "не сестрі, а дочці")
+        self.assertEqual(result, {"status": "ask_clarification", "question": "Який саме подарунок?"})
 
     def test_blank_ask_clarification_question_falls_back(self):
-        stub = _StubBot('{"operation": "ask_clarification", "question": "   "}')
+        stub = _StubBot('{"patches": [{"operation": "ask_clarification", "question": "   "}]}')
         preview_edit_planner.configure(stub)
         result = preview_edit_planner.plan_preview_edit(_two_gifts_preview(), "не сестрі, а дочці")
-        self.assertEqual(result, {"operation": "no_change"})
+        self.assertEqual(result, {"status": "no_change"})
 
-    def test_out_of_range_index_falls_back(self):
-        stub = _StubBot('{"operation": "rename_expense_description", "index": 5, "new_value": "Х"}')
+    def test_out_of_range_target_id_falls_back(self):
+        stub = _StubBot('{"patches": [{"operation": "rename_expense_description", "target_id": "exp_5", "new_value": "Х"}]}')
         preview_edit_planner.configure(stub)
         result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "не сестрі, а дочці")
-        self.assertEqual(result, {"operation": "no_change"})
+        self.assertEqual(result, {"status": "ask_clarification", "question": preview_edit_planner._GENERIC_CLARIFY_QUESTION})
+
+    def test_target_id_wrong_list_falls_back(self):
+        # exp_1 is a real id, but naming it in a rename_shopping_item patch
+        # (the wrong operation for that list) must never be trusted.
+        stub = _StubBot('{"patches": [{"operation": "rename_shopping_item", "target_id": "exp_1", "new_value": "Х"}]}')
+        preview_edit_planner.configure(stub)
+        result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "щось")
+        self.assertEqual(result["status"], "ask_clarification")
 
     def test_unknown_operation_falls_back(self):
-        stub = _StubBot('{"operation": "change_amount", "index": 0, "new_value": "999"}')
+        stub = _StubBot('{"patches": [{"operation": "change_amount", "target_id": "exp_1", "new_value": "999"}]}')
         preview_edit_planner.configure(stub)
         result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "зроби 999 zł")
-        self.assertEqual(result, {"operation": "no_change"})
+        self.assertEqual(result, {"status": "no_change"})
 
     def test_malformed_json_falls_back(self):
         stub = _StubBot('це не json')
         preview_edit_planner.configure(stub)
         result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "не сестрі, а дочці")
-        self.assertEqual(result, {"operation": "no_change"})
+        self.assertEqual(result, {"status": "no_change"})
+
+    def test_markdown_fenced_json_is_accepted(self):
+        stub = _StubBot('```json\n{"patches": [{"operation": "no_change"}]}\n```')
+        preview_edit_planner.configure(stub)
+        result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "щось геть інше")
+        self.assertEqual(result, {"status": "no_change"})
 
     def test_gemini_exception_falls_back(self):
         stub = _StubBot(raise_exc=RuntimeError("network down"))
         preview_edit_planner.configure(stub)
         result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "не сестрі, а дочці")
-        self.assertEqual(result, {"operation": "no_change"})
+        self.assertEqual(result, {"status": "no_change"})
 
     def test_empty_gemini_response_falls_back(self):
         stub = _StubBot(None)
         preview_edit_planner.configure(stub)
         result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "не сестрі, а дочці")
-        self.assertEqual(result, {"operation": "no_change"})
+        self.assertEqual(result, {"status": "no_change"})
 
     def test_blank_user_text_never_calls_gemini(self):
-        stub = _StubBot('{"operation": "no_change"}')
+        stub = _StubBot('{"patches": [{"operation": "no_change"}]}')
         preview_edit_planner.configure(stub)
         result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "   ")
-        self.assertEqual(result, {"operation": "no_change"})
+        self.assertEqual(result, {"status": "no_change"})
         self.assertEqual(stub.calls, 0)
 
-    def test_no_field_for_amount_change_exists_in_schema(self):
-        # There is no operation whose applied patch could ever touch amount/
-        # quantity/unit/date/category — an "amount" key on a rename patch is
-        # simply ignored by the caller (bot.py only ever reads index/new_value).
-        stub = _StubBot('{"operation": "rename_expense_description", "index": 0, "new_value": "Дешевше", "amount": "1.00"}')
+    def test_nothing_patchable_never_calls_gemini(self):
+        stub = _StubBot('{"patches": [{"operation": "no_change"}]}')
         preview_edit_planner.configure(stub)
-        result = preview_edit_planner.plan_preview_edit(_gift_expense_preview_genitive(), "зроби дешевше")
-        self.assertEqual(result, {"operation": "rename_expense_description", "index": 0, "new_value": "Дешевше"})
-        self.assertNotIn("amount", result)
+        empty_pending = {
+            "add_shopping_items": [], "add_inventory_items": [], "new_expenses": [],
+        }
+        result = preview_edit_planner.plan_preview_edit(empty_pending, "щось геть інше")
+        self.assertEqual(result, {"status": "no_change"})
+        self.assertEqual(stub.calls, 0)
+
+    def test_currency_field_from_gemini_is_never_accepted(self):
+        # There is no field in the validated patch for currency at all —
+        # even if Gemini's raw response includes one, it's simply dropped.
+        stub = _StubBot(
+            '{"patches": [{"operation": "update_expense_amount", "target_id": "exp_1", '
+            '"new_amount": "528", "currency": "EUR"}]}'
+        )
+        preview_edit_planner.configure(stub)
+        result = preview_edit_planner.plan_preview_edit(_komod_expense_preview(), "комод коштував 528")
+        self.assertEqual(result["status"], "patches")
+        self.assertNotIn("currency", result["patches"][0])
 
 
 # =========================
@@ -251,104 +415,101 @@ class PreviewEditPlannerWebhookTestCase(unittest.TestCase):
         return [call.args[1] for call in self.mock_send.call_args_list]
 
 
-# 1 — full live phrase, case mismatch, resolved via the AI planner.
-class TestFullLivePhraseResolvesViaPlanner(PreviewEditPlannerWebhookTestCase):
-    def test_full_phrase_corrects_gift_recipient_despite_case_mismatch(self):
-        chat_id = 997101
-        pending_global_household[chat_id] = _gift_expense_preview_genitive()
+# 1 — the exact Komod live bug: amount + context note updated together.
+class TestKomodAmountAndNoteCorrection(PreviewEditPlannerWebhookTestCase):
+    def test_amount_and_context_note_both_update(self):
+        chat_id = 997201
+        pending_global_household[chat_id] = _komod_expense_preview()
         self.mock_call_gemini.return_value = (
-            '{"operation": "rename_expense_description", "index": 0, "new_value": "Подарунок дочці"}'
+            '{"patches": ['
+            '{"operation": "update_expense_amount", "target_id": "exp_1", "new_amount": "528"},'
+            '{"operation": "update_expense_context_note", "target_id": "exp_1", '
+            '"new_context_note": "Оригінальна ціна 628 zł, куплено за 528 zł"}'
+            ']}'
         )
         with patch.object(bot, "apply_global_household_operations") as mock_apply:
             _call_webhook(_make_update(
-                997101001, chat_id, "Там має бути подарунок не сестрі, а подарунок дочці.",
+                997201001, chat_id,
+                "Я згадала, що комод коштував оригінальна ціна 628, а ми купили його за 528.",
             ))
         mock_apply.assert_not_called()
         data = pending_global_household[chat_id]
-        self.assertEqual(data["new_expenses"][0]["description"], "Подарунок дочці")
-        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("60.00"))
-        self.mock_call_gemini.assert_called_once()
+        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("528.00"))
+        self.assertEqual(data["new_expenses"][0]["context_note"], "Оригінальна ціна 628 zł, куплено за 528 zł")
+        texts = self._sent_texts()
+        self.assertTrue(any("528" in t and "Комод" in t for t in texts))
 
 
-# 2 — short contrast phrase, same case-mismatch bug, same resolution.
-class TestShortPhraseResolvesViaPlanner(PreviewEditPlannerWebhookTestCase):
-    def test_short_contrast_phrase_corrects_gift_recipient(self):
-        chat_id = 997102
-        pending_global_household[chat_id] = _gift_expense_preview_genitive()
+# 2/5 — combined correction in one message applies both patches; repeated
+# single-purpose corrections across two messages also both land before
+# confirmation.
+class TestCombinedAndSequentialCorrections(PreviewEditPlannerWebhookTestCase):
+    def test_combined_correction_applies_both_patches(self):
+        chat_id = 997202
+        pending_global_household[chat_id] = _gift_and_komod_preview()
         self.mock_call_gemini.return_value = (
-            '{"operation": "rename_expense_description", "index": 0, "new_value": "Подарунок дочці"}'
+            '{"patches": ['
+            '{"operation": "rename_expense_description", "target_id": "exp_1", "new_value": "Подарунок дочці"},'
+            '{"operation": "update_expense_amount", "target_id": "exp_2", "new_amount": "528"}'
+            ']}'
         )
-        _call_webhook(_make_update(997102001, chat_id, "не сестрі, а дочці"))
+        _call_webhook(_make_update(
+            997202001, chat_id,
+            "Подарунок має бути не сестрі, а дочці, і ціна за комод не 527, а 528.",
+        ))
         data = pending_global_household[chat_id]
         self.assertEqual(data["new_expenses"][0]["description"], "Подарунок дочці")
-        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("60.00"))
+        self.assertEqual(data["new_expenses"][1]["amount"], Decimal("528.00"))
+        self.assertEqual(data["new_expenses"][1]["description"], "Комод")
+
+    def test_sequential_single_purpose_corrections_both_land(self):
+        chat_id = 997205
+        pending_global_household[chat_id] = _gift_and_komod_preview()
+
+        self.mock_call_gemini.return_value = (
+            '{"patches": [{"operation": "rename_expense_description", "target_id": "exp_1", "new_value": "Подарунок дочці"}]}'
+        )
+        _call_webhook(_make_update(997205001, chat_id, "не сестрі, а дочці"))
+
+        self.mock_call_gemini.return_value = (
+            '{"patches": [{"operation": "update_expense_amount", "target_id": "exp_2", "new_amount": "528"}]}'
+        )
+        _call_webhook(_make_update(997205002, chat_id, "комод не 527, а 528"))
+
+        data = pending_global_household[chat_id]
+        self.assertEqual(data["new_expenses"][0]["description"], "Подарунок дочці")
+        self.assertEqual(data["new_expenses"][1]["amount"], Decimal("528.00"))
 
 
-# 3 — two plausible expense targets -> the planner itself asks for
-# clarification (distinct from the deterministic substring-ambiguity path,
-# which never even fires here since "сестри"/"мами" don't share a fragment).
-class TestPlannerAsksClarificationOnAmbiguousTarget(PreviewEditPlannerWebhookTestCase):
-    def test_two_plausible_gifts_ask_which_one(self):
-        chat_id = 997103
-        pending_global_household[chat_id] = _two_gifts_preview()
+# 3 — amount patch names a number never present in the user's text.
+class TestAmountNotInTextIsRejected(PreviewEditPlannerWebhookTestCase):
+    def test_invented_amount_is_never_applied(self):
+        chat_id = 997203
+        pending_global_household[chat_id] = _komod_expense_preview()
+        original = dict(pending_global_household[chat_id]["new_expenses"][0])
+        self.mock_call_gemini.return_value = (
+            '{"patches": [{"operation": "update_expense_amount", "target_id": "exp_1", "new_amount": "999"}]}'
+        )
+        _call_webhook(_make_update(997203001, chat_id, "зроби комод трохи дешевшим"))
+        self.assertEqual(pending_global_household[chat_id]["new_expenses"][0], original)
+
+
+# 4 — amount patch's target itself is ambiguous between two expenses;
+# Gemini asks for clarification instead of guessing.
+class TestAmbiguousAmountTargetAsksClarification(PreviewEditPlannerWebhookTestCase):
+    def test_two_plausible_expenses_ask_which_one(self):
+        chat_id = 997204
+        pending_global_household[chat_id] = _gift_and_komod_preview()
         original = [dict(ne) for ne in pending_global_household[chat_id]["new_expenses"]]
         self.mock_call_gemini.return_value = (
-            '{"operation": "ask_clarification", "question": "У плані два подарунки — який саме виправити?"}'
+            '{"patches": [{"operation": "ask_clarification", "question": "У плані дві витрати — яку саме змінити на 528 zł?"}]}'
         )
-        _call_webhook(_make_update(997103001, chat_id, "виправ подарунок, там інший отримувач"))
+        _call_webhook(_make_update(997204001, chat_id, "зроби 528 zł"))
         self.assertEqual(pending_global_household[chat_id]["new_expenses"], original)
-        self.assertTrue(any("який саме виправити" in t for t in self._sent_texts()))
+        self.assertTrue(any("яку саме змінити" in t for t in self._sent_texts()))
 
 
-# 4 — Gemini tries to smuggle an amount change; the schema has no such
-# field, so only the rename actually applies and the amount never moves.
-class TestAmountChangeIsNeverApplied(PreviewEditPlannerWebhookTestCase):
-    def test_amount_field_in_gemini_response_is_ignored(self):
-        chat_id = 997104
-        pending_global_household[chat_id] = _gift_expense_preview_genitive()
-        self.mock_call_gemini.return_value = (
-            '{"operation": "rename_expense_description", "index": 0, '
-            '"new_value": "Подарунок дочці", "amount": "999.00"}'
-        )
-        _call_webhook(_make_update(997104001, chat_id, "не сестрі, а дочці, і зроби 999 zł"))
-        data = pending_global_household[chat_id]
-        self.assertEqual(data["new_expenses"][0]["description"], "Подарунок дочці")
-        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("60.00"))
-
-    def test_unrecognized_operation_name_never_mutates_pending(self):
-        chat_id = 997105
-        pending_global_household[chat_id] = _gift_expense_preview_genitive()
-        original = dict(pending_global_household[chat_id]["new_expenses"][0])
-        self.mock_call_gemini.return_value = '{"operation": "change_amount", "new_amount": "999.00"}'
-        _call_webhook(_make_update(997105001, chat_id, "зроби 999 zł"))
-        self.assertEqual(pending_global_household[chat_id]["new_expenses"][0], original)
-        self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
-
-
-# 5/6 — existing deterministic flows never reach the planner at all.
-class TestExistingDeterministicFlowsNeverCallGemini(PreviewEditPlannerWebhookTestCase):
-    def test_quantity_edit_still_works_without_gemini(self):
-        chat_id = 997106
-        pending_global_household[chat_id] = _milk_and_cheese_shopping_preview()
-        _call_webhook(_make_update(997106001, chat_id, "молока 1 л, а сиру 500 г"))
-        data = pending_global_household[chat_id]
-        self.assertEqual(data["add_shopping_items"][0]["quantity_text"], "1 л")
-        self.assertEqual(data["add_shopping_items"][1]["quantity_text"], "500 г")
-        self.mock_call_gemini.assert_not_called()
-
-    def test_price_clarification_still_works_without_gemini(self):
-        chat_id = 997107
-        pending_global_household[chat_id] = _cookie_inventory_only_preview()
-        with patch.object(bot, "apply_global_household_operations") as mock_apply:
-            _call_webhook(_make_update(997107001, chat_id, "за пів кілограма 5 zl"))
-        mock_apply.assert_not_called()
-        data = pending_global_household[chat_id]
-        self.assertEqual(len(data["new_expenses"]), 1)
-        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("10.00"))
-        self.mock_call_gemini.assert_not_called()
-
-
-# 7/8 — confirm/cancel still behave correctly after an AI-planner edit.
+# 6/7 — confirm/cancel still behave correctly after AI-planner edits.
 class TestConfirmCancelAfterPlannerEdit(PreviewEditPlannerWebhookTestCase):
     @classmethod
     def setUpClass(cls):
@@ -359,48 +520,96 @@ class TestConfirmCancelAfterPlannerEdit(PreviewEditPlannerWebhookTestCase):
     def tearDownClass(cls):
         bot.StaleSnapshotError = cls._original_stale_error
 
-    def test_confirm_after_planner_edit_writes_corrected_description(self):
-        chat_id = 997108
-        pending_global_household[chat_id] = _gift_expense_preview_genitive()
+    def test_confirm_after_planner_edit_writes_corrected_values(self):
+        chat_id = 997206
+        pending_global_household[chat_id] = _komod_expense_preview()
         self.mock_call_gemini.return_value = (
-            '{"operation": "rename_expense_description", "index": 0, "new_value": "Подарунок дочці"}'
+            '{"patches": ['
+            '{"operation": "update_expense_amount", "target_id": "exp_1", "new_amount": "528"},'
+            '{"operation": "update_expense_context_note", "target_id": "exp_1", '
+            '"new_context_note": "Оригінальна ціна 628 zł, куплено за 528 zł"}'
+            ']}'
         )
-        _call_webhook(_make_update(997108001, chat_id, "не сестрі, а дочці"))
+        _call_webhook(_make_update(
+            997206001, chat_id,
+            "Я згадала, що комод коштував оригінальна ціна 628, а ми купили його за 528.",
+        ))
         with patch.object(bot, "apply_global_household_operations") as mock_apply:
             mock_apply.return_value = {
                 "shopping_added": 0, "inventory_added": 0, "inventory_updated": 0,
                 "inventory_removed": 0, "expense_added_id": 1, "expense_deleted": False,
             }
-            _call_webhook(_make_update(997108002, chat_id, "✅ Так, застосувати"))
+            _call_webhook(_make_update(997206002, chat_id, "✅ Так, застосувати"))
         mock_apply.assert_called_once()
         _, kwargs = mock_apply.call_args
-        self.assertEqual(kwargs["new_expenses"][0]["description"], "Подарунок дочці")
-        self.assertEqual(kwargs["new_expenses"][0]["amount"], Decimal("60.00"))
+        self.assertEqual(kwargs["new_expenses"][0]["amount"], Decimal("528.00"))
+        # context_note is presentation-only (see bot.py's confirm handler,
+        # which strips it before apply_global_household_operations — it has
+        # no column in the DB schema) — the corrected NOTE is only ever
+        # visible in the pending preview itself, already asserted above.
+        self.assertNotIn("context_note", kwargs["new_expenses"][0])
         self.assertNotIn(chat_id, pending_global_household)
 
     def test_cancel_after_planner_edit_writes_nothing(self):
-        chat_id = 997109
-        pending_global_household[chat_id] = _gift_expense_preview_genitive()
+        chat_id = 997207
+        pending_global_household[chat_id] = _komod_expense_preview()
         self.mock_call_gemini.return_value = (
-            '{"operation": "rename_expense_description", "index": 0, "new_value": "Подарунок дочці"}'
+            '{"patches": [{"operation": "update_expense_amount", "target_id": "exp_1", "new_amount": "528"}]}'
         )
-        _call_webhook(_make_update(997109001, chat_id, "не сестрі, а дочці"))
+        _call_webhook(_make_update(997207001, chat_id, "комод коштував 528"))
         with patch.object(bot, "apply_global_household_operations") as mock_apply:
-            _call_webhook(_make_update(997109002, chat_id, "❌ Скасувати"))
+            _call_webhook(_make_update(997207002, chat_id, "❌ Скасувати"))
             mock_apply.assert_not_called()
         self.assertNotIn(chat_id, pending_global_household)
         self.assertTrue(any("Зміни скасовано." in t for t in self._sent_texts()))
 
 
-# 9 — generic unrelated text during a pending preview still gets the guard
-# (planner safely resolves to no_change since call_gemini's response here
-# isn't configured to look like a real patch).
-class TestUnrelatedTextDuringPendingStillGuarded(PreviewEditPlannerWebhookTestCase):
-    def test_unrelated_question_still_shows_guard_message(self):
-        chat_id = 997110
+# 8 — existing V1 rename-only correction still works via the planner.
+class TestExistingRenameOnlyCorrectionStillWorks(PreviewEditPlannerWebhookTestCase):
+    def test_case_mismatch_rename_still_resolves(self):
+        chat_id = 997208
+        pending_global_household[chat_id] = _gift_expense_preview_genitive()
+        self.mock_call_gemini.return_value = (
+            '{"patches": [{"operation": "rename_expense_description", "target_id": "exp_1", "new_value": "Подарунок дочці"}]}'
+        )
+        _call_webhook(_make_update(997208001, chat_id, "не сестрі, а дочці"))
+        data = pending_global_household[chat_id]
+        self.assertEqual(data["new_expenses"][0]["description"], "Подарунок дочці")
+        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("60.00"))
+
+
+# 9/10 — existing deterministic flows never reach the planner at all.
+class TestExistingDeterministicFlowsNeverCallGemini(PreviewEditPlannerWebhookTestCase):
+    def test_price_clarification_still_works_without_gemini(self):
+        chat_id = 997209
+        pending_global_household[chat_id] = _cookie_inventory_only_preview()
+        with patch.object(bot, "apply_global_household_operations") as mock_apply:
+            _call_webhook(_make_update(997209001, chat_id, "за пів кілограма 5 zl"))
+        mock_apply.assert_not_called()
+        data = pending_global_household[chat_id]
+        self.assertEqual(len(data["new_expenses"]), 1)
+        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("10.00"))
+        self.mock_call_gemini.assert_not_called()
+
+    def test_quantity_edit_still_works_without_gemini(self):
+        chat_id = 997210
+        pending_global_household[chat_id] = _milk_and_cheese_shopping_preview()
+        _call_webhook(_make_update(997210001, chat_id, "молока 1 л, а сиру 500 г"))
+        data = pending_global_household[chat_id]
+        self.assertEqual(data["add_shopping_items"][0]["quantity_text"], "1 л")
+        self.assertEqual(data["add_shopping_items"][1]["quantity_text"], "500 г")
+        self.mock_call_gemini.assert_not_called()
+
+
+# 11 — generic unrelated text during a pending preview still doesn't mutate
+# it (planner safely resolves to no_change/ask_clarification since
+# call_gemini's response here isn't configured to look like a real patch).
+class TestUnrelatedTextDuringPendingNeverMutates(PreviewEditPlannerWebhookTestCase):
+    def test_unrelated_question_never_mutates_preview(self):
+        chat_id = 997211
         pending_global_household[chat_id] = _cookie_inventory_only_preview()
         original = dict(pending_global_household[chat_id])
-        _call_webhook(_make_update(997110001, chat_id, "Яка сьогодні погода?"))
+        _call_webhook(_make_update(997211001, chat_id, "Яка сьогодні погода?"))
         self.assertEqual(pending_global_household[chat_id], original)
         self.mock_call_gemini.assert_called_once()
         self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))

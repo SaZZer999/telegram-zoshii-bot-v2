@@ -4008,45 +4008,54 @@ def _try_apply_text_correction(chat_id, data, items, text):
 
 
 def _try_apply_preview_edit_planner(chat_id, data, text):
-    """Pending Preview Edit Planner V1 — the LAST-RESORT semantic fallback,
+    """Pending Preview Edit Planner — the LAST-RESORT semantic fallback,
     tried only after every deterministic preview-edit handler (quantity/
     rename parser, text correction, price clarification) has already
     failed to recognize `text`. Deterministic substring matching can't
-    bridge a genuine Ukrainian case/wording difference (e.g. the live bug
-    this fixes: pending description "Подарунок для сестри" [genitive] vs a
-    correction naming "сестрі" [dative] — no substring match at all, even
-    though a person instantly sees these are the same gift); Gemini can.
-    See preview_edit_planner.plan_preview_edit's own "never guessed"
-    contract for the full safety story — it never touches amount/quantity/
-    unit/date/category, only ever a name/description string, and only after
-    Python has independently bounds-checked the target index.
+    bridge a genuine Ukrainian case/wording difference (e.g. V1's live bug:
+    pending description "Подарунок для сестри" [genitive] vs a correction
+    naming "сестрі" [dative] — no substring match at all, even though a
+    person instantly sees these are the same gift); Gemini can. V2 adds
+    amount/context-note corrections (e.g. "оригінальна ціна 628, купили за
+    528" on a pending expense) and lets ONE correction message apply
+    several independent patches at once (e.g. a rename AND an amount fix
+    together). See preview_edit_planner.plan_preview_edit's own docstring
+    for the full safety story — every patch is independently bounds-
+    checked against the CURRENT pending state before Python ever applies
+    it, and a batch with any invalid patch is discarded whole (never
+    partially applied).
 
     Returns True if `text` was fully handled (an updated preview or a
     targeted clarification question was already sent) — False if the
-    planner found nothing to change ({"operation": "no_change"}), letting
-    the caller fall back to its own existing guard message exactly as if
-    this function had never run.
+    planner found nothing to change ({"status": "no_change"}), letting the
+    caller fall back to its own existing guard message exactly as if this
+    function had never run.
     """
     result = preview_edit_planner.plan_preview_edit(data, text)
-    operation = result["operation"]
+    status = result["status"]
 
-    if operation == "no_change":
+    if status == "no_change":
         return False
 
-    if operation == "ask_clarification":
+    if status == "ask_clarification":
         send_message(chat_id, result["question"], reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
         return True
 
-    index = result["index"]
-    new_value = result["new_value"]
-    if operation == "rename_expense_description":
-        data["new_expenses"][index]["description"] = new_value
-    elif operation == "rename_inventory_item":
-        data["add_inventory_items"][index]["name"] = new_value
-        data["add_inventory_items"][index]["canonical_name"] = canonicalize_name(new_value)
-    elif operation == "rename_shopping_item":
-        data["add_shopping_items"][index]["name"] = new_value
-        data["add_shopping_items"][index]["canonical_name"] = canonicalize_name(new_value)
+    for patch in result["patches"]:
+        operation = patch["operation"]
+        index = patch["index"]
+        if operation == "rename_expense_description":
+            data["new_expenses"][index]["description"] = patch["new_value"]
+        elif operation == "rename_inventory_item":
+            data["add_inventory_items"][index]["name"] = patch["new_value"]
+            data["add_inventory_items"][index]["canonical_name"] = canonicalize_name(patch["new_value"])
+        elif operation == "rename_shopping_item":
+            data["add_shopping_items"][index]["name"] = patch["new_value"]
+            data["add_shopping_items"][index]["canonical_name"] = canonicalize_name(patch["new_value"])
+        elif operation == "update_expense_amount":
+            data["new_expenses"][index]["amount"] = patch["new_amount"]
+        elif operation == "update_expense_context_note":
+            data["new_expenses"][index]["context_note"] = patch["new_context_note"]
 
     preview = household_router.format_preview(data, header="Оновив план:")
     send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
