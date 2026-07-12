@@ -173,7 +173,10 @@ class TestVoiceTranscriptReusesTextRoutes(VoiceWebhookTestCase):
                 with patch("os.remove"):
                     with patch.object(bot, "call_gemini", return_value="Бо це білок казеїн.") as mock_gemini:
                         _call_webhook(_make_voice_update(991313001, chat_id))
-        mock_gemini.assert_called_once()
+        # Unified Mini Action Planner V1 classifies first (falls back to
+        # "unknown" — this fixed string isn't valid JSON), then general
+        # AI-chat runs and answers with the same mocked text — 2 calls.
+        self.assertEqual(mock_gemini.call_count, 2)
         self.assertTrue(any("Бо це білок казеїн." == t for t in self._sent_texts()))
 
 

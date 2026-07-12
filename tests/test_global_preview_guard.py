@@ -159,7 +159,10 @@ class TestPendingGlobalHouseholdBlocksNewText(unittest.TestCase):
     def test_no_pending_preview_reaches_ai_chat_normally(self):
         chat_id = 991006
         _call_webhook(_make_update(991000006, chat_id, "Яка сьогодні погода?"))
-        self.mock_call_gemini.assert_called_once()
+        # Unified Mini Action Planner V1 classifies first (falls back to
+        # "unknown" for this mock), then general AI-chat runs — 2 calls is
+        # the expected shape now.
+        self.assertEqual(self.mock_call_gemini.call_count, 2)
         self.assertTrue(all(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG != t for t in self._sent_texts()))
 
 

@@ -351,6 +351,17 @@ class DispatcherDeps:
     # приготувати?", "Що зробити на вечерю?", ...). Optional for the same
     # reason as every other field above.
     meal_ideas: Callable = None
+    # Unified Mini Action Planner V1 — optional single nested callback (thin
+    # lambda-forward to bot.py's `_try_mini_action_planner`), tried LAST in
+    # Phase D — after cooking_mode, meal_ideas and household_read have all
+    # already had a chance and reported nothing to do — and BEFORE the
+    # general AI-chat fallback (see dispatch()'s own docstring). One extra
+    # Gemini classifier call, closed to five actions (add_to_shopping/
+    # add_to_inventory/ask_inventory/meal_ideas/unknown); "unknown" (or any
+    # validation failure) returns False so general_ai_fallback still runs
+    # exactly once, exactly as before this planner existed. Optional for
+    # the same reason as every other field above.
+    mini_action_planner: Callable = None
 
 
 def _dispatch_confirm_or_cancel(deps, chat_id, user_id, display_name, text):
@@ -804,8 +815,11 @@ def dispatch(deps, chat_id, user_id, display_name, text):
       else runs. Otherwise `deps.meal_ideas` (Meal Ideas V1, optional) is
       tried next; then `deps.household_read` (Household Read Context V1,
       optional) — see meal_ideas' own module-docstring entry above for why
-      meal_ideas now wins this order; if either handled the message,
-      general AI fallback never runs. Otherwise `deps.command_routes.
+      meal_ideas now wins this order; then `deps.mini_action_planner`
+      (Unified Mini Action Planner V1, optional) — the last attempt, one
+      closed-vocabulary Gemini classifier call, only reached once nothing
+      above claimed the message. If any of the three handled it, general AI
+      fallback never runs. Otherwise `deps.command_routes.
       general_ai_fallback` runs
       exactly once.
 
@@ -851,6 +865,16 @@ def dispatch(deps, chat_id, user_id, display_name, text):
         return RouteOutcome.HANDLED
 
     if deps.household_read is not None and deps.household_read(chat_id, user_id, display_name, text):
+        return RouteOutcome.HANDLED
+
+    # Unified Mini Action Planner V1 — the LAST attempt before general
+    # AI-chat: everything above (every deterministic route, cooking mode,
+    # meal_ideas' own gate, household_read's own gate+classifier) already
+    # had a chance and found nothing. Only "unknown" (or a validation
+    # failure the planner already collapsed to "unknown" itself) returns
+    # False here, so general_ai_fallback below still always runs exactly
+    # once either way.
+    if deps.mini_action_planner is not None and deps.mini_action_planner(chat_id, user_id, display_name, text):
         return RouteOutcome.HANDLED
 
     deps.command_routes.general_ai_fallback(chat_id, text)

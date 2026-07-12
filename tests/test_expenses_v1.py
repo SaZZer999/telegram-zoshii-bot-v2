@@ -279,7 +279,10 @@ class TestExpenseWebhookFlow(unittest.TestCase):
         with patch.object(bot, "_ask_gemini_expense_router") as mock_router:
             _call_webhook(_make_update(930000002, chat_id, "Яка сьогодні погода?"))
             mock_router.assert_not_called()
-        self.mock_call_gemini.assert_called_once()
+        # Unified Mini Action Planner V1 classifies first (call 1, falls
+        # back to "unknown" for this mock), then general AI-chat runs
+        # normally (call 2) — two calls is the expected, correct shape now.
+        self.assertEqual(self.mock_call_gemini.call_count, 2)
         self.assertNotIn(chat_id, bot.pending_expense)
 
     # Case 12

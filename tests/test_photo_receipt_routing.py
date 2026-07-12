@@ -415,7 +415,10 @@ class TestRegression(PhotoWebhookTestCase):
                 "update_id": 881041001,
                 "message": {"chat": {"id": chat_id}, "text": "Привіт!", "from": {"id": 555, "first_name": "Тест"}},
             })
-        mock_gemini.assert_called_once()
+        # Unified Mini Action Planner V1 classifies first (falls back to
+        # "unknown" — "Відповідь." isn't valid JSON), then general AI-chat
+        # runs and answers with the same mocked text — 2 calls.
+        self.assertEqual(mock_gemini.call_count, 2)
 
 
 if __name__ == "__main__":
