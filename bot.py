@@ -1565,6 +1565,14 @@ _NAME_SYNONYMS = {
     "smietana": "сметана",
     "śmietana": "сметана",
     "печення": "печиво",
+    "komod": "комод",
+    "komoda": "комод",
+    "комода": "комод",
+    "auto-carsel": "автокрісло",
+    "auto carsel": "автокрісло",
+    "auto car seat": "автокрісло",
+    "автокресло": "автокрісло",
+    "ліжечко": "дитяче ліжечко",
 }
 
 # Narrow, deterministic Latin/Cyrillic homoglyph whitelist — mirrors
@@ -3838,7 +3846,7 @@ def _apply_global_household_confirm(chat_id):
             consume_delete_ids=consume_delete_ids,
             inventory_targets=data["inventory_targets"],
             new_expenses=[
-                {k: v for k, v in ne.items() if k != "category_was_defaulted"}
+                {k: v for k, v in ne.items() if k not in ("category_was_defaulted", "assumption_note", "context_note")}
                 for ne in new_expenses
             ],
             delete_expense_id=delete_expense_data["expense_id"] if delete_expense_data else None,

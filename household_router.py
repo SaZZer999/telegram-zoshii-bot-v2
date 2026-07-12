@@ -113,27 +113,47 @@ _MISTAKE_EXPENSE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Purchase Event Planner V1 — a deterministic, Python-side safety net for
-# add_expense amounts (belt-and-suspenders alongside _amount_literally_in_
-# text and the prompt's own "ambiguous_expense" instruction below): if the
-# message mentions a discount/percentage anywhere, ANY add_expense operation
-# Gemini still returned for it is treated as ambiguous rather than validated
-# normally — see _validate_operations_detailed's `has_discount_marker`. This
-# never depends on Gemini actually following the prompt correctly: a stated
-# original price ("коштує 20 zł") often IS a literal number in the text (so
-# _amount_literally_in_text alone would let it through) even though it is
-# NOT what was actually paid once a discount applies.
+# Assumption-Based Purchase Preview V1 — a standalone message can describe a
+# purchase/price/discount/free-item WITHOUT an explicit "купив"-style verb
+# ("візочок коштував 3300, знижка 150", "автокрісло дісталось безкоштовно",
+# or a mixed/English "we bought a komod ... bought it for 527") — these
+# still need a real Gemini pass, not just messages phrased as an imperative
+# purchase. Deliberately high-recall, same reasoning as gate()'s other
+# patterns and mini_action_planner.looks_household_like's own pre-gate: a
+# false positive here only costs one harmless extra Gemini call that
+# resolves to intent="none".
+_PRICE_CONTEXT_RE = re.compile(
+    r"коштув\w*|безкоштовно|знижк\w*|скидк\w*|bought|paid|\bcost\b",
+    re.IGNORECASE,
+)
+
+# Purchase Event Planner V1 — used ONLY for the "nothing else was produced
+# at all" fallback note near the end of _validate_operations_detailed (see
+# `has_discount_marker` there). It used to ALSO hard-block every add_expense
+# op in a message that merely mentioned a discount/percentage ANYWHERE, even
+# for unrelated items with their own clearly-stated final price — Assumption-
+# Based Purchase Preview V1 removed that blanket block (see rule 5 in its
+# work order: "do not hard-block the whole expense just because the word
+# discount/знижка exists"). The remaining, narrower defenses are: (1)
+# _amount_literally_in_text, still enforced on every add_expense amount —
+# but a failure there is now a non-blocking note (see the add_expense
+# branch), never a batch-wide "invalid"; (2) assumed_expense (below), the
+# type Gemini is now instructed to use INSTEAD of add_expense whenever a
+# flat original-price-minus-discount computation is actually needed — never
+# computed by Gemini, always recomputed here in Python from literal pieces.
 _DISCOUNT_MARKER_RE = re.compile(
     r"знижк\w*|знижен\w*|відсот\w*|скидк\w*|zniżk\w*|промо\w*|%",
     re.IGNORECASE,
 )
 
-# Safe Discount Calculation V1 — an explicit "this is the FINAL amount I
-# actually paid" signal overrides has_discount_marker's blanket block: a
-# discount mentioned elsewhere in the same message no longer makes a
-# directly-stated final amount ambiguous (see _validate_operations_
-# detailed's add_expense branch). Deliberately narrow verbs/adverbs, never
-# "coштує"/"було" alone (those still describe a PRICE, not a payment).
+# Referenced by tests documenting the Ukrainian phrasing this project treats
+# as an explicit "this is what I actually paid" signal (see expenses._parse_
+# expense_amount/add_expense's own description field and Assumption-Based
+# Purchase Preview V1's prompt guidance) — no longer used to gate anything
+# here in Python; the choice between add_expense (a clear final amount) and
+# assumed_expense (a computed one) is now Gemini's own classification call,
+# per rule 2 of that work order ("AI may suggest structured operations, but
+# Python validates amounts" — not which op type was the right one to use).
 _FINAL_AMOUNT_MARKER_RE = re.compile(
     r"заплатив\w*|оплатив\w*|сплатив\w*|фінальн\w*|фактично\s+сплач\w*|"
     r"загалом|у\s?підсумку|зрештою|вийшло",
@@ -162,6 +182,57 @@ def _parse_percent(raw_percent):
     if value <= 0 or value > 100:
         return None
     return value
+
+
+def _normalize_display_name(name):
+    """If `name`'s cleaned/lowercased form is EXACTLY a known product
+    synonym key in _bot._NAME_SYNONYMS (e.g. "komod"->"комод", "auto
+    carsel"->"автокрісло", "печення"->"печиво") — return the canonical form,
+    capitalized for display; a name that ISN'T a synonym key is returned
+    completely unchanged (never guessed/rewritten). Only used for expense
+    descriptions (add_expense/assumed_expense) — unlike add_shopping/
+    add_inventory item names, a plain expense description never otherwise
+    goes through canonicalize_name/_NAME_SYNONYMS at all, so "we bought a
+    komod for 527" would otherwise show "komod" verbatim in the preview."""
+    if not isinstance(name, str) or not name.strip():
+        return name
+    base = _bot._repair_mixed_script(_bot._clean_unicode_whitespace(name)).strip().lower()
+    synonym = _bot._NAME_SYNONYMS.get(base)
+    if synonym is None:
+        return name
+    return _bot.inventory.capitalize_first(synonym)
+
+
+def _clean_context_note(raw_note):
+    """Cosmetic-only, Gemini-authored context for a plain add_expense entry
+    (e.g. "Оригінальна ціна 650 zł, куплено за 570 zł") — no amount here is
+    ever trusted/parsed/used for anything beyond display, since the actual
+    expense amount was already independently validated as its own literal
+    number (see add_expense's own `amount` field). Whitespace-collapsed and
+    length-capped; None (not "") when missing/blank, so callers can use a
+    simple truthiness check."""
+    if not isinstance(raw_note, str):
+        return None
+    cleaned = re.sub(r"\s+", " ", raw_note).strip()
+    return cleaned[:200] or None
+
+
+def _format_assumption_note(original_price, discount_text, final_amount):
+    """Assumption-Based Purchase Preview V1's per-item note for an
+    assumed_expense entry (e.g. "Припущення: 3300 zł − 150 zł = 3150 zł.
+    Якщо 3300 zł уже була фінальна ціна, зміни перед підтвердженням.") —
+    always built HERE from the already-Python-computed final_amount, never
+    from anything Gemini might have written itself (the whole point of
+    assumed_expense is that Python, not Gemini, owns the arithmetic — see
+    the op's own validation). `discount_text` is a pre-formatted display
+    string for the subtracted piece — either an amount ("150,00 zł") or a
+    percent ("50%"), decided by the caller."""
+    original_display = expenses._format_expense_amount(original_price)
+    final_display = expenses._format_expense_amount(final_amount)
+    return (
+        f"Припущення: {original_display} − {discount_text} = {final_display}. "
+        f"Якщо {original_display} уже була фінальна ціна, зміни перед підтвердженням."
+    )
 
 
 def _format_discount_calculation_note(unit_price, discount_percent, basis_unit, discounted_unit_price, multiplier, final_amount):
@@ -197,7 +268,11 @@ def gate(text):
     is open. Narrow on purpose: a plain zł-tagged amount or an imperative
     "видали/скасуй витрату" never matches here (those stay on the existing
     narrow expense gates), so this router only ever gets a first look at
-    messages the legacy gates don't already own.
+    messages the legacy gates don't already own. _PRICE_CONTEXT_RE (see its
+    own comment) additionally covers a purchase/price/discount/free-item
+    STORY with no imperative buy verb at all (Assumption-Based Purchase
+    Preview V1) — e.g. "коштувало 650, знайшли за 570", "дісталось
+    безкоштовно", or English "we bought it for 527".
     """
     if not isinstance(text, str):
         return False
@@ -209,6 +284,7 @@ def gate(text):
         or _BOUGHT_RE.search(stripped)
         or _CONSUME_RE.search(stripped)
         or _MISTAKE_EXPENSE_RE.search(stripped)
+        or _PRICE_CONTEXT_RE.search(stripped)
     )
 
 
@@ -217,7 +293,7 @@ def gate(text):
 # =========================
 _ALLOWED_OP_TYPES = {
     "add_shopping", "add_inventory", "consume_inventory", "add_expense", "delete_expense", "ambiguous_expense",
-    "discount_expense",
+    "discount_expense", "assumed_expense",
 }
 
 HOUSEHOLD_ROUTER_PROMPT = (
@@ -230,6 +306,11 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "позначити покупку купленою, видалити товар зі списку покупок чи запасів, відредагувати товар, "
     "домашні назви (aliases), рецепти, чеки/фото, довільні звіти — для всього цього завжди повертай «none»)\n\n"
     "Дозволені типи операцій (поле operations — масив, може містити кілька елементів одного повідомлення):\n"
+    "Повідомлення часто описує КІЛЬКА окремих покупок одразу (напр. купили візочок, ліжечко, комод і подарунок "
+    "в одному повідомленні) — обробляй КОЖНУ покупку НЕЗАЛЕЖНО: якщо сума для одного товару чітка, а для "
+    "іншого неоднозначна — все одно додай чітку операцію (add_expense/discount_expense/assumed_expense) для "
+    "першого товару, а для другого просто додай ambiguous_expense; неоднозначність одного товару НІКОЛИ не "
+    "заважає іншим товарам у тому самому повідомленні.\n"
     "1. «add_shopping» — новий товар, який людина ЩЕ ТІЛЬКИ планує купити (напр. «Планую купити булочку», "
     "«Треба купити молоко»). Поля: name, quantity_text (як у тексті, або порожній рядок якщо кількість не "
     "вказана), category — одна з фіксованих категорій нижче.\n"
@@ -281,13 +362,24 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "округлюй і не вигадуй суму, якої немає в тексті), currency (завжди «PLN»), category — одна з фіксованих "
     "категорій витрат нижче (якщо не впевнений — «Інше»), description (короткий опис без суми й категорії "
     "всередині), expense_date (YYYY-MM-DD; якщо дата не вказана явно — сьогоднішня дата з наданого "
-    "контексту; ніколи не в майбутньому). Повідомлення може описувати КІЛЬКА окремих покупок із сумою "
+    "контексту; ніколи не в майбутньому), необов'язкове context_note (короткий інформативний коментар без "
+    "жодних сум для обчислення, напр. «Оригінальна/сайтова ціна 650 zł, куплено за 570 zł» — лише контекст, "
+    "НІКОЛИ не сума, яку треба порахувати). Повідомлення може описувати КІЛЬКА окремих покупок із сумою "
     "(напр. «Купив молоко за 8 zł. Купив хліб за 5 zł») — тоді додай по ОДНІЙ операції add_expense на кожну "
     "таку покупку, у тому самому порядку, як вони згадані в тексті; ніколи не підсумовуй кілька сум в одну "
-    "операцію. Якщо користувач явно каже, що якесь число — це ОСТАТОЧНА/ФАКТИЧНО СПЛАЧЕНА сума (слова "
-    "«заплатив», «оплатив», «сплатив», «фінально», «загалом», «зрештою», «вийшло») — це ЗАВЖДИ add_expense з "
-    "тим числом, НАВІТЬ якщо десь у тому самому повідомленні згадана знижка чи первісна ціна; використай "
-    "число як є, ніколи нічого не перераховуй.\n"
+    "операцію. Якщо та сама сума повторюється двічі поспіль для ОДНІЄЇ покупки (напр. «60 за 60», «60 for "
+    "60») — це ОДНА сума 60, а не дві окремі покупки чи подвоєна сума.\n"
+    "Якщо користувач явно каже, що якесь число — це ОСТАТОЧНА/ФАКТИЧНО СПЛАЧЕНА сума (слова «заплатив», "
+    "«оплатив», «сплатив», «фінально», «загалом», «зрештою», «вийшло», «paid», «bought it for», «bought for», "
+    "«found it for», англ. «for») — це ЗАВЖДИ add_expense з тим числом, НАВІТЬ якщо десь у тому самому "
+    "повідомленні згадана знижка чи первісна/сайтова ціна; використай число як є, ніколи нічого не "
+    "перераховуй. Якщо разом з фінальною сумою згадана й оригінальна/сайтова ціна («на сайті коштувало 650, "
+    "але знайшли за 570» / «cost 627, but we bought it for 527») — постав фінальну суму (570/527) в amount, "
+    "а оригінальну ціну опиши в context_note, БЕЗ будь-якого обчислення.\n"
+    "Якщо людина каже, що отримала товар БЕЗКОШТОВНО / нічого не заплатила («дісталось безкоштовно», «didn't "
+    "pay anything for this») — НІКОЛИ не додавай жодної операції з сумою (ні add_expense, ні "
+    "ambiguous_expense, ні assumed_expense) для цього товару: лише add_inventory/add_shopping для самого "
+    "товару, без жодної згадки суми.\n"
     "6. «delete_expense» — людина каже, що ВИПАДКОВО чи ПОМИЛКОВО додала витрату і хоче її прибрати (напр. "
     "«Булочку до витрат я додав випадково», «Помилково записав ту витрату»). Повертай це ЛИШЕ якщо рівно "
     "ОДНА позиція з наданого списку останніх витрат явно відповідає опису; якщо жодна або кілька можуть "
@@ -295,24 +387,34 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "Поле: selected_numbers — масив з РІВНО одним номером зі списку останніх витрат. Максимум одна операція "
     "delete_expense на повідомлення.\n"
     "7. «ambiguous_expense» — повідомлення згадує ціну/суму покупки, але її НЕ можна безпечно перетворити на "
-    "add_expense чи discount_expense: РАЗОМ зі знижкою/відсотком (напр. «коштувало 20, але знижка 50%», "
-    "«−30%», «акція») БЕЗ вказаної кількості, за яку ця ціна (не «за кілограм»/«за штуку»/«за 1 л»), "
-    "оригінальну/довідкову ціну без явно сплаченої суми, або будь-яку суму, яку довелося б обчислювати іншим "
-    "способом. НІКОЛИ не обчислюй і не вигадуй остаточну суму в такому випадку. Замість add_expense додай "
+    "add_expense, discount_expense чи assumed_expense: коли НЕЯСНО, до якого товару чи якої частини "
+    "повідомлення сума взагалі відноситься, коли жодне число з тексту не можна безпечно вважати ні "
+    "оригінальною ціною, ні знижкою, ні фінальною сумою, або коли є кілька можливих трактувань і жодне не "
+    "переважає. НІКОЛИ не обчислюй і не вигадуй остаточну суму в такому випадку. Замість add_expense додай "
     "ОДНУ операцію {\"type\": \"ambiguous_expense\", \"note\": \"...\"}, де note — КОРОТКЕ УТОЧНЮЮЧЕ "
     "ЗАПИТАННЯ українською, що перелічує можливі варіанти суми (напр. «20 zł — це ціна за 1 кг, за 0,5 кг чи "
-    "фінальна сума?»), а не просто констатація неоднозначності. add_expense дозволено лише коли в тексті є "
-    "ОДНЕ явне число, яке користувач написав як фактично СПЛАЧЕНУ суму, без жодних знижок/відсотків поруч "
-    "(або з явним словом «заплатив»/«фінально» — див. тип 5 вище).\n"
-    "8. «discount_expense» — БЕЗПЕЧНИЙ розрахунок ціни зі знижкою: використовуй ЛИШЕ коли в тексті ЯВНО і "
-    "ОДНОЗНАЧНО є ВСІ три частини разом: (а) ціна за одиницю товару, (б) ЗА ЯКУ САМЕ кількість ця ціна («за "
-    "кілограм», «за 1 л», «за штуку» — якщо в тексті просто «за кілограм»/«за штуку» без числа, це означає "
-    "«1 кг»/«1 шт.»), (в) відсоток знижки. Поля: unit_price (рядок, ціна ДО знижки, як у тексті), "
-    "unit_price_basis (рядок, кількість+одиниця, ЗАВЖДИ цифрами — «1 кг», «1 л», «1 шт.» — ніколи словом), "
-    "discount_percent (рядок, число відсотка без знака %, як у тексті), currency (завжди «PLN»). Python сам "
-    "порахує остаточну суму (ціна за одиницю − знижка, помножена на куплену кількість того самого товару) — "
-    "ти НІКОЛИ не вказуєш готову суму тут, лише ці три явні частини. Якщо БУДЬ-ЯКА з трьох частин не зовсім "
-    "явна чи відсутня — НЕ використовуй discount_expense, використай тип 7 (ambiguous_expense) замість цього.\n\n"
+    "фінальна сума?»), а не просто констатація неоднозначності.\n"
+    "8. «discount_expense» — БЕЗПЕЧНИЙ розрахунок ЦІНИ ЗА ОДИНИЦЮ (на кг/л/шт.) зі знижкою, коли товар "
+    "куплено певною КІЛЬКІСТЮ: використовуй ЛИШЕ коли в тексті ЯВНО і ОДНОЗНАЧНО є ВСІ три частини разом: "
+    "(а) ціна за одиницю товару, (б) ЗА ЯКУ САМЕ кількість ця ціна («за кілограм», «за 1 л», «за штуку» — "
+    "якщо в тексті просто «за кілограм»/«за штуку» без числа, це означає «1 кг»/«1 шт.»), (в) відсоток "
+    "знижки. Поля: unit_price (рядок, ціна ДО знижки, як у тексті), unit_price_basis (рядок, кількість+"
+    "одиниця, ЗАВЖДИ цифрами — «1 кг», «1 л», «1 шт.» — ніколи словом), discount_percent (рядок, число "
+    "відсотка без знака %, як у тексті), currency (завжди «PLN»). Python сам порахує остаточну суму (ціна за "
+    "одиницю − знижка, помножена на куплену кількість того самого товару) — ти НІКОЛИ не вказуєш готову суму "
+    "тут, лише ці три явні частини.\n"
+    "9. «assumed_expense» — БЕЗПЕЧНЕ ПРИПУЩЕННЯ: товар куплено ЗА ОДНУ покупку (не по вазі/об'єму), відома "
+    "ЯВНА оригінальна ціна і ЯВНА знижка (сумою або відсотком), АЛЕ немає слова про фактично сплачену/"
+    "фінальну суму (див. тип 5) — напр. «Ми купили візочок за 3300 злотих, але нам зробили знижку 150 "
+    "злотих» (немає «заплатили»/«вийшло», лише оригінальна ціна і знижка). Поля: description (назва товару), "
+    "original_price (рядок, ціна ДО знижки, як у тексті), і ОДНЕ з: discount_amount (рядок, сума знижки в "
+    "злотих, як у тексті) або discount_percent (рядок, відсоток знижки без знака %), currency (завжди "
+    "«PLN»). Python сам порахує original_price − discount_amount (або original_price × (100−відсоток)/100) і "
+    "покаже це як ПРИПУЩЕННЯ з поясненням та попередженням — ти НІКОЛИ не вказуєш готову суму тут.\n"
+    "Різниця між discount_expense (8) і assumed_expense (9): 8 — коли ціна за ОДИНИЦЮ виміру (кг/л/шт.) і "
+    "товар мають окрему кількість для множення; 9 — коли ціна й знижка стосуються ОДНІЄЇ конкретної покупки "
+    "цілком (напр. один візочок), без множення на кількість. Якщо жодна з трьох частин (оригінальна ціна, "
+    "знижка, кількість/одиниця) не зовсім явна — використай тип 7 (ambiguous_expense) замість 8 чи 9.\n\n"
     "Категорії товарів (для add_shopping/add_inventory): М'ясо та риба, Молочне та яйця, Овочі та зелень, "
     "Фрукти та ягоди, Хліб і випічка, Крупи, макарони та борошно, Соуси, спеції та бакалія, Солодке та "
     "снеки, Напої, Заморожене, Інше їстівне.\n"
@@ -357,6 +459,42 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "\"household_operations\", \"operations\": ["
     "{\"type\": \"add_expense\", \"amount\": \"10\", \"currency\": \"PLN\", \"category\": \"Продукти\", "
     "\"description\": \"Печиво\", \"expense_date\": \"2026-07-12\"}"
+    "], \"unresolved_fragments\": []}\n"
+    "Приклад assumed_expense (для «Ми купили візочок для дитини за 3300 злотих, але нам зробили знижку 150 "
+    "злотих.» — оригінальна ціна і знижка є, але немає слова «заплатили»/«вийшло»): {\"intent\": "
+    "\"household_operations\", \"operations\": ["
+    "{\"type\": \"assumed_expense\", \"description\": \"Візочок для дитини\", \"original_price\": \"3300\", "
+    "\"discount_amount\": \"150\", \"currency\": \"PLN\"}"
+    "], \"unresolved_fragments\": []}\n"
+    "Приклад final-amount override з контекстом (для «Ми купили дитяче ліжечко, яке на сайті коштувало 650, "
+    "але ми знайшли його за 570.» — «знайшли за 570» це фактично сплачена сума, 650 — лише контекст): "
+    "{\"intent\": \"household_operations\", \"operations\": ["
+    "{\"type\": \"add_expense\", \"amount\": \"570\", \"currency\": \"PLN\", \"category\": \"Дім і рахунки\", "
+    "\"description\": \"Дитяче ліжечко\", \"expense_date\": \"2026-07-12\", "
+    "\"context_note\": \"Оригінальна/сайтова ціна 650 zł, куплено за 570 zł\"}"
+    "], \"unresolved_fragments\": []}\n"
+    "Приклад безкоштовного товару (для «У нас також є автокрісло, але за нього ми нічого не заплатили.» — "
+    "БЕЗ жодної суми, лише товар): {\"intent\": \"household_operations\", \"operations\": ["
+    "{\"type\": \"add_inventory\", \"name\": \"Автокрісло\", \"quantity_text\": \"1\", \"category\": "
+    "\"Інше їстівне\"}"
+    "], \"unresolved_fragments\": []}\n"
+    "Приклад багатьох незалежних покупок в одному повідомленні (для «Ми купили візочок для дитини за 3300 "
+    "злотих, але нам зробили знижку 150 злотих. Також купили дитяче ліжечко, яке на сайті коштувало 650, але "
+    "ми знайшли його за 570. Купили комод, який коштував 627, але купили за 527. Ще є автокрісло, за яке ми "
+    "нічого не заплатили. Ще купила подарунок для її сестри за 60, щоб подякувати за автокрісло.» — КОЖНА "
+    "покупка обробляється незалежно своїм типом): {\"intent\": \"household_operations\", \"operations\": ["
+    "{\"type\": \"assumed_expense\", \"description\": \"Візочок для дитини\", \"original_price\": \"3300\", "
+    "\"discount_amount\": \"150\", \"currency\": \"PLN\"}, "
+    "{\"type\": \"add_expense\", \"amount\": \"570\", \"currency\": \"PLN\", \"category\": \"Дім і рахунки\", "
+    "\"description\": \"Дитяче ліжечко\", \"expense_date\": \"2026-07-12\", "
+    "\"context_note\": \"Оригінальна/сайтова ціна 650 zł, куплено за 570 zł\"}, "
+    "{\"type\": \"add_expense\", \"amount\": \"527\", \"currency\": \"PLN\", \"category\": \"Дім і рахунки\", "
+    "\"description\": \"Комод\", \"expense_date\": \"2026-07-12\", "
+    "\"context_note\": \"Оригінальна ціна 627 zł, куплено за 527 zł\"}, "
+    "{\"type\": \"add_inventory\", \"name\": \"Автокрісло\", \"quantity_text\": \"1\", \"category\": "
+    "\"Інше їстівне\"}, "
+    "{\"type\": \"add_expense\", \"amount\": \"60\", \"currency\": \"PLN\", \"category\": \"Інше\", "
+    "\"description\": \"Подарунок сестрі\", \"expense_date\": \"2026-07-12\"}"
     "], \"unresolved_fragments\": []}"
 )
 
@@ -1019,58 +1157,104 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             })
 
         elif op_type == "add_expense":
-            if has_discount_marker and not has_final_amount_marker:
-                # Purchase Event Planner V1 — see has_discount_marker's own
-                # comment above: a discount/percentage anywhere in the
-                # message means this op's amount is never trustworthy
-                # (an original/list price, not what was actually paid), so
-                # it becomes a non-blocking clarification note instead of
-                # either a blocking "invalid" reason or a silently-invented
-                # expense — Gemini's own proposed amount (if any) is quoted
-                # back so the user can tell it apart from unrelated notes.
-                # Skipped entirely when has_final_amount_marker is also true
-                # (Safe Discount Calculation V1, example C) — an explicit
-                # "заплатив"/"фінально"/... signal means THIS number is a
-                # real final amount regardless of a discount mentioned
-                # elsewhere; it still goes through the normal amount-
-                # literal check below, just not this blanket redirect.
-                proposed_amount = op.get("amount")
-                if isinstance(proposed_amount, str) and proposed_amount.strip():
-                    expense_notes.append(
-                        f"У повідомленні є знижка — сума ({proposed_amount.strip()} zł?) може бути "
-                        "неточною. Напиши точну сплачену суму, якщо хочеш додати цю витрату."
-                    )
-                else:
-                    expense_notes.append(
-                        "У повідомленні є знижка — сума покупки неоднозначна. Напиши точну сплачену "
-                        "суму, якщо хочеш додати цю витрату."
-                    )
-                continue
+            # Assumption-Based Purchase Preview V1: every failure below is a
+            # non-blocking note attached to THIS item alone (never reasons,
+            # which would block the entire batch — including every OTHER
+            # item's perfectly fine expense/inventory add in the same multi-
+            # item message; see the work order's rule 5/6). The amount-
+            # literal check is still fully enforced — a note, not silence,
+            # is what replaces a fabricated/mismatched amount now.
+            description = _normalize_display_name(expenses._clean_expense_description(op.get("description"))) or "Покупка"
             currency = op.get("currency")
             if currency not in (None, "PLN"):
-                reasons.append("Не можу безпечно визначити валюту витрати.")
+                expense_notes.append(f"«{description}» — не можу безпечно визначити валюту витрати.")
                 continue
             amount = expenses._parse_expense_amount(op.get("amount"))
             if amount is None:
-                reasons.append("Не можу безпечно визначити суму витрати.")
+                expense_notes.append(
+                    f"«{description}» — не можу безпечно визначити суму витрати. Напиши точну сплачену "
+                    "суму, якщо хочеш додати цю витрату."
+                )
                 continue
             if not _amount_literally_in_text(amount, source_text):
                 # The amount doesn't appear anywhere in what the user
                 # actually typed — Gemini computed it (a discount applied to
                 # a stated price, a sum of several mentioned prices, ...)
                 # rather than reading it. Never silently invent a price.
-                reasons.append("Не можу безпечно визначити суму витрати без обчислень зі знижками чи сумами.")
+                expense_notes.append(
+                    f"«{description}» — сума неоднозначна ({expenses._format_expense_amount(amount)}?). "
+                    "Напиши точну сплачену суму, якщо хочеш додати цю витрату."
+                )
                 continue
             expense_date = expenses._validate_expense_date(op.get("expense_date"), now=now)
             if expense_date is None:
-                reasons.append("Не можу безпечно визначити дату витрати.")
+                expense_notes.append(f"«{description}» — не можу безпечно визначити дату витрати.")
                 continue
             category, category_was_defaulted = expenses._validate_expense_category(op.get("category"))
-            description = expenses._clean_expense_description(op.get("description"))
             new_expenses.append({
                 "amount": amount, "currency": "PLN", "category": category,
                 "category_was_defaulted": category_was_defaulted, "description": description,
-                "expense_date": expense_date,
+                "expense_date": expense_date, "context_note": _clean_context_note(op.get("context_note")),
+            })
+
+        elif op_type == "assumed_expense":
+            # Assumption-Based Purchase Preview V1 (see the prompt's type 9)
+            # — a flat original-price-minus-discount computation, used when
+            # the message states a price and a discount WITHOUT a clearer
+            # final-paid-amount phrasing (see add_expense above/the prompt's
+            # own "prefer a clear final amount" instruction — Gemini should
+            # use plain add_expense whenever wording is that clear). Every
+            # piece (original_price, discount_amount/discount_percent) must
+            # be a literal number the user actually typed; the SUBTRACTION
+            # ITSELF is always done here in Python, never trusted from
+            # Gemini — see _format_assumption_note's own docstring. Any
+            # missing/unparseable/non-literal piece becomes a non-blocking
+            # note, exactly like add_expense above, never a batch-wide block.
+            description = _normalize_display_name(expenses._clean_expense_description(op.get("description"))) or "Покупка"
+            original_price = expenses._parse_expense_amount(op.get("original_price"))
+            if original_price is None or not _amount_literally_in_text(original_price, source_text):
+                expense_notes.append(
+                    f"«{description}» — сума неоднозначна. Напиши точну сплачену суму, якщо хочеш додати "
+                    "цю витрату."
+                )
+                continue
+            discount_amount = None
+            if op.get("discount_amount") is not None:
+                discount_amount = expenses._parse_expense_amount(op.get("discount_amount"))
+            discount_percent = None
+            if op.get("discount_percent") is not None:
+                discount_percent = _parse_percent(op.get("discount_percent"))
+
+            final_amount = None
+            assumption_note = None
+            if (
+                discount_amount is not None and _amount_literally_in_text(discount_amount, source_text)
+                and discount_amount < original_price
+            ):
+                final_amount = (original_price - discount_amount).quantize(Decimal("0.01"))
+                assumption_note = _format_assumption_note(
+                    original_price, expenses._format_expense_amount(discount_amount), final_amount,
+                )
+            elif discount_percent is not None and _amount_literally_in_text(discount_percent, source_text):
+                final_amount = (
+                    original_price * (Decimal("100") - discount_percent) / Decimal("100")
+                ).quantize(Decimal("0.01"))
+                percent_display = _bot.format_quantity_display(discount_percent, None)
+                assumption_note = _format_assumption_note(original_price, f"{percent_display}%", final_amount)
+
+            if final_amount is None:
+                expense_notes.append(
+                    f"«{description}» — сума неоднозначна. Напиши точну сплачену суму, якщо хочеш додати "
+                    "цю витрату."
+                )
+                continue
+
+            expense_date = expenses._validate_expense_date(op.get("expense_date"), now=now) or now.date()
+            category, category_was_defaulted = expenses._validate_expense_category(op.get("category"))
+            new_expenses.append({
+                "amount": final_amount, "currency": "PLN", "category": category,
+                "category_was_defaulted": category_was_defaulted, "description": description,
+                "expense_date": expense_date, "assumption_note": assumption_note,
             })
 
         elif op_type == "discount_expense":
@@ -1328,6 +1512,21 @@ def _format_new_item_line(item):
     return f"• Додати {label}"
 
 
+def _expense_entry_note_lines(new_expense_entry):
+    """Assumption-Based Purchase Preview V1 — the per-item note (if any)
+    shown directly under ONE expense line, indented, never bulleted (so it
+    reads as a sub-note of the line above it, not a new list item). At most
+    ONE of "assumption_note" (a computed Припущення — see _format_
+    assumption_note) or "context_note" (Gemini's own free-text context on a
+    plain add_expense, e.g. an original-vs-paid comparison) is ever present
+    on a single entry; deliberately per-item rather than one bulk warning
+    footer, so multiple assumptions in the same multi-item preview stay
+    attached to the item they actually describe instead of reading as
+    generic, hard-to-place noise."""
+    note = new_expense_entry.get("assumption_note") or new_expense_entry.get("context_note")
+    return [f"  {note}"] if note else []
+
+
 def format_preview(payload, header="План змін:", extra_note=None):
     """`header` defaults to the original preview header; Preview Edit V2
     passes "Оновив план:" instead when re-rendering an edited
@@ -1415,11 +1614,13 @@ def format_preview(payload, header="План змін:", extra_note=None):
             desc = ne["description"] or ne["category"]
             lines.append(f"• Додати {desc} — {amount_display}")
             lines.append(f"• Категорія: {ne['category']}")
+            lines.extend(_expense_entry_note_lines(ne))
         else:
             for ne in new_expenses:
                 amount_display = expenses._format_expense_amount(ne["amount"])
                 desc = ne["description"] or ne["category"]
                 lines.append(f"• {desc} — {amount_display}")
+                lines.extend(_expense_entry_note_lines(ne))
         if delete_expense:
             lines.append(f"• Видалити {delete_expense['display']} — {delete_expense['amount_display']}")
 

@@ -235,10 +235,15 @@ class TestExplicitFinalAmountOverridesDiscountMarker(SafeDiscountCalculationWebh
         self.assertEqual(len(payload["new_expenses"]), 1)
         self.assertEqual(payload["new_expenses"][0]["amount"], Decimal("10.00"))
 
-    def test_without_final_amount_verb_discount_still_blocks_add_expense(self):
-        # Regression guard: a plain "20 zł" WITHOUT заплатив/фінально/... is
-        # still redirected to a note when a discount marker is present —
-        # has_final_amount_marker must never widen the block unintentionally.
+    def test_without_final_amount_verb_literal_add_expense_still_allowed(self):
+        # Superseded by Assumption-Based Purchase Preview V1: a plain
+        # "20 zł" WITHOUT заплатив/фінально/... is no longer blocked just
+        # because a discount marker is present elsewhere in the message —
+        # see household_router._DISCOUNT_MARKER_RE's updated docstring.
+        # Gemini is now expected to reach for assumed_expense/
+        # ambiguous_expense itself when a computation is actually needed
+        # (see TestSafeUnitPriceCalculation/TestAmbiguousDiscountAsksClarification
+        # above); a bare add_expense with a literal amount is trusted.
         chat_id = 992006
         self.mock_household_router.return_value = {
             "intent": "household_operations",
@@ -250,7 +255,8 @@ class TestExplicitFinalAmountOverridesDiscountMarker(SafeDiscountCalculationWebh
         }
         _call_webhook(_make_update(992006001, chat_id, TEXT_B_AMBIGUOUS))
         data = pending_global_household[chat_id]
-        self.assertEqual(data["new_expenses"], [])
+        self.assertEqual(len(data["new_expenses"]), 1)
+        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("20.00"))
 
 
 # =========================

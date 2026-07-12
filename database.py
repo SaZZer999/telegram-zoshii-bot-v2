@@ -42,6 +42,14 @@ _NAME_SYNONYMS = {
     "smietana": "сметана",
     "śmietana": "сметана",
     "печення": "печиво",
+    "komod": "комод",
+    "komoda": "комод",
+    "комода": "комод",
+    "auto-carsel": "автокрісло",
+    "auto carsel": "автокрісло",
+    "auto car seat": "автокрісло",
+    "автокресло": "автокрісло",
+    "ліжечко": "дитяче ліжечко",
 }
 
 # Narrow, deterministic Latin/Cyrillic homoglyph whitelist — only the classic

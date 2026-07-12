@@ -397,7 +397,10 @@ class TestTelegramTranscriptRegressions(MiniActionPlannerWebhookTestCase):
         self.assertEqual(pending["add_inventory_items"][0]["quantity_value"], 1)
         texts = self._sent_texts()
         self.assertTrue(any("Печиво" in t and "1 кг" in t for t in texts))
-        self.assertTrue(any("знижк" in t.lower() for t in texts))
+        # The fabricated "10" (not literally in the text — "20"/"50%" are)
+        # still becomes a non-blocking per-item note, not a real expense —
+        # see Assumption-Based Purchase Preview V1's add_expense branch.
+        self.assertTrue(any("сума неоднозначна" in t for t in texts))
 
 
 if __name__ == "__main__":

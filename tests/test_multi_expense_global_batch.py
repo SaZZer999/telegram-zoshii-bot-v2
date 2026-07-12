@@ -176,10 +176,14 @@ class TestMultiExpensePreview(_BaseWebhookTestCase):
         self.assertTrue(any("• Додати Молоко — 10,00 zł" in t for t in texts))
         self.assertTrue(any("• Категорія: Продукти" in t for t in texts))
 
-    # #4: an error anywhere in the batch (here: the third op, an add_expense
-    # with an unparsable amount) blocks the WHOLE preview — no partial
-    # pending state, no DB write.
-    def test_error_in_third_operation_blocks_entire_batch(self):
+    # #4: superseded by Assumption-Based Purchase Preview V1 (rule 5/6/7 —
+    # never hard-block the whole batch just because ONE item's amount is
+    # ambiguous). An error in the third op (an add_expense with an
+    # unparsable amount) now degrades to a non-blocking note attached to
+    # THAT item alone — the rest of the batch (Молоко + its valid 8 zł
+    # expense) still becomes a normal preview, awaiting the same confirm/
+    # cancel as always; still no DB write before confirm.
+    def test_error_in_third_operation_becomes_a_note_rest_of_batch_still_previewed(self):
         chat_id = 990003
         self.mock_household_router.return_value = {
             "intent": "household_operations",
@@ -194,10 +198,14 @@ class TestMultiExpensePreview(_BaseWebhookTestCase):
         }
         _call_webhook(_make_update(800000003, chat_id, "Купив молоко за 8 zł. Купив хліб за х zł."))
 
-        self.assertNotIn(chat_id, pending_global_household)
+        self.assertIn(chat_id, pending_global_household)
         self.mock_apply.assert_not_called()
+        data = pending_global_household[chat_id]
+        self.assertEqual(len(data["add_inventory_items"]), 1)
+        self.assertEqual(len(data["new_expenses"]), 1)
+        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("8.00"))
         texts = self._sent_texts()
-        self.assertTrue(any("Не зміг безпечно обробити" in t for t in texts))
+        self.assertTrue(any("Хліб" in t and "не можу безпечно визначити суму" in t for t in texts))
 
 
 class TestMultiExpenseConfirm(_BaseWebhookTestCase):

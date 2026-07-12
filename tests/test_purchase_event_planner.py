@@ -141,11 +141,20 @@ class TestCookieStory(PurchaseEventPlannerWebhookTestCase):
         self.assertTrue(any("Печиво" in t and "1 кг" in t for t in texts))
         self.assertTrue(any("знижк" in t.lower() for t in texts))
 
-    def test_python_side_guard_catches_add_expense_even_if_gemini_ignores_prompt(self):
-        # Gemini did NOT follow the "ambiguous_expense" instruction and
-        # emitted a plain add_expense with an amount that IS literally in
-        # the text ("20") — household_router's discount-marker guard must
-        # still redirect it to a non-blocking note, never a real expense.
+    def test_literal_add_expense_with_discount_marker_present_now_allowed(self):
+        # Superseded by Assumption-Based Purchase Preview V1 (see its work
+        # order's rule 5: "do not hard-block the whole expense just because
+        # the word discount/знижка exists") — a discount word ANYWHERE in
+        # the message no longer redirects every add_expense to a note by
+        # itself; Gemini is instead expected to use assumed_expense/
+        # ambiguous_expense for genuinely computed amounts (see
+        # tests/test_assumption_based_preview.py), while a plain add_expense
+        # with a literal amount is trusted like any other. The one Python-
+        # side guarantee that remains: an amount NOT literally typed by the
+        # user (i.e. genuinely fabricated) still never reaches new_expenses
+        # — see TestCookieStory's other test in this class, and
+        # test_computed_discount_amount_is_rejected in
+        # test_global_household_router.py.
         chat_id = 990102
         self.mock_household_router.return_value = {
             "intent": "household_operations",
@@ -162,8 +171,8 @@ class TestCookieStory(PurchaseEventPlannerWebhookTestCase):
         mock_apply.assert_not_called()
         self.assertIn(chat_id, pending_global_household)
         data = pending_global_household[chat_id]
-        self.assertEqual(data["new_expenses"], [])
-        self.assertIsNone(data["new_expense"])
+        self.assertEqual(len(data["new_expenses"]), 1)
+        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("20.00"))
         self.assertEqual(data["add_inventory_items"][0]["quantity_value"], 1)
 
 
