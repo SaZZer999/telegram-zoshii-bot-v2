@@ -93,6 +93,7 @@ import household_read_context
 import meal_ideas
 import preview_editing
 import voice_input
+import voice_transcript_normalizer
 import photo_receipts
 import mini_action_planner
 
@@ -5952,6 +5953,18 @@ def _handle_voice_message(chat_id, voice, user_id=None):
         send_message(chat_id, voice_input.TRANSCRIBE_FAILED_MSG)
         return None
 
+    # Voice Transcript Normalizer V1 — Whisper occasionally mixes English/
+    # Polish/Russian fragments into an otherwise-Ukrainian transcript even
+    # with the "uk" language hint already passed above; `transcript` is
+    # replaced with the normalized text (numbers/amounts verified unchanged
+    # — see voice_transcript_normalizer._numbers_preserved) BEFORE both the
+    # echo below and the value handed to message_dispatcher.dispatch(...),
+    # so the planner never sees the raw mixed-language fragments. Any
+    # failure/skip safely returns `transcript` itself unchanged.
+    normalized_transcript, was_normalized = voice_transcript_normalizer.normalize(transcript, language)
+    logger.info("voice_transcript_normalize: language=%s changed=%s", language, was_normalized)
+    transcript = normalized_transcript
+
     if voice_input.VOICE_SHOW_TRANSCRIPT:
         send_message(chat_id, f"🎙️ Розпізнав:\n«{transcript}»")
 
@@ -6280,6 +6293,10 @@ household_router.configure(
 # Wire mini_action_planner.py's dependency (only call_gemini) the same way —
 # it never imports bot.py either (see its module docstring).
 mini_action_planner.configure(sys.modules[__name__])
+
+# Wire voice_transcript_normalizer.py's dependency (only call_gemini) the
+# same way — it never imports bot.py either (see its module docstring).
+voice_transcript_normalizer.configure(sys.modules[__name__])
 
 
 if __name__ == "__main__":
