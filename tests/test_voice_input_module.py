@@ -110,6 +110,90 @@ class TestTranscribeAudioFile(unittest.TestCase):
         _, kwargs = mock_client.audio.transcriptions.create.call_args
         self.assertEqual(kwargs["language"], "uk")
 
+    # Language Settings V1 — the `language` kwarg (per-user selected
+    # language) is what actually reaches Groq, taking priority over the
+    # process-wide VOICE_LANGUAGE env default.
+    def test_language_param_overrides_env_var(self):
+        fake_response = MagicMock()
+        fake_response.text = "hello"
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = fake_response
+        with patch.object(voice_input, "VOICE_LANGUAGE", "en"):
+            with patch.object(voice_input, "Groq", return_value=mock_client):
+                voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test", language="pl")
+        _, kwargs = mock_client.audio.transcriptions.create.call_args
+        self.assertEqual(kwargs["language"], "pl")
+
+    def test_language_param_used_when_env_unset(self):
+        fake_response = MagicMock()
+        fake_response.text = "cześć"
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = fake_response
+        with patch.object(voice_input, "VOICE_LANGUAGE", None):
+            with patch.object(voice_input, "Groq", return_value=mock_client):
+                voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test", language="pl")
+        _, kwargs = mock_client.audio.transcriptions.create.call_args
+        self.assertEqual(kwargs["language"], "pl")
+
+    # If Groq rejects/fails the language-hinted request, transcribe_audio_file
+    # retries ONCE with no language hint (auto-detect) before giving up — a
+    # rejected language code must never surface as a silent/uncaught failure.
+    def test_failed_language_hinted_request_retries_once_without_language(self):
+        fake_response = MagicMock()
+        fake_response.text = "auto-detected text"
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = [
+            RuntimeError("groq 400: invalid language code"),
+            fake_response,
+        ]
+        with patch.object(voice_input, "Groq", return_value=mock_client):
+            result = voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test", language="uk")
+        self.assertEqual(result, "auto-detected text")
+        self.assertEqual(mock_client.audio.transcriptions.create.call_count, 2)
+        first_kwargs = mock_client.audio.transcriptions.create.call_args_list[0].kwargs
+        second_kwargs = mock_client.audio.transcriptions.create.call_args_list[1].kwargs
+        self.assertEqual(first_kwargs["language"], "uk")
+        self.assertNotIn("language", second_kwargs)
+
+    # If BOTH the language-hinted attempt and the auto-detect retry fail,
+    # the existing controlled TRANSCRIBE_FAILED_MSG is still raised —
+    # exactly the same failure contract as before Language Settings V1.
+    def test_language_hinted_request_final_failure_after_retry_raises_controlled_error(self):
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = RuntimeError("groq 500: internal error")
+        with patch.object(voice_input, "Groq", return_value=mock_client):
+            with self.assertRaises(voice_input.VoiceInputError) as ctx:
+                voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test", language="ru")
+        self.assertEqual(str(ctx.exception), voice_input.TRANSCRIBE_FAILED_MSG)
+        self.assertEqual(mock_client.audio.transcriptions.create.call_count, 2)
+
+    # No language hint at all (both `language` param and VOICE_LANGUAGE env
+    # unset) means there is nothing to retry without — a single failure
+    # raises immediately, exactly like the pre-Language-Settings-V1 behavior.
+    def test_no_language_hint_never_retries(self):
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = RuntimeError("network error")
+        with patch.object(voice_input, "VOICE_LANGUAGE", None):
+            with patch.object(voice_input, "Groq", return_value=mock_client):
+                with self.assertRaises(voice_input.VoiceInputError):
+                    voice_input.transcribe_audio_file(self.temp_path, api_key="sk-test")
+        self.assertEqual(mock_client.audio.transcriptions.create.call_count, 1)
+
+    def test_language_retry_is_logged_without_secrets(self):
+        fake_response = MagicMock()
+        fake_response.text = "ok"
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = [
+            RuntimeError("groq 400: bad language, key=sk-secret"),
+            fake_response,
+        ]
+        with patch.object(voice_input, "Groq", return_value=mock_client):
+            with self.assertLogs(voice_input.logger, level="WARNING") as log_ctx:
+                voice_input.transcribe_audio_file(self.temp_path, api_key="sk-secret", language="uk")
+        joined = "\n".join(log_ctx.output)
+        self.assertIn("voice_transcription_language_retry", joined)
+        self.assertNotIn("sk-secret", joined)
+
     # 4. Groq receives a filename ending in the SAME suffix as the local
     # file (bot.py's own _normalize_voice_suffix already turned Telegram's
     # ".oga" into ".ogg" before this function ever runs — this only proves

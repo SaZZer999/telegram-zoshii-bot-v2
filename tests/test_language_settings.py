@@ -310,5 +310,70 @@ class TestVoiceTranscriptionUsesSelectedLanguage(LanguageSettingsTestCase):
         mock_transcribe.assert_called_once_with("/tmp/f4.oga")
 
 
+# =========================
+# Regression coverage for the exact live bug: voice_input.transcribe_audio_
+# file is left UNMOCKED here (only its Groq client is), so bot.py's
+# `language=` kwarg actually reaches the real function signature — before
+# the fix, this raised an uncaught TypeError ("unexpected keyword argument
+# 'language'") that never even hit voice_input.VoiceInputError, so webhook()
+# sent nothing back to the user at all.
+# =========================
+class TestVoiceRegressionWithRealTranscribeFunction(LanguageSettingsTestCase):
+    def setUp(self):
+        super().setUp()
+        import tempfile
+        fd, self.temp_path = tempfile.mkstemp(suffix=".ogg")
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"fake-ogg-bytes")
+        self.addCleanup(lambda: os.path.exists(self.temp_path) and os.remove(self.temp_path))
+
+    def test_selected_language_no_longer_crashes_voice_pipeline(self):
+        chat_id = 884001
+        fake_response = MagicMock()
+        fake_response.text = "Поясни коротко, чому молоко згортається в каві?"
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = fake_response
+        with patch.object(bot, "get_user_voice_language", return_value="uk"):
+            with patch.object(bot, "_download_telegram_voice_to_temp", return_value=self.temp_path):
+                with patch.object(voice_input, "Groq", return_value=mock_client):
+                    with patch.object(bot, "call_gemini", return_value="ok"):
+                        _call_webhook(_make_voice_update(chat_id, user_id=chat_id))
+        _, kwargs = mock_client.audio.transcriptions.create.call_args
+        self.assertEqual(kwargs["language"], "uk")
+        texts = [t for _, t, _ in self._sent()]
+        self.assertTrue(any("🎙️ Розпізнав:" in t for t in texts))
+
+    def test_language_hinted_failure_falls_back_to_auto_and_still_replies(self):
+        chat_id = 884002
+        fake_response = MagicMock()
+        fake_response.text = "Поясни коротко, чому молоко згортається в каві?"
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = [
+            RuntimeError("groq 400: invalid language code"),
+            fake_response,
+        ]
+        with patch.object(bot, "get_user_voice_language", return_value="uk"):
+            with patch.object(bot, "_download_telegram_voice_to_temp", return_value=self.temp_path):
+                with patch.object(voice_input, "Groq", return_value=mock_client):
+                    with patch.object(bot, "call_gemini", return_value="ok"):
+                        _call_webhook(_make_voice_update(chat_id, user_id=chat_id))
+        self.assertEqual(mock_client.audio.transcriptions.create.call_count, 2)
+        texts = [t for _, t, _ in self._sent()]
+        self.assertTrue(any("🎙️ Розпізнав:" in t for t in texts))
+
+    def test_final_failure_after_retry_sends_controlled_message(self):
+        chat_id = 884003
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = RuntimeError("groq 500: internal error")
+        with patch.object(bot, "get_user_voice_language", return_value="uk"):
+            with patch.object(bot, "_download_telegram_voice_to_temp", return_value=self.temp_path):
+                with patch.object(voice_input, "Groq", return_value=mock_client):
+                    _call_webhook(_make_voice_update(chat_id, user_id=chat_id))
+        self.assertEqual(mock_client.audio.transcriptions.create.call_count, 2)
+        texts = [t for _, t, _ in self._sent()]
+        self.assertEqual(texts, [voice_input.TRANSCRIBE_FAILED_MSG])
+        self.assertIn("Не вдалося розпізнати голосове", voice_input.TRANSCRIBE_FAILED_MSG)
+
+
 if __name__ == "__main__":
     unittest.main()

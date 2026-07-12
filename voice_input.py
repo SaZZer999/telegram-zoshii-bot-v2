@@ -117,7 +117,7 @@ def _sanitize_error_message(exc, api_key=None):
     return message[:300]
 
 
-def transcribe_audio_file(file_path, *, filename=None, api_key=None):
+def transcribe_audio_file(file_path, *, filename=None, api_key=None, language=None):
     """Transcribe the audio file at `file_path` (already downloaded to
     local disk by the caller) and return the normalized (stripped)
     transcript string — "" if the provider returned nothing usable, never
@@ -133,14 +133,21 @@ def transcribe_audio_file(file_path, *, filename=None, api_key=None):
     (already normalized by bot.py's _download_telegram_voice_to_temp to a
     suffix Groq reliably recognizes, e.g. ".ogg" instead of Telegram's own
     ".oga") is what Groq actually sees in the multipart upload.
+
+    `language` (Language Settings V1) overrides the process-wide
+    VOICE_LANGUAGE env default when given — bot.py passes the caller's
+    saved per-user language here; omitting it (None) preserves the exact
+    pre-Language-Settings-V1 behavior of falling back to VOICE_LANGUAGE (or
+    no hint at all if that's unset too). If Groq rejects/fails a request
+    that included a language hint, this retries ONCE with no language hint
+    (auto-detect) before giving up — a provider-side language-code
+    complaint must never surface as a silent failure to the user.
     """
     ensure_ready(api_key)
     resolved_key = _resolve_api_key(api_key)
     client = Groq(api_key=resolved_key)
 
-    kwargs = {}
-    if VOICE_LANGUAGE:
-        kwargs["language"] = VOICE_LANGUAGE
+    resolved_language = language or VOICE_LANGUAGE
 
     resolved_filename = filename or os.path.basename(file_path)
     suffix = os.path.splitext(resolved_filename)[1] or "(none)"
@@ -150,27 +157,59 @@ def transcribe_audio_file(file_path, *, filename=None, api_key=None):
         file_size = -1
 
     logger.info(
-        "voice_transcription_start: provider=groq model=%s file_suffix=%s file_size_bytes=%d",
-        VOICE_TRANSCRIBER_MODEL, suffix, file_size,
+        "voice_transcription_start: provider=groq model=%s file_suffix=%s file_size_bytes=%d language=%s",
+        VOICE_TRANSCRIBER_MODEL, suffix, file_size, resolved_language or "auto",
     )
 
     try:
         with open(file_path, "rb") as f:
-            response = client.audio.transcriptions.create(
-                file=(resolved_filename, f.read()),
-                model=VOICE_TRANSCRIBER_MODEL,
-                prompt=TRANSCRIBE_PROMPT,
-                response_format="json",
-                temperature=0,
-                **kwargs,
-            )
-    except Exception as e:
-        # Covers a missing/unreadable file (OSError) and every Groq SDK/
-        # network/provider error alike — the user only ever sees the same
-        # generic TRANSCRIBE_FAILED_MSG either way; the exception class and
-        # a sanitized message go server-side only.
+            file_bytes = f.read()
+    except OSError as e:
         logger.error("voice_transcription_error: %s: %s", type(e).__name__, _sanitize_error_message(e, resolved_key))
         raise VoiceInputError(TRANSCRIBE_FAILED_MSG)
+
+    def _call(with_language):
+        call_kwargs = {"language": resolved_language} if with_language and resolved_language else {}
+        return client.audio.transcriptions.create(
+            file=(resolved_filename, file_bytes),
+            model=VOICE_TRANSCRIBER_MODEL,
+            prompt=TRANSCRIBE_PROMPT,
+            response_format="json",
+            temperature=0,
+            **call_kwargs,
+        )
+
+    try:
+        response = _call(with_language=True)
+    except Exception as e:
+        # A rejected/failed language-hinted request gets ONE retry with no
+        # language hint (auto-detect) — covers Groq being unable to honor a
+        # specific language code without ever failing the whole message
+        # over it. No retry left to attempt when there was no language hint
+        # in the first place (resolved_language is falsy).
+        if not resolved_language:
+            logger.error(
+                "voice_transcription_error: %s: %s",
+                type(e).__name__, _sanitize_error_message(e, resolved_key),
+            )
+            raise VoiceInputError(TRANSCRIBE_FAILED_MSG)
+
+        logger.warning(
+            "voice_transcription_language_retry: language=%s error=%s: %s",
+            resolved_language, type(e).__name__, _sanitize_error_message(e, resolved_key),
+        )
+        try:
+            response = _call(with_language=False)
+        except Exception as e2:
+            # Covers a missing/unreadable file (OSError) and every Groq SDK/
+            # network/provider error alike — the user only ever sees the same
+            # generic TRANSCRIBE_FAILED_MSG either way; the exception class
+            # and a sanitized message go server-side only.
+            logger.error(
+                "voice_transcription_error: %s: %s",
+                type(e2).__name__, _sanitize_error_message(e2, resolved_key),
+            )
+            raise VoiceInputError(TRANSCRIBE_FAILED_MSG)
 
     text = _extract_transcript_text(response)
     if text is None:
