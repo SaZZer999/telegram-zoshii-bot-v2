@@ -36,6 +36,24 @@ NORMALIZED_TRANSCRIPT = (
     "Подарунок для її сестри за 60."
 )
 
+# The exact live regression transcript — includes the "for 60 for 60"
+# stutter that made _numbers_preserved wrongly reject a correct
+# normalization and silently fall back to the raw, still-mixed transcript.
+LIVE_TRANSCRIPT = (
+    "Ми купили візочок для дитини за 3300 злотих, але нам зробили знижку 150 злотих. Також ми купили "
+    "дитячу ліжечку, яке на сайті оригінальному коштувало 650, але ми знайшли його за 570. We bought a "
+    "komod, which cost 627, but we bought it for 527. We also have an auto-carsel, but we didn't pay "
+    "anything for this. I only bought a gift for her sister for 60 for 60, to thank her for the "
+    "auto-carsel."
+)
+
+LIVE_TRANSCRIPT_NORMALIZED = (
+    "Ми купили візочок для дитини за 3300 злотих, але нам зробили знижку 150 злотих. Також ми купили "
+    "дитяче ліжечко, яке на сайті оригінальному коштувало 650, але ми знайшли його за 570. Ми купили "
+    "комод, який коштував 627, але купили за 527. Ще маємо автокрісло, але за нього нічого не заплатили. "
+    "Я купила подарунок для її сестри за 60, щоб подякувати за автокрісло."
+)
+
 
 def _make_voice_update(update_id, chat_id, user_id=555, duration=5):
     return {
@@ -88,7 +106,7 @@ class TestMixedTranscriptNormalized(VoiceNormalizerWebhookTestCase):
                     with patch("os.remove"):
                         with patch.object(
                             voice_transcript_normalizer, "normalize",
-                            return_value=(NORMALIZED_TRANSCRIPT, True),
+                            return_value=(NORMALIZED_TRANSCRIPT, True, "changed"),
                         ) as mock_normalize:
                             with patch.object(bot, "call_gemini", return_value=None):
                                 _call_webhook(_make_voice_update(994001001, chat_id, user_id=chat_id))
@@ -149,6 +167,40 @@ class TestMixedTranscriptNormalized(VoiceNormalizerWebhookTestCase):
         data = pending_global_household[chat_id]
         self.assertEqual(len(data["new_expenses"]), 1)
         self.assertEqual(data["new_expenses"][0]["amount"].to_eng_string(), "3150.00")
+
+
+# =========================
+# The exact live regression transcript, end to end through the webhook —
+# the "for 60 for 60" stutter must never force a fallback to the raw,
+# still-mixed-language transcript.
+# =========================
+class TestLiveRegressionTranscript(VoiceNormalizerWebhookTestCase):
+    def test_live_transcript_normalizes_end_to_end(self):
+        chat_id = 994006
+        response = '{"normalized": "%s"}' % LIVE_TRANSCRIPT_NORMALIZED
+        # bot.call_gemini is used by more than just the normalizer here (the
+        # now-Ukrainian-looking text also naturally reaches household_router/
+        # general AI fallback downstream) — the normalizer's OWN success-on-
+        # first-try behavior is asserted precisely at the unit level in
+        # tests/test_voice_transcript_normalizer_module.py; this test only
+        # verifies the end-to-end echo content.
+        with patch.object(bot, "get_user_voice_language", return_value="uk"):
+            with patch.object(bot, "_download_telegram_voice_to_temp", return_value="/tmp/f6.oga"):
+                with patch.object(voice_input, "transcribe_audio_file", return_value=LIVE_TRANSCRIPT):
+                    with patch("os.remove"):
+                        with patch.object(bot, "call_gemini", return_value=response):
+                            _call_webhook(_make_voice_update(994006001, chat_id, user_id=chat_id))
+        texts = self._sent_texts()
+        echo = next(t for t in texts if t.startswith("🎙️ Розпізнав:"))
+        self.assertNotEqual(echo, f"🎙️ Розпізнав:\n«{LIVE_TRANSCRIPT}»")
+        self.assertNotIn("We bought", echo)
+        self.assertNotIn("auto-carsel", echo)
+        self.assertNotIn("gift for her sister", echo)
+        self.assertIn("комод", echo)
+        self.assertIn("автокрісло", echo)
+        self.assertIn("подарунок", echo.lower())
+        for amount in ("3300", "150", "650", "570", "627", "527", "60"):
+            self.assertIn(amount, echo)
 
 
 # =========================

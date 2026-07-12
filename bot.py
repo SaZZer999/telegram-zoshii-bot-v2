@@ -5960,10 +5960,10 @@ def _handle_voice_message(chat_id, voice, user_id=None):
     # — see voice_transcript_normalizer._numbers_preserved) BEFORE both the
     # echo below and the value handed to message_dispatcher.dispatch(...),
     # so the planner never sees the raw mixed-language fragments. Any
-    # failure/skip safely returns `transcript` itself unchanged.
-    normalized_transcript, was_normalized = voice_transcript_normalizer.normalize(transcript, language)
-    logger.info("voice_transcript_normalize: language=%s changed=%s", language, was_normalized)
-    transcript = normalized_transcript
+    # failure/skip safely returns `transcript` itself unchanged. normalize()
+    # already logs its own language/status/changed diagnostics (never the
+    # transcript content) — nothing more to log here.
+    transcript, _was_normalized, _normalize_status = voice_transcript_normalizer.normalize(transcript, language)
 
     if voice_input.VOICE_SHOW_TRANSCRIPT:
         send_message(chat_id, f"🎙️ Розпізнав:\n«{transcript}»")
