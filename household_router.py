@@ -17,7 +17,11 @@ via configure(), never a snapshotted import (mirrors expenses.py's own
 `expenses.py` is imported directly (not through `_bot`): it never imports
 bot.py or this module, so there is no cycle, and its amount/date/category
 validators and formatters are reused as-is for the add_expense/delete_expense
-side of every operation instead of being duplicated a second time.
+side of every operation instead of being duplicated a second time. Same
+reasoning for `preview_editing.compute_quantity_multiplier` (Safe Discount
+Calculation V1's unit-conversion math — never duplicated) and `quantities.
+parse_structured_quantity` (discount_expense's unit_price_basis parsing) —
+neither imports bot.py or this module either.
 
 Owns no Telegram/pending state of its own — bot.py stores
 pending_global_household and performs the actual DB write via
@@ -32,6 +36,8 @@ from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 import expenses
+import preview_editing
+from quantities import parse_structured_quantity
 
 # =========================
 # INJECTED DEPENDENCIES (see configure())
@@ -122,6 +128,58 @@ _DISCOUNT_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Safe Discount Calculation V1 — an explicit "this is the FINAL amount I
+# actually paid" signal overrides has_discount_marker's blanket block: a
+# discount mentioned elsewhere in the same message no longer makes a
+# directly-stated final amount ambiguous (see _validate_operations_
+# detailed's add_expense branch). Deliberately narrow verbs/adverbs, never
+# "coштує"/"було" alone (those still describe a PRICE, not a payment).
+_FINAL_AMOUNT_MARKER_RE = re.compile(
+    r"заплатив\w*|оплатив\w*|сплатив\w*|фінальн\w*|фактично\s+сплач\w*|"
+    r"загалом|у\s?підсумку|зрештою|вийшло",
+    re.IGNORECASE,
+)
+
+
+def _parse_percent(raw_percent):
+    """Parse a discount percent into an exact Decimal in (0, 100], or None
+    if missing/unparseable/out of range — same never-float, never-negative
+    contract as expenses._parse_expense_amount, reused for discount_
+    expense's discount_percent field."""
+    if raw_percent is None:
+        return None
+    if isinstance(raw_percent, (int, float)):
+        raw_percent = str(raw_percent)
+    if not isinstance(raw_percent, str):
+        return None
+    cleaned = raw_percent.strip().replace("%", "").replace(",", ".").strip()
+    if not cleaned:
+        return None
+    try:
+        value = Decimal(cleaned)
+    except InvalidOperation:
+        return None
+    if value <= 0 or value > 100:
+        return None
+    return value
+
+
+def _format_discount_calculation_note(unit_price, discount_percent, basis_unit, discounted_unit_price, multiplier, final_amount):
+    """The plain-text explanation shown alongside a Safe Discount
+    Calculation V1 expense (e.g. "20,00 zł/кг − 50% = 10,00 zł/кг; 1 кг ×
+    10,00 zł = 10,00 zł") — every number formatted with the SAME functions
+    the rest of the app already uses (expenses._format_expense_amount,
+    _bot.format_quantity_display), never a bespoke display format."""
+    percent_display = _bot.format_quantity_display(discount_percent, None)
+    unit_price_display = expenses._format_expense_amount(unit_price)
+    discounted_display = expenses._format_expense_amount(discounted_unit_price)
+    multiplier_display = _bot.format_quantity_display(multiplier, None)
+    final_display = expenses._format_expense_amount(final_amount)
+    return (
+        f"{unit_price_display}/{basis_unit} − {percent_display}% = {discounted_display}/{basis_unit}; "
+        f"{multiplier_display} {basis_unit} × {discounted_display} = {final_display}"
+    )
+
 
 def _dedupe_preserve_order(items):
     """First-occurrence-wins de-duplication for user-facing reason/fragment/
@@ -159,6 +217,7 @@ def gate(text):
 # =========================
 _ALLOWED_OP_TYPES = {
     "add_shopping", "add_inventory", "consume_inventory", "add_expense", "delete_expense", "ambiguous_expense",
+    "discount_expense",
 }
 
 HOUSEHOLD_ROUTER_PROMPT = (
@@ -209,7 +268,9 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "3. Якщо повідомлення означає «купив X ЗА Y zł» — це ОДНА покупка з ціною: додай ОБИДВІ операції — "
     "add_inventory (сам товар) І add_expense (сума) в одному масиві operations. Але якщо ця сама ціна "
     "згадується РАЗОМ зі знижкою/відсотком (напр. «коштує 20 zł, але знижка 50%») — Y НЕ є сумою, яку "
-    "фактично сплачено: не додавай add_expense у цьому випадку, дивись тип 7 (ambiguous_expense) нижче.\n"
+    "фактично сплачено: не додавай add_expense у цьому випадку. Якщо явно вказано, за ЯКУ кількість ця ціна "
+    "(«за кілограм», «за штуку», «за 1 л») — використай тип 8 (discount_expense) нижче для безпечного "
+    "розрахунку. Якщо НЕ вказано, за яку кількість ціна — використай тип 7 (ambiguous_expense).\n"
     "4. «consume_inventory» — людина з'їла/використала частину запасів (напр. «З'їв 2 ковбаски», "
     "«Використала 200 г масла»). Повертай це ЛИШЕ коли кількість чітко вказана числом і одиницею. Якщо "
     "кількість неясна («з'їв трохи молока») — не вигадуй operations для цього фрагмента, а опиши фрагмент у "
@@ -223,7 +284,10 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "контексту; ніколи не в майбутньому). Повідомлення може описувати КІЛЬКА окремих покупок із сумою "
     "(напр. «Купив молоко за 8 zł. Купив хліб за 5 zł») — тоді додай по ОДНІЙ операції add_expense на кожну "
     "таку покупку, у тому самому порядку, як вони згадані в тексті; ніколи не підсумовуй кілька сум в одну "
-    "операцію.\n"
+    "операцію. Якщо користувач явно каже, що якесь число — це ОСТАТОЧНА/ФАКТИЧНО СПЛАЧЕНА сума (слова "
+    "«заплатив», «оплатив», «сплатив», «фінально», «загалом», «зрештою», «вийшло») — це ЗАВЖДИ add_expense з "
+    "тим числом, НАВІТЬ якщо десь у тому самому повідомленні згадана знижка чи первісна ціна; використай "
+    "число як є, ніколи нічого не перераховуй.\n"
     "6. «delete_expense» — людина каже, що ВИПАДКОВО чи ПОМИЛКОВО додала витрату і хоче її прибрати (напр. "
     "«Булочку до витрат я додав випадково», «Помилково записав ту витрату»). Повертай це ЛИШЕ якщо рівно "
     "ОДНА позиція з наданого списку останніх витрат явно відповідає опису; якщо жодна або кілька можуть "
@@ -231,12 +295,24 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "Поле: selected_numbers — масив з РІВНО одним номером зі списку останніх витрат. Максимум одна операція "
     "delete_expense на повідомлення.\n"
     "7. «ambiguous_expense» — повідомлення згадує ціну/суму покупки, але її НЕ можна безпечно перетворити на "
-    "add_expense: разом зі знижкою/відсотком (напр. «коштувало 20, але знижка 50%», «−30%», «акція»), "
-    "оригінальну/довідкову ціну без явно сплаченої суми, або будь-яку суму, яку довелося б обчислювати "
-    "(відсоток, ділення, сума кількох цін). НІКОЛИ не обчислюй і не вигадуй остаточну суму в такому випадку. "
-    "Замість add_expense додай ОДНУ операцію {\"type\": \"ambiguous_expense\", \"note\": \"короткий опис "
-    "українською, чому сума неоднозначна\"}. add_expense дозволено лише коли в тексті є ОДНЕ явне число, яке "
-    "користувач написав як фактично СПЛАЧЕНУ суму, без жодних знижок/відсотків поруч.\n\n"
+    "add_expense чи discount_expense: РАЗОМ зі знижкою/відсотком (напр. «коштувало 20, але знижка 50%», "
+    "«−30%», «акція») БЕЗ вказаної кількості, за яку ця ціна (не «за кілограм»/«за штуку»/«за 1 л»), "
+    "оригінальну/довідкову ціну без явно сплаченої суми, або будь-яку суму, яку довелося б обчислювати іншим "
+    "способом. НІКОЛИ не обчислюй і не вигадуй остаточну суму в такому випадку. Замість add_expense додай "
+    "ОДНУ операцію {\"type\": \"ambiguous_expense\", \"note\": \"...\"}, де note — КОРОТКЕ УТОЧНЮЮЧЕ "
+    "ЗАПИТАННЯ українською, що перелічує можливі варіанти суми (напр. «20 zł — це ціна за 1 кг, за 0,5 кг чи "
+    "фінальна сума?»), а не просто констатація неоднозначності. add_expense дозволено лише коли в тексті є "
+    "ОДНЕ явне число, яке користувач написав як фактично СПЛАЧЕНУ суму, без жодних знижок/відсотків поруч "
+    "(або з явним словом «заплатив»/«фінально» — див. тип 5 вище).\n"
+    "8. «discount_expense» — БЕЗПЕЧНИЙ розрахунок ціни зі знижкою: використовуй ЛИШЕ коли в тексті ЯВНО і "
+    "ОДНОЗНАЧНО є ВСІ три частини разом: (а) ціна за одиницю товару, (б) ЗА ЯКУ САМЕ кількість ця ціна («за "
+    "кілограм», «за 1 л», «за штуку» — якщо в тексті просто «за кілограм»/«за штуку» без числа, це означає "
+    "«1 кг»/«1 шт.»), (в) відсоток знижки. Поля: unit_price (рядок, ціна ДО знижки, як у тексті), "
+    "unit_price_basis (рядок, кількість+одиниця, ЗАВЖДИ цифрами — «1 кг», «1 л», «1 шт.» — ніколи словом), "
+    "discount_percent (рядок, число відсотка без знака %, як у тексті), currency (завжди «PLN»). Python сам "
+    "порахує остаточну суму (ціна за одиницю − знижка, помножена на куплену кількість того самого товару) — "
+    "ти НІКОЛИ не вказуєш готову суму тут, лише ці три явні частини. Якщо БУДЬ-ЯКА з трьох частин не зовсім "
+    "явна чи відсутня — НЕ використовуй discount_expense, використай тип 7 (ambiguous_expense) замість цього.\n\n"
     "Категорії товарів (для add_shopping/add_inventory): М'ясо та риба, Молочне та яйця, Овочі та зелень, "
     "Фрукти та ягоди, Хліб і випічка, Крупи, макарони та борошно, Соуси, спеції та бакалія, Солодке та "
     "снеки, Напої, Заморожене, Інше їстівне.\n"
@@ -257,16 +333,30 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "\"description\": \"Масло\", \"expense_date\": \"2026-07-05\"}"
     "], \"unresolved_fragments\": []}\n"
     "Приклад none: {\"intent\": \"none\", \"operations\": [], \"unresolved_fragments\": []}\n"
-    "Приклад (для «Вчора після роботи я зайшов в магазин заді дому. Там дід з вусами продавав дуже смачне "
-    "печиво. Воно в загальному коштує 20 злотих, але на нього було 50% знижки. Я купив пів кілограма, але "
-    "воно було таке смачне, що я вернувся і купив ще пів.»): {\"intent\": \"household_operations\", "
+    "Приклад ambiguous_expense (для «Печиво коштувало 20 zł, було 50% знижки, я купив пів кілограма і потім "
+    "ще пів.» — ЦІНА без вказаної кількості, за яку вона): {\"intent\": \"household_operations\", "
     "\"operations\": ["
     "{\"type\": \"add_inventory\", \"name\": \"Печиво\", \"quantity_text\": \"0,5 кг\", \"category\": "
     "\"Солодке та снеки\"}, "
     "{\"type\": \"add_inventory\", \"name\": \"Печиво\", \"quantity_text\": \"0,5 кг\", \"category\": "
     "\"Солодке та снеки\"}, "
-    "{\"type\": \"ambiguous_expense\", \"note\": \"Ціна 20 zł зі знижкою 50% — неясно, скільки фактично "
-    "сплачено за пів кілограма, а скільки за обидва рази\"}"
+    "{\"type\": \"ambiguous_expense\", \"note\": \"20 zł — це ціна за 1 кг, за 0,5 кг чи фінальна сума?\"}"
+    "], \"unresolved_fragments\": []}\n"
+    "Приклад discount_expense (для «Печиво коштувало 20 zł за кілограм, було 50% знижки, я купив пів "
+    "кілограма і потім ще пів.» — ЦІНА ЯВНО за кілограм): {\"intent\": \"household_operations\", "
+    "\"operations\": ["
+    "{\"type\": \"add_inventory\", \"name\": \"Печиво\", \"quantity_text\": \"0,5 кг\", \"category\": "
+    "\"Солодке та снеки\"}, "
+    "{\"type\": \"add_inventory\", \"name\": \"Печиво\", \"quantity_text\": \"0,5 кг\", \"category\": "
+    "\"Солодке та снеки\"}, "
+    "{\"type\": \"discount_expense\", \"unit_price\": \"20\", \"unit_price_basis\": \"1 кг\", "
+    "\"discount_percent\": \"50\", \"currency\": \"PLN\"}"
+    "], \"unresolved_fragments\": []}\n"
+    "Приклад final-amount override (для «Печиво було зі знижкою, фінально заплатив 10 zł.» — ФАКТИЧНО "
+    "СПЛАЧЕНА сума явно вказана словом «заплатив», незалежно від згадки знижки): {\"intent\": "
+    "\"household_operations\", \"operations\": ["
+    "{\"type\": \"add_expense\", \"amount\": \"10\", \"currency\": \"PLN\", \"category\": \"Продукти\", "
+    "\"description\": \"Печиво\", \"expense_date\": \"2026-07-12\"}"
     "], \"unresolved_fragments\": []}"
 )
 
@@ -829,14 +919,19 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
     used_inventory_numbers = set()
     new_expenses = []
     expense_notes = []
+    discount_expense_ops = []
     delete_expense = None
     delete_expense_count = 0
 
     # Purchase Event Planner V1 — see _DISCOUNT_MARKER_RE's own comment: a
     # discount/percentage mention anywhere in the ORIGINAL message makes
     # every add_expense op in this batch ambiguous, regardless of whether
-    # Gemini already followed the prompt's own "ambiguous_expense" instruction.
+    # Gemini already followed the prompt's own "ambiguous_expense" instruction
+    # — UNLESS has_final_amount_marker overrides it (Safe Discount Calculation
+    # V1, example C: "фінально заплатив 10 zł" is a real final amount even
+    # when a discount is mentioned elsewhere in the same message).
     has_discount_marker = bool(source_text) and bool(_DISCOUNT_MARKER_RE.search(source_text))
+    has_final_amount_marker = bool(source_text) and bool(_FINAL_AMOUNT_MARKER_RE.search(source_text))
 
     total_inventory = len(inventory_items)
 
@@ -924,7 +1019,7 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             })
 
         elif op_type == "add_expense":
-            if has_discount_marker:
+            if has_discount_marker and not has_final_amount_marker:
                 # Purchase Event Planner V1 — see has_discount_marker's own
                 # comment above: a discount/percentage anywhere in the
                 # message means this op's amount is never trustworthy
@@ -933,6 +1028,12 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
                 # either a blocking "invalid" reason or a silently-invented
                 # expense — Gemini's own proposed amount (if any) is quoted
                 # back so the user can tell it apart from unrelated notes.
+                # Skipped entirely when has_final_amount_marker is also true
+                # (Safe Discount Calculation V1, example C) — an explicit
+                # "заплатив"/"фінально"/... signal means THIS number is a
+                # real final amount regardless of a discount mentioned
+                # elsewhere; it still goes through the normal amount-
+                # literal check below, just not this blanket redirect.
                 proposed_amount = op.get("amount")
                 if isinstance(proposed_amount, str) and proposed_amount.strip():
                     expense_notes.append(
@@ -972,6 +1073,36 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
                 "expense_date": expense_date,
             })
 
+        elif op_type == "discount_expense":
+            # Safe Discount Calculation V1 (see the prompt's type 8) — every
+            # piece is validated INDIVIDUALLY here (unit_price/discount_
+            # percent must be literal numbers actually typed by the user,
+            # unit_price_basis must parse as an explicit structured
+            # quantity); the actual multiply-by-purchased-quantity math only
+            # happens once add_inventory_items is FINAL (after merge +
+            # representation guard, below) — see discount_expense_ops'
+            # processing near the end of this function. A piece that fails
+            # here becomes a non-blocking note, exactly like ambiguous_
+            # expense — never blocks the rest of the batch, never invents
+            # a number.
+            unit_price = expenses._parse_expense_amount(op.get("unit_price"))
+            discount_percent = _parse_percent(op.get("discount_percent"))
+            basis_value, basis_unit = parse_structured_quantity(op.get("unit_price_basis") or "")
+            if (
+                unit_price is None or not _amount_literally_in_text(unit_price, source_text)
+                or discount_percent is None or not _amount_literally_in_text(discount_percent, source_text)
+                or basis_value is None
+            ):
+                expense_notes.append(
+                    "У повідомленні є розрахунок ціни зі знижкою, але я не можу безпечно його застосувати. "
+                    "Напиши точну сплачену суму, якщо хочеш додати цю витрату."
+                )
+                continue
+            discount_expense_ops.append({
+                "unit_price": unit_price, "discount_percent": discount_percent,
+                "basis_value": basis_value, "basis_unit": basis_unit,
+            })
+
         elif op_type == "ambiguous_expense":
             # Gemini's own signal (see the prompt's type 7) that a price/
             # amount was mentioned but can't be safely turned into
@@ -1006,20 +1137,6 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
 
     if reasons:
         return "invalid", _dedupe_preserve_order(reasons)
-
-    if has_discount_marker and not expense_notes and not new_expenses:
-        # A discount was mentioned but produced no add_expense AND no
-        # ambiguous_expense note at all (e.g. Gemini silently dropped the
-        # price instead of following the prompt's "ambiguous_expense"
-        # instruction) — still surface it, so "expense amount needs
-        # clarification" is never silently lost (see the module's Purchase
-        # Event Planner V1 docs/regression coverage).
-        expense_notes.append(
-            "У повідомленні згадано знижку — суму витрати не додано. Напиши точну сплачену суму, якщо "
-            "хочеш додати цю витрату."
-        )
-
-    expense_notes = _dedupe_preserve_order(expense_notes)
 
     add_shopping_items = _bot._auto_merge_in_place(add_shopping_raw) if add_shopping_raw else []
     add_inventory_items = _bot._auto_merge_in_place(add_inventory_raw) if add_inventory_raw else []
@@ -1059,6 +1176,12 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
         guard_kind, guard_result = apply_inventory_representation_guard(add_inventory_items, inventory_items)
         add_representation_conflicts = []
     if guard_kind == "clarify":
+        # discount_expense_ops isn't resolvable yet here — add_inventory_
+        # items may still change once this clarification is answered, so
+        # any collected pieces are simply dropped (never computed against a
+        # quantity that could still change); expense_notes already carries
+        # every individually-invalid piece's own note from the loop above,
+        # so nothing about "the amount needs clarification" is silently lost.
         return "clarify", {
             **guard_result,
             "add_shopping_items": add_shopping_items,
@@ -1067,12 +1190,13 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             "new_expenses": new_expenses,
             "new_expense": _legacy_single_expense(new_expenses),
             "delete_expense": delete_expense,
-            "expense_notes": expense_notes,
+            "expense_notes": _dedupe_preserve_order(expense_notes),
         }
     add_inventory_items, inventory_merge_targets = guard_result
 
     representation_conflict_queue = consume_representation_conflicts + add_representation_conflicts
     if representation_conflict_queue:
+        # Same reasoning as the guard_kind == "clarify" branch above.
         return "clarify_representation", {
             "conflict": representation_conflict_queue[0],
             "queue": representation_conflict_queue[1:],
@@ -1083,8 +1207,65 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             "new_expenses": new_expenses,
             "new_expense": _legacy_single_expense(new_expenses),
             "delete_expense": delete_expense,
-            "expense_notes": expense_notes,
+            "expense_notes": _dedupe_preserve_order(expense_notes),
         }
+
+    # Safe Discount Calculation V1 — add_inventory_items is FINAL now (past
+    # merge + both representation-guard passes), so it's finally safe to
+    # multiply a discount_expense op's per-unit price by how much of that
+    # product was actually bought. Deliberately as narrow/conservative as
+    # Price Clarification V1's own single-item rule: never guess which item
+    # or which of several discounts a calculation belongs to.
+    expense_calculation_note = None
+    if discount_expense_ops:
+        if new_expenses or len(add_inventory_items) != 1 or len(discount_expense_ops) != 1:
+            for _ in discount_expense_ops:
+                expense_notes.append(
+                    "У повідомленні є розрахунок ціни зі знижкою, але я не можу безпечно застосувати його "
+                    "до одного товару. Напиши точну сплачену суму, якщо хочеш додати цю витрату."
+                )
+        else:
+            d = discount_expense_ops[0]
+            item = add_inventory_items[0]
+            multiplier = preview_editing.compute_quantity_multiplier(
+                item.get("quantity_value"), item.get("quantity_unit"), d["basis_value"], d["basis_unit"],
+            )
+            if multiplier is None or item.get("quantity_inferred"):
+                # Incompatible units (price-per-unit vs. quantity bought), or
+                # the bought quantity is itself only a guessed default —
+                # never invent a multiplier (see compute_quantity_
+                # multiplier's own "never guessed" contract).
+                expense_notes.append(
+                    "Не можу безпечно порахувати суму: одиниця ціни не збігається з кількістю товару. "
+                    "Напиши точну сплачену суму, якщо хочеш додати цю витрату."
+                )
+            else:
+                discounted_unit_price = (
+                    d["unit_price"] * (Decimal("100") - d["discount_percent"]) / Decimal("100")
+                ).quantize(Decimal("0.01"))
+                final_amount = (discounted_unit_price * multiplier).quantize(Decimal("0.01"))
+                new_expenses.append({
+                    "amount": final_amount, "currency": "PLN", "category": "Продукти",
+                    "category_was_defaulted": True, "description": item["name"],
+                    "expense_date": now.date(),
+                })
+                expense_calculation_note = _format_discount_calculation_note(
+                    d["unit_price"], d["discount_percent"], d["basis_unit"],
+                    discounted_unit_price, multiplier, final_amount,
+                )
+
+    if has_discount_marker and not expense_notes and not new_expenses:
+        # A discount was mentioned but produced no add_expense, no
+        # discount_expense calculation, AND no ambiguous_expense note at all
+        # (e.g. Gemini silently dropped the price instead of following the
+        # prompt's instructions) — still surface it, so "expense amount
+        # needs clarification" is never silently lost.
+        expense_notes.append(
+            "У повідомленні згадано знижку — суму витрати не додано. Напиши точну сплачену суму, якщо "
+            "хочеш додати цю витрату."
+        )
+
+    expense_notes = _dedupe_preserve_order(expense_notes)
 
     if not add_shopping_items and not add_inventory_items and not consume_changes and not new_expenses and not delete_expense:
         if expense_notes:
@@ -1104,6 +1285,7 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
         "delete_expense": delete_expense,
         "inventory_merge_targets": inventory_merge_targets,
         "expense_notes": expense_notes,
+        "expense_calculation_note": expense_calculation_note,
     }
 
 

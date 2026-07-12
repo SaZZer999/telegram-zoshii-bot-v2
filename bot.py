@@ -3510,7 +3510,8 @@ def _handle_household_router_result(chat_id, kind, payload, household_id, user_d
         "user_db_id": user_db_id,
         "origin": origin,
     }
-    send_message(chat_id, household_router.format_preview(payload), reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+    preview = household_router.format_preview(payload, extra_note=payload.get("expense_calculation_note"))
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
     return True
 
 
