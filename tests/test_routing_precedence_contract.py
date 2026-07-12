@@ -115,7 +115,14 @@ class TestActiveGlobalPreviewBlocksNewCommand(RoutingContractTestCase):
         _call_webhook(_make_update(chat_id, chat_id, "Купив молоко за 10 zł"))
 
         self.mock_household_router.assert_not_called()
-        self.mock_gemini.assert_not_called()
+        # Pending Preview Edit Planner V1: household_router itself is still
+        # never reached (the pending preview blocks a new command from ever
+        # starting a fresh router pass) — but the deterministic preview-edit
+        # handlers now hand off to a semantic Gemini fallback before the
+        # guard message, so call_gemini IS invoked once (resolves safely to
+        # "no_change" here — its return value isn't configured in this
+        # test's setUp).
+        self.mock_gemini.assert_called_once()
         self.assertIn(chat_id, pending_global_household)
         self.assertIn(bot.GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG, self._sent_texts())
 

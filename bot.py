@@ -96,6 +96,7 @@ import voice_input
 import voice_transcript_normalizer
 import photo_receipts
 import mini_action_planner
+import preview_edit_planner
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -998,13 +999,10 @@ PRICE_CLARIFICATION_AMBIGUOUS_MSG = (
 
 # Pending Preview Text Correction V1 — see _try_apply_text_correction's own
 # docstring. Sent instead of silently guessing when a recognized correction
-# phrase ("не X, а Y", "заміни X на Y", ...) doesn't cleanly resolve to
-# exactly one item/expense in the active preview.
-TEXT_CORRECTION_NOT_FOUND_MSG = (
-    "Не знайшов, що саме змінити в поточному плані.\n\n"
-    "Напиши точніше, або підтверди чи скасуй поточний план."
-)
-
+# phrase ("не X, а Y", "заміни X на Y", ...) matches 2+ items/expenses in
+# the active preview at once (a ZERO-match result defers to Pending Preview
+# Edit Planner V1's semantic fallback instead — see that function's own
+# docstring for why "not found" is no longer this module's final word).
 TEXT_CORRECTION_AMBIGUOUS_MSG = (
     "У плані кілька рядків підходять під цю правку.\n\n"
     "Напиши точніше, який саме рядок виправити."
@@ -3963,12 +3961,19 @@ def _try_apply_text_correction(chat_id, data, items, text):
     Every add_shopping/add_inventory item's `name` AND every new_expenses
     entry's `description` are candidates; the correction applies ONLY when
     EXACTLY ONE candidate's text contains the old fragment (case-
-    insensitive substring) — zero or 2+ matches send a targeted message
-    instead of ever guessing which one the user meant. Returns True if
-    `text` was fully handled (an updated preview, or a targeted no-match/
-    ambiguous message, was already sent) — False if `text` doesn't look
-    like a correction phrase at all, so the caller falls back to its own
-    existing behavior (price clarification, then the generic guard).
+    insensitive substring). Returns True only when it actually applied a
+    rename — a ZERO-match result returns False (silently, no message sent)
+    so the caller can escalate to the semantic Pending Preview Edit
+    Planner V1 fallback instead (see _try_apply_preview_edit_planner): a
+    substring miss is exactly the failure mode a genuine Ukrainian case/
+    wording difference produces (e.g. "сестрі" vs "для сестри" — the live
+    bug both this function and that planner exist for), so deterministic
+    matching finding nothing is never treated as the final word anymore.
+    A 2+-match result is still immediately ambiguous on PURELY textual
+    grounds (no semantic help needed to see that), so it's still handled
+    here directly. Returns False if `text` doesn't look like a correction
+    phrase at all either, so the caller falls back to its own remaining
+    handlers (price clarification, the AI planner, then the generic guard).
     """
     correction = preview_editing.parse_text_correction(text)
     if correction is None:
@@ -3980,8 +3985,7 @@ def _try_apply_text_correction(chat_id, data, items, text):
 
     matches = preview_editing.find_text_correction_targets(correction["old"], candidates)
     if not matches:
-        send_message(chat_id, TEXT_CORRECTION_NOT_FOUND_MSG, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
-        return True
+        return False
     if len(matches) > 1:
         send_message(chat_id, TEXT_CORRECTION_AMBIGUOUS_MSG, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
         return True
@@ -3997,6 +4001,52 @@ def _try_apply_text_correction(chat_id, data, items, text):
         items[index]["canonical_name"] = canonicalize_name(corrected_text)
     else:
         new_expenses[index]["description"] = corrected_text
+
+    preview = household_router.format_preview(data, header="Оновив план:")
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+    return True
+
+
+def _try_apply_preview_edit_planner(chat_id, data, text):
+    """Pending Preview Edit Planner V1 — the LAST-RESORT semantic fallback,
+    tried only after every deterministic preview-edit handler (quantity/
+    rename parser, text correction, price clarification) has already
+    failed to recognize `text`. Deterministic substring matching can't
+    bridge a genuine Ukrainian case/wording difference (e.g. the live bug
+    this fixes: pending description "Подарунок для сестри" [genitive] vs a
+    correction naming "сестрі" [dative] — no substring match at all, even
+    though a person instantly sees these are the same gift); Gemini can.
+    See preview_edit_planner.plan_preview_edit's own "never guessed"
+    contract for the full safety story — it never touches amount/quantity/
+    unit/date/category, only ever a name/description string, and only after
+    Python has independently bounds-checked the target index.
+
+    Returns True if `text` was fully handled (an updated preview or a
+    targeted clarification question was already sent) — False if the
+    planner found nothing to change ({"operation": "no_change"}), letting
+    the caller fall back to its own existing guard message exactly as if
+    this function had never run.
+    """
+    result = preview_edit_planner.plan_preview_edit(data, text)
+    operation = result["operation"]
+
+    if operation == "no_change":
+        return False
+
+    if operation == "ask_clarification":
+        send_message(chat_id, result["question"], reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+        return True
+
+    index = result["index"]
+    new_value = result["new_value"]
+    if operation == "rename_expense_description":
+        data["new_expenses"][index]["description"] = new_value
+    elif operation == "rename_inventory_item":
+        data["add_inventory_items"][index]["name"] = new_value
+        data["add_inventory_items"][index]["canonical_name"] = canonicalize_name(new_value)
+    elif operation == "rename_shopping_item":
+        data["add_shopping_items"][index]["name"] = new_value
+        data["add_shopping_items"][index]["canonical_name"] = canonicalize_name(new_value)
 
     preview = household_router.format_preview(data, header="Оновив план:")
     send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
@@ -4020,14 +4070,18 @@ def _handle_global_household_edit_text(chat_id, text):
             return
         if _try_apply_price_clarification(chat_id, data, items, text):
             return
+        if _try_apply_preview_edit_planner(chat_id, data, text):
+            return
         send_message(chat_id, result or GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
         return
 
     # Nothing addable in this preview (consume-only/expense-only) — quantity
     # edits and price clarification both require an add_shopping/add_
-    # inventory item, so neither applies; a text correction targeting an
-    # expense description still might (see _try_apply_text_correction).
+    # inventory item, so neither applies; text correction and the AI
+    # planner (both covering expense descriptions too) still might.
     if _try_apply_text_correction(chat_id, data, items, text):
+        return
+    if _try_apply_preview_edit_planner(chat_id, data, text):
         return
     send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
 
@@ -6370,6 +6424,10 @@ mini_action_planner.configure(sys.modules[__name__])
 # Wire voice_transcript_normalizer.py's dependency (only call_gemini) the
 # same way — it never imports bot.py either (see its module docstring).
 voice_transcript_normalizer.configure(sys.modules[__name__])
+
+# Wire preview_edit_planner.py's dependency (only call_gemini) the same
+# way — it never imports bot.py either (see its module docstring).
+preview_edit_planner.configure(sys.modules[__name__])
 
 
 if __name__ == "__main__":

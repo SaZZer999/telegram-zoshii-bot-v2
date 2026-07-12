@@ -223,11 +223,16 @@ class TestConfirmCancelAfterClarification(PriceClarificationWebhookTestCase):
 # =========================
 class TestUnrelatedTextStillBlocked(PriceClarificationWebhookTestCase):
     def test_unrelated_text_still_shows_guard_message(self):
+        # Pending Preview Edit Planner V1: once every deterministic preview-
+        # edit handler fails, a semantic Gemini fallback now gets one try
+        # before the guard message — call_gemini's default (unconfigured)
+        # mock return value fails JSON parsing and safely resolves to
+        # "no_change", so the guard still fires and nothing is mutated,
+        # exactly as before this planner existed.
         chat_id = 991608
         pending_global_household[chat_id] = _cookie_inventory_only_preview()
         original = dict(pending_global_household[chat_id])
         _call_webhook(_make_update(991608001, chat_id, "Яка сьогодні погода?"))
-        self.mock_call_gemini.assert_not_called()
         self.assertEqual(pending_global_household[chat_id], original)
         self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
 

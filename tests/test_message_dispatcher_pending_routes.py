@@ -585,7 +585,13 @@ class TestWebhookIntegration(unittest.TestCase):
         }
         _call_webhook(_make_update(chat_id, "Купив молоко за 10 zł"))
         self.mock_send.assert_called_once_with(chat_id, bot.GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
-        self.mock_gemini.assert_not_called()
+        # Pending Preview Edit Planner V1: every deterministic preview-edit
+        # handler fails for this text (no addable items/expenses to even
+        # target), so the semantic fallback now gets ONE chance via Gemini
+        # before the guard message — it safely resolves to "no_change"
+        # (call_gemini returns None here) and the guard still fires exactly
+        # as before.
+        self.mock_gemini.assert_called_once()
 
     def test_confirm_cancel_button_reaches_dispatch_exactly_once(self):
         # As of Dispatcher V3B, confirm/cancel is routed THROUGH dispatch()

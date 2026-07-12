@@ -40,7 +40,6 @@ from bot import (  # noqa: E402
     pending_global_household,
     GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD,
     GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG,
-    TEXT_CORRECTION_NOT_FOUND_MSG,
     TEXT_CORRECTION_AMBIGUOUS_MSG,
 )
 
@@ -113,6 +112,14 @@ class TextCorrectionWebhookTestCase(unittest.TestCase):
         patcher_send = patch.object(bot, "send_message")
         self.mock_send = patcher_send.start()
         self.addCleanup(patcher_send.stop)
+        # Pending Preview Edit Planner V1: a zero-match text correction now
+        # defers to this Gemini-based fallback instead of being the final
+        # word — patched here (unconfigured, like test_price_clarification.py)
+        # so it never hits the network; its default MagicMock return value
+        # safely fails JSON parsing and resolves to "no_change".
+        patcher_gemini = patch.object(bot, "call_gemini")
+        self.mock_call_gemini = patcher_gemini.start()
+        self.addCleanup(patcher_gemini.stop)
 
     def tearDown(self):
         pending_global_household.clear()
@@ -185,7 +192,10 @@ class TestAmbiguousCorrectionAsksWhichOne(TextCorrectionWebhookTestCase):
 
 
 # =========================
-# 4 — no matching phrase at all -> controlled no-match response, no mutation.
+# 4 — no matching phrase at all -> deterministic correction defers to the
+# semantic Pending Preview Edit Planner V1 fallback, which also finds
+# nothing here (Gemini is mocked/unconfigured) -> the generic guard fires,
+# no mutation.
 # =========================
 class TestNoMatchStaysSafe(TextCorrectionWebhookTestCase):
     def test_no_item_contains_the_old_fragment(self):
@@ -194,7 +204,8 @@ class TestNoMatchStaysSafe(TextCorrectionWebhookTestCase):
         original = dict(pending_global_household[chat_id])
         _call_webhook(_make_update(995006001, chat_id, "не сестрі, а дочці"))
         self.assertEqual(pending_global_household[chat_id], original)
-        self.assertTrue(any(TEXT_CORRECTION_NOT_FOUND_MSG == t for t in self._sent_texts()))
+        self.mock_call_gemini.assert_called_once()
+        self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
 
 
 # =========================

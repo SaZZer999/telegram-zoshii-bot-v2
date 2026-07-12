@@ -803,15 +803,18 @@ class TestBlockedByOtherActivePendingState(InventoryAdminWebhookTestCase):
     def test_rename_blocked_by_other_active_pending_state(self):
         # Pending Preview Text Correction V1: "перейменуй X на Y" is now ALSO
         # a recognized correction-phrase shape (see preview_editing.
-        # parse_text_correction) — with nothing addable/no expenses in this
-        # empty pending_global_household preview, it resolves to the new,
-        # more specific TEXT_CORRECTION_NOT_FOUND_MSG rather than the fully
-        # generic GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG (the work order's own
-        # rule: "keep existing generic guard OR show a controlled 'не
-        # знайшов, що саме змінити' message" — both are safe; nothing is
-        # ever applied either way). What actually matters here is preserved
-        # unchanged: the command is still fully blocked, and pending_
-        # cleanup_admin never starts.
+        # parse_text_correction), but with nothing addable/no expenses in
+        # this empty pending_global_household preview there are zero
+        # candidates to match — that now defers (see _try_apply_text_
+        # correction's "zero matches -> False" contract) to the Pending
+        # Preview Edit Planner V1 semantic fallback, patched here (like
+        # test_price_clarification.py) so it never hits the network; its
+        # default MagicMock return value safely fails JSON parsing and
+        # resolves to "no_change", so the fully generic
+        # GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG still fires and nothing is
+        # ever applied. What actually matters here is preserved unchanged:
+        # the command is still fully blocked, and pending_cleanup_admin
+        # never starts.
         chat_id = 771040
         bot.pending_global_household[chat_id] = {
             "add_shopping_items": [], "add_inventory_items": [], "consume_changes": [],
@@ -819,12 +822,10 @@ class TestBlockedByOtherActivePendingState(InventoryAdminWebhookTestCase):
             "household_id": 1, "user_db_id": 10, "origin": "global",
         }
         try:
-            _call_webhook(_make_update(771000040, chat_id, "перейменуй mlekо на молоко"))
+            with patch.object(bot, "call_gemini"):
+                _call_webhook(_make_update(771000040, chat_id, "перейменуй mlekо на молоко"))
             self.assertNotIn(chat_id, pending_cleanup_admin)
-            self.assertTrue(any(
-                t in (GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG, bot.TEXT_CORRECTION_NOT_FOUND_MSG)
-                for t in self._sent_texts()
-            ))
+            self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
         finally:
             bot.pending_global_household.pop(chat_id, None)
 
