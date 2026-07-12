@@ -801,6 +801,17 @@ class TestDeleteConfirmAndCancel(InventoryAdminWebhookTestCase):
 
 class TestBlockedByOtherActivePendingState(InventoryAdminWebhookTestCase):
     def test_rename_blocked_by_other_active_pending_state(self):
+        # Pending Preview Text Correction V1: "перейменуй X на Y" is now ALSO
+        # a recognized correction-phrase shape (see preview_editing.
+        # parse_text_correction) — with nothing addable/no expenses in this
+        # empty pending_global_household preview, it resolves to the new,
+        # more specific TEXT_CORRECTION_NOT_FOUND_MSG rather than the fully
+        # generic GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG (the work order's own
+        # rule: "keep existing generic guard OR show a controlled 'не
+        # знайшов, що саме змінити' message" — both are safe; nothing is
+        # ever applied either way). What actually matters here is preserved
+        # unchanged: the command is still fully blocked, and pending_
+        # cleanup_admin never starts.
         chat_id = 771040
         bot.pending_global_household[chat_id] = {
             "add_shopping_items": [], "add_inventory_items": [], "consume_changes": [],
@@ -810,7 +821,10 @@ class TestBlockedByOtherActivePendingState(InventoryAdminWebhookTestCase):
         try:
             _call_webhook(_make_update(771000040, chat_id, "перейменуй mlekо на молоко"))
             self.assertNotIn(chat_id, pending_cleanup_admin)
-            self.assertTrue(any(GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG == t for t in self._sent_texts()))
+            self.assertTrue(any(
+                t in (GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG, bot.TEXT_CORRECTION_NOT_FOUND_MSG)
+                for t in self._sent_texts()
+            ))
         finally:
             bot.pending_global_household.pop(chat_id, None)
 

@@ -996,6 +996,20 @@ PRICE_CLARIFICATION_AMBIGUOUS_MSG = (
     "Напиши остаточну сплачену суму напряму, наприклад «заплатив 10 zł»."
 )
 
+# Pending Preview Text Correction V1 — see _try_apply_text_correction's own
+# docstring. Sent instead of silently guessing when a recognized correction
+# phrase ("не X, а Y", "заміни X на Y", ...) doesn't cleanly resolve to
+# exactly one item/expense in the active preview.
+TEXT_CORRECTION_NOT_FOUND_MSG = (
+    "Не знайшов, що саме змінити в поточному плані.\n\n"
+    "Напиши точніше, або підтверди чи скасуй поточний план."
+)
+
+TEXT_CORRECTION_AMBIGUOUS_MSG = (
+    "У плані кілька рядків підходять під цю правку.\n\n"
+    "Напиши точніше, який саме рядок виправити."
+)
+
 UNDO_PREVIEW_KEYBOARD = {
     "keyboard": [
         ["✅ Так, скасувати"],
@@ -3936,27 +3950,86 @@ def _try_apply_price_clarification(chat_id, data, items, text):
     return True
 
 
+def _try_apply_text_correction(chat_id, data, items, text):
+    """Pending Preview Text Correction V1 — a short correction phrase ("не
+    X, а Y", "заміни X на Y", "перейменуй X на Y", "там має бути X не A, а
+    X B") that fixes an item name or expense description already sitting
+    in the active pending_global_household preview, instead of being
+    rejected as an unrelated new command by the generic pending-plan guard
+    message — that rejection was the actual live bug this function fixes.
+    Deterministic only (preview_editing.parse_text_correction), no Gemini
+    call — never touches quantities/amounts/units/dates/categories.
+
+    Every add_shopping/add_inventory item's `name` AND every new_expenses
+    entry's `description` are candidates; the correction applies ONLY when
+    EXACTLY ONE candidate's text contains the old fragment (case-
+    insensitive substring) — zero or 2+ matches send a targeted message
+    instead of ever guessing which one the user meant. Returns True if
+    `text` was fully handled (an updated preview, or a targeted no-match/
+    ambiguous message, was already sent) — False if `text` doesn't look
+    like a correction phrase at all, so the caller falls back to its own
+    existing behavior (price clarification, then the generic guard).
+    """
+    correction = preview_editing.parse_text_correction(text)
+    if correction is None:
+        return False
+
+    candidates = [("item", i, item["name"]) for i, item in enumerate(items)]
+    new_expenses = data.get("new_expenses") or []
+    candidates += [("expense", i, ne.get("description") or "") for i, ne in enumerate(new_expenses)]
+
+    matches = preview_editing.find_text_correction_targets(correction["old"], candidates)
+    if not matches:
+        send_message(chat_id, TEXT_CORRECTION_NOT_FOUND_MSG, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+        return True
+    if len(matches) > 1:
+        send_message(chat_id, TEXT_CORRECTION_AMBIGUOUS_MSG, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+        return True
+
+    kind, index, current_text = matches[0]
+    corrected_text = preview_editing.apply_text_correction(current_text, correction["old"], correction["new"])
+    if kind == "item":
+        # Mutates the SAME dict already referenced by data["add_shopping_
+        # items"]/["add_inventory_items"] — see PREVIEW EDIT V2's own
+        # module docstring for why `items` (this function's own param) and
+        # those lists always share item identity.
+        items[index]["name"] = corrected_text
+        items[index]["canonical_name"] = canonicalize_name(corrected_text)
+    else:
+        new_expenses[index]["description"] = corrected_text
+
+    preview = household_router.format_preview(data, header="Оновив план:")
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+    return True
+
+
 def _handle_global_household_edit_text(chat_id, text):
     data = pending_global_household.get(chat_id)
     if data is None:
         return
     items = data["add_shopping_items"] + data["add_inventory_items"]
-    if not items:
-        # Nothing addable in this preview (consume-only/expense-only) —
-        # there's no add-item target to edit at all, so fall straight back
-        # to the original "unfinished plan" guard, exactly as before
-        # Preview Edit V2 existed.
-        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+
+    if items:
+        ok, result = preview_editing.parse_household_add_preview_edit(text, items)
+        if ok:
+            preview_editing.apply_household_add_preview_edits(items, result, canonicalize_name, inventory.capitalize_first)
+            preview = household_router.format_preview(data, header="Оновив план:")
+            send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+            return
+        if _try_apply_text_correction(chat_id, data, items, text):
+            return
+        if _try_apply_price_clarification(chat_id, data, items, text):
+            return
+        send_message(chat_id, result or GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
         return
-    ok, result = preview_editing.parse_household_add_preview_edit(text, items)
-    if ok:
-        preview_editing.apply_household_add_preview_edits(items, result, canonicalize_name, inventory.capitalize_first)
-        preview = household_router.format_preview(data, header="Оновив план:")
-        send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+
+    # Nothing addable in this preview (consume-only/expense-only) — quantity
+    # edits and price clarification both require an add_shopping/add_
+    # inventory item, so neither applies; a text correction targeting an
+    # expense description still might (see _try_apply_text_correction).
+    if _try_apply_text_correction(chat_id, data, items, text):
         return
-    if _try_apply_price_clarification(chat_id, data, items, text):
-        return
-    send_message(chat_id, result or GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+    send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
 
 
 def _start_undo_flow(chat_id, user_id, display_name):

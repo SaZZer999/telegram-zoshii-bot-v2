@@ -655,6 +655,95 @@ def parse_price_clarification(text):
     return None
 
 
+# =========================
+# TEXT CORRECTION V1 — a short correction phrase ("не X, а Y", "заміни X на
+# Y", "перейменуй X на Y", "там має бути X не A, а X B") that fixes an item
+# name or expense description already sitting in an ACTIVE
+# pending_global_household preview, instead of being rejected as an
+# unrelated new command by the generic pending-plan guard message — that
+# rejection was the live bug this section fixes. Deterministic only, no
+# Gemini call: parse_text_correction only ever extracts an (old, new)
+# fragment pair; the caller (bot.py's _try_apply_text_correction) decides
+# WHICH item/expense it applies to (exactly one candidate whose text
+# contains `old`, never guessed across multiple matches — see that
+# function's own docstring) and calls apply_text_correction to build the
+# corrected text. Never touches quantities/amounts/units/dates/categories —
+# purely a substring replace within whichever single field matched.
+# =========================
+
+# "X не A, а X B" / "не A, а B" — the OPTIONAL leading `prefix` (a single
+# word right before "не", e.g. "подарунок", "це", or filler like "має
+# бути"'s last word) only controls whether an optional repeat of the SAME
+# word is consumed right after "а" — it is never itself part of the
+# returned old/new fragments, so a filler word captured here (e.g. "це")
+# that doesn't literally reappear after "а" is harmless: the optional
+# repeat group just matches zero times and `new` is extracted correctly
+# either way. re.search (not match) on purpose — the required "там має
+# бути ..." example has "не X, а Y" embedded mid-sentence, not at the start.
+_CONTRAST_CORRECTION_RE = re.compile(
+    r"(?:(?P<prefix>\S+)\s+)?не\s+(?P<old>.+?),?\s+а\s+(?:(?P=prefix)\s+)?(?P<new>.+?)[.!?]*$",
+    re.IGNORECASE,
+)
+
+_ZAMINY_CORRECTION_RE = re.compile(r"^заміни\s+(?P<old>.+?)\s+на\s+(?P<new>.+?)[.!?]*$", re.IGNORECASE)
+_PEREYMENUY_CORRECTION_RE = re.compile(r"^перейменуй\s+(?P<old>.+?)\s+на\s+(?P<new>.+?)[.!?]*$", re.IGNORECASE)
+
+
+def parse_text_correction(text):
+    """Deterministically parse a short correction phrase into {"old": str,
+    "new": str} — `old` is the fragment to find (case-insensitive
+    substring) among the active preview's item names/expense descriptions,
+    `new` is what to replace it with. Returns None if `text` doesn't match
+    any recognized correction shape at all — the caller must treat that
+    exactly like an unrecognized preview edit (fall back to its own
+    existing guard/clarification message), never guess.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+
+    m = _ZAMINY_CORRECTION_RE.match(stripped)
+    if m:
+        old, new = m.group("old").strip(), m.group("new").strip()
+        return {"old": old, "new": new} if old and new else None
+
+    m = _PEREYMENUY_CORRECTION_RE.match(stripped)
+    if m:
+        old, new = m.group("old").strip(), m.group("new").strip()
+        return {"old": old, "new": new} if old and new else None
+
+    m = _CONTRAST_CORRECTION_RE.search(stripped)
+    if m:
+        old = _strip_trailing_punct(m.group("old"))
+        new = _strip_trailing_punct(m.group("new"))
+        return {"old": old, "new": new} if old and new else None
+
+    return None
+
+
+def apply_text_correction(text, old_fragment, new_fragment):
+    """Replace the FIRST case-insensitive occurrence of `old_fragment`
+    within `text` with `new_fragment`, leaving the rest of `text` untouched
+    (e.g. "Подарунок сестрі" with old="сестрі"/new="дочці" ->
+    "Подарунок дочці") — never a full-text overwrite, so surrounding words
+    (a product name, a shared prefix) survive the correction unchanged."""
+    return re.sub(re.escape(old_fragment), new_fragment, text, count=1, flags=re.IGNORECASE)
+
+
+def find_text_correction_targets(old_fragment, candidates):
+    """`candidates` is a list of (kind, index, text) tuples (kind/index are
+    caller-defined, opaque here — e.g. ("item", 2, "Автокрісло") or
+    ("expense", 0, "Подарунок сестрі")). Returns the SUBSET whose `text`
+    contains `old_fragment` (case-insensitive substring) — the caller
+    applies the correction only when this list has EXACTLY one entry;
+    zero or 2+ matches must never guess (see this module's own "TEXT
+    CORRECTION V1" section docstring)."""
+    needle = (old_fragment or "").strip().lower()
+    if not needle:
+        return []
+    return [c for c in candidates if needle in (c[2] or "").lower()]
+
+
 def compute_quantity_multiplier(pending_value, pending_unit, unit_value, unit_unit):
     """How many `unit_value unit_unit`-sized units fit into `pending_value
     pending_unit` — e.g. (1, "кг") against (0.5, "кг") -> Decimal("2"). Same
