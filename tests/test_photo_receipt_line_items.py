@@ -54,7 +54,9 @@ class TestParseLineItems(unittest.TestCase):
             {"name": "Mleko", "quantity": "2", "unit": "л", "line_price": "8.00"},
         ])
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["name"], "Mleko")
+        # Receipt V2.1: "mleko" is a known grocery word — normalized to
+        # its Ukrainian household name (see _normalize_product_name).
+        self.assertEqual(items[0]["name"], "Молоко")
         self.assertEqual(items[0]["quantity_text"], "2 л")
         self.assertEqual(items[0]["line_price"], Decimal("8.00"))
 
@@ -70,7 +72,7 @@ class TestParseLineItems(unittest.TestCase):
             {"name": "Rabat -10%", "quantity": None, "unit": None, "line_price": "1.00"},
         ])
         names = [i["name"] for i in items]
-        self.assertEqual(names, ["Mleko"])
+        self.assertEqual(names, ["Молоко"])
 
     def test_kaucja_deposit_line_is_dropped(self):
         items = photo_receipts._parse_line_items([{"name": "Kaucja butelka", "quantity": None, "unit": None, "line_price": "0.50"}])
@@ -103,7 +105,7 @@ class TestParseLineItems(unittest.TestCase):
     def test_non_dict_entry_is_skipped(self):
         items = photo_receipts._parse_line_items(["not a dict", {"name": "Mleko", "quantity": "1", "unit": "л", "line_price": "4.00"}])
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["name"], "Mleko")
+        self.assertEqual(items[0]["name"], "Молоко")
 
 
 class TestDecideReceiptOutcomeWithLineItems(unittest.TestCase):
@@ -230,7 +232,9 @@ class TestCombinedExpenseAndInventoryPreview(PhotoLineItemsWebhookTestCase):
         self.assertEqual(data["new_expenses"][0]["description"], "Biedronka")
         names = {item["canonical_name"] for item in data["add_inventory_items"]}
         self.assertIn("молоко", names)
-        self.assertIn("jajka", names)
+        # Receipt V2.1: "jajka" is a known grocery word too — normalized
+        # to "яйця" before this canonical name is ever computed.
+        self.assertIn("яйця", names)
         texts = self._sent_texts()
         self.assertTrue(any("30,00 zł" in t and "🧊" in t and "💸" in t for t in texts))
 
@@ -386,7 +390,9 @@ class TestReceiptDiscountRowNeverDuplicatesProduct(unittest.TestCase):
         ]
         items = photo_receipts._parse_line_items(raw_items)
         names = [i["name"] for i in items]
-        self.assertEqual(names.count("SER GOUDA"), 1)
+        # Receipt V2.1: "SER GOUDA" is normalized to its Ukrainian display
+        # name before this count is even taken.
+        self.assertEqual(names.count("Сир Гауда"), 1)
         self.assertEqual(len(items), 3)
 
     def test_zabka_receipt_gives_one_cheese_item_not_two(self):
@@ -417,7 +423,7 @@ class TestReceiptDiscountRowNeverDuplicatesProduct(unittest.TestCase):
             _call_webhook(_make_photo_update(998010001, chat_id))
 
         data = pending_global_household[chat_id]
-        cheese_items = [i for i in data["add_inventory_items"] if i["canonical_name"] == "ser gouda"]
+        cheese_items = [i for i in data["add_inventory_items"] if i["canonical_name"] == "сир гауда"]
         self.assertEqual(len(cheese_items), 1)
         self.assertEqual(cheese_items[0]["quantity_value"], Decimal("1"))
         self.assertEqual(len(data["add_inventory_items"]), 3)
@@ -427,6 +433,102 @@ class TestReceiptDiscountRowNeverDuplicatesProduct(unittest.TestCase):
         self.assertEqual(data["new_expenses"][0]["description"], "Żabka")
         pending_expense.clear()
         pending_global_household.clear()
+
+
+# =========================
+# Receipt V2.1 — product name normalization (package-size stripping +
+# Polish/English -> Ukrainian grocery-word translation). See
+# photo_receipts._normalize_product_name/_strip_package_size.
+# =========================
+class TestProductNameNormalization(unittest.TestCase):
+    def test_package_size_suffix_stripped_and_used_as_fallback_quantity(self):
+        # 1 — "SER GOUDA 135g" -> display name "Сир Гауда", not the raw
+        # "SER GOUDA 135g" the live bug reported; the embedded "135g" is
+        # used as the quantity ONLY because Gemini's own quantity/unit
+        # fields were blank here.
+        item = photo_receipts._parse_line_item({
+            "name": "SER GOUDA 135g", "quantity": None, "unit": None, "line_price": "9.98",
+        })
+        self.assertEqual(item["name"], "Сир Гауда")
+        self.assertEqual(item["quantity_text"], "135 г")
+
+    def test_separate_gemini_quantity_wins_over_embedded_package_size(self):
+        item = photo_receipts._parse_line_item({
+            "name": "SER GOUDA 135g", "quantity": "2", "unit": "шт", "line_price": "19.96",
+        })
+        self.assertEqual(item["name"], "Сир Гауда")
+        self.assertEqual(item["quantity_text"], "2 шт")
+
+    def test_olej_bartek_preserves_brand_name(self):
+        # 2 — "OLEJ BARTEK" -> "Олія Bartek": translated grocery word +
+        # preserved brand, not just "Олія" alone.
+        item = photo_receipts._parse_line_item({
+            "name": "OLEJ BARTEK", "quantity": "1", "unit": "л", "line_price": "6.50",
+        })
+        self.assertEqual(item["name"], "Олія Bartek")
+
+    def test_czosnek_translates_to_chasnyk(self):
+        # 3 — "CZOSNEK" -> "Часник".
+        item = photo_receipts._parse_line_item({
+            "name": "CZOSNEK", "quantity": "1", "unit": "шт", "line_price": "1.80",
+        })
+        self.assertEqual(item["name"], "Часник")
+
+    def test_mleko_1l_strips_size_and_translates(self):
+        item = photo_receipts._parse_line_item({
+            "name": "MLEKO 1L", "quantity": None, "unit": None, "line_price": "4.50",
+        })
+        self.assertEqual(item["name"], "Молоко")
+        self.assertEqual(item["quantity_text"], "1 л")
+
+    def test_unrecognized_brand_only_name_gets_title_cased(self):
+        item = photo_receipts._parse_line_item({
+            "name": "COCA COLA", "quantity": "1", "unit": "л", "line_price": "7.00",
+        })
+        self.assertEqual(item["name"], "Coca Cola")
+
+
+# =========================
+# 4/5 — same-normalized-name duplicate where the discount row has NO price
+# at all (neither positive nor negative) — the negative-price check alone
+# can't catch this; _dedupe_discount_duplicates (grouping by the FINAL
+# normalized name) is what's needed.
+# =========================
+class TestMissingPriceDuplicateIsDropped(unittest.TestCase):
+    def test_priceless_duplicate_with_package_size_variant_is_dropped(self):
+        # The real row has the package-size suffix; Gemini's discount row
+        # for the SAME cheese has no distinguishing keyword AND no price
+        # at all (not even negative) — only visible as a same-name repeat
+        # once both are normalized to "Сир Гауда".
+        raw_items = [
+            {"name": "SER GOUDA 135g", "quantity": None, "unit": None, "line_price": "9.98"},
+            {"name": "SER GOUDA 135g", "quantity": None, "unit": None, "line_price": None},
+        ]
+        items = photo_receipts._parse_line_items(raw_items)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["name"], "Сир Гауда")
+        self.assertEqual(items[0]["line_price"], Decimal("9.98"))
+
+    def test_two_genuinely_priced_identical_products_both_kept(self):
+        # 5 — two CLEARLY real purchases (both have their own real price)
+        # of the identical product must still be allowed to become 2 шт.
+        raw_items = [
+            {"name": "Jajka", "quantity": None, "unit": None, "line_price": "6.00"},
+            {"name": "Jajka", "quantity": None, "unit": None, "line_price": "6.00"},
+        ]
+        items = photo_receipts._parse_line_items(raw_items)
+        self.assertEqual(len(items), 2)
+
+    def test_both_priceless_duplicates_kept_as_is(self):
+        # No stronger signal (a priced row to compare against) exists here
+        # — nothing safe to drop, so both survive unchanged rather than
+        # guessing which one (if either) is the discount.
+        raw_items = [
+            {"name": "Chleb", "quantity": None, "unit": None, "line_price": None},
+            {"name": "Chleb", "quantity": None, "unit": None, "line_price": None},
+        ]
+        items = photo_receipts._parse_line_items(raw_items)
+        self.assertEqual(len(items), 2)
 
 
 if __name__ == "__main__":

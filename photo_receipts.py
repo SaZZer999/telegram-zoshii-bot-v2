@@ -279,6 +279,102 @@ def _format_plain_number(value):
     return text or "0"
 
 
+# Receipt V2.1 — product name normalization. A raw receipt name commonly
+# has a package-size token baked in ("SER GOUDA 135g") and/or is plain
+# Polish/English in ALL CAPS — neither belongs in a household-friendly
+# inventory preview line. `\s*` between the number and unit lets an
+# unspaced "135g" match the same as a spaced "135 g"; the lookbehind/
+# lookahead require a real boundary on both sides so a number that's part
+# of some other word is never touched.
+_PACKAGE_SIZE_RE = re.compile(
+    r"(?<!\S)(\d+(?:[.,]\d+)?)\s*(kg|g|ml|l)(?=\s|$|[.,;)])", re.IGNORECASE,
+)
+_PACKAGE_SIZE_UNIT_DISPLAY = {"g": "г", "kg": "кг", "ml": "мл", "l": "л"}
+
+
+def _strip_package_size(name):
+    """Remove the FIRST embedded package-size token (e.g. "135g", "1L",
+    "500 ml") from `name`, returning (cleaned_name, embedded_quantity_text)
+    — embedded_quantity_text is None if no such token was found. The
+    caller only ever uses embedded_quantity_text as a FALLBACK when
+    Gemini's own separate quantity/unit fields for this line item came
+    back blank — a separately-reported quantity always wins over a token
+    parsed back out of the name text."""
+    m = _PACKAGE_SIZE_RE.search(name)
+    if not m:
+        return name, None
+    cleaned = re.sub(r"\s+", " ", (name[:m.start()] + name[m.end():])).strip()
+    unit_display = _PACKAGE_SIZE_UNIT_DISPLAY[m.group(2).lower()]
+    embedded_quantity_text = f"{m.group(1).replace(',', '.')} {unit_display}"
+    return cleaned, embedded_quantity_text
+
+
+# Deterministic Polish/English -> Ukrainian grocery-word translation,
+# applied word-by-word (or as a whole recognized phrase, checked first) —
+# never a full machine-translation attempt, just the common grocery
+# vocabulary this bot's household actually shops for. A word/phrase NOT in
+# either table (a brand name like "BARTEK") is preserved, only its casing
+# is normalized (ALL CAPS -> Title Case) — never dropped, never guessed at.
+_PHRASE_NAME_MAP = {
+    "ser gouda": "Сир Гауда",
+}
+# Sorted longest-phrase-first so a 2-word phrase is tried before any
+# single-word fallback below could shadow part of it.
+_PHRASE_NAME_MAP_ITEMS = sorted(
+    ((phrase.split(), translation) for phrase, translation in _PHRASE_NAME_MAP.items()),
+    key=lambda pair: -len(pair[0]),
+)
+
+_WORD_NAME_MAP = {
+    "olej": "олія", "czosnek": "часник", "ser": "сир",
+    "mleko": "молоко", "jajka": "яйця", "jaja": "яйця",
+    "masło": "масло", "maslo": "масло", "chleb": "хліб",
+    "bułka": "булка", "bulka": "булка",
+    "pomidor": "помідори", "pomidory": "помідори",
+    "ogórek": "огірки", "ogorek": "огірки", "ogórki": "огірки", "ogorki": "огірки",
+}
+
+
+def _normalize_product_name(name):
+    """Translate known Polish/English grocery words/phrases to Ukrainian,
+    word by word, preserving any unrecognized word (a brand name) as-is
+    except for ALL-CAPS -> Title Case cleanup — "OLEJ BARTEK" -> "Олія
+    Bartek" (translated + preserved brand), "SER GOUDA" -> "Сир Гауда"
+    (whole-phrase translation), "CZOSNEK" -> "Часник". Never raises;
+    returns `name` unchanged (just whitespace-normalized) if it has no
+    recognizable words at all."""
+    words = name.split()
+    if not words:
+        return name
+    lowered = [w.lower() for w in words]
+
+    result = []
+    i = 0
+    n = len(words)
+    while i < n:
+        matched = False
+        for phrase_words, translation in _PHRASE_NAME_MAP_ITEMS:
+            plen = len(phrase_words)
+            if lowered[i:i + plen] == phrase_words:
+                result.append(translation)
+                i += plen
+                matched = True
+                break
+        if matched:
+            continue
+        word, lw = words[i], lowered[i]
+        if lw in _WORD_NAME_MAP:
+            result.append(_WORD_NAME_MAP[lw])
+        elif word.isupper() and len(word) > 1:
+            result.append(word.capitalize())
+        else:
+            result.append(word)
+        i += 1
+
+    result[0] = result[0][:1].upper() + result[0][1:]
+    return " ".join(result)
+
+
 def _parse_line_item(raw):
     """One raw Gemini line_items entry -> {"name", "quantity_text",
     "line_price"} or None if malformed/blank/obviously not an inventory
@@ -289,33 +385,84 @@ def _parse_line_item(raw):
     at all; only the row's own NEGATIVE price marks it as a discount, not
     a second unit purchased — a name-only keyword filter would auto-merge
     that second row into the real one (1+1 -> "2 шт.", the live bug this
-    fixes). `quantity_text` is either a clean "<number> <unit>" string
-    (only when BOTH parsed cleanly) or "" (an unclear quantity — safely
-    defaults downstream, never guessed here). Never raises."""
+    fixes). A second live bug (a discount row that DOESN'T even get a
+    negative price from Gemini — just no price at all) is handled one
+    level up, in _parse_line_items' own dedup pass, once every row's FINAL
+    normalized name is known.
+
+    `name` is normalized before being returned: any embedded package-size
+    token ("135g", "1L", ...) is stripped out (see _strip_package_size) —
+    used as a FALLBACK quantity only when Gemini's own quantity/unit for
+    this row came back blank, never overriding a real one — and known
+    Polish/English grocery words are translated to Ukrainian (see
+    _normalize_product_name); an unrecognized word (a brand name) is kept,
+    only its casing is cleaned up. `quantity_text` is either a clean
+    "<number> <unit>" string or "" (an unclear quantity — safely defaults
+    downstream, never guessed here). Never raises."""
     if not isinstance(raw, dict):
         return None
-    name = raw.get("name")
-    if not isinstance(name, str) or not name.strip():
+    raw_name = raw.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
         return None
-    name = name.strip()
-    if _looks_like_non_inventory_name(name):
+    raw_name = raw_name.strip()
+    if _looks_like_non_inventory_name(raw_name):
         return None
 
     signed_price = _parse_amount(raw.get("line_price"), require_positive=False)
     if signed_price is not None and signed_price < 0:
         return None
 
+    stripped_name, embedded_quantity_text = _strip_package_size(raw_name)
+    display_name = _normalize_product_name(stripped_name)
+
     quantity_text = ""
     quantity_value = _parse_amount(raw.get("quantity"))
     raw_unit = raw.get("unit")
     if quantity_value is not None and isinstance(raw_unit, str) and raw_unit.strip().lower() in _VALID_ITEM_UNITS:
         quantity_text = f"{_format_plain_number(quantity_value)} {raw_unit.strip().lower()}"
+    if not quantity_text and embedded_quantity_text:
+        quantity_text = embedded_quantity_text
 
     return {
-        "name": name,
+        "name": display_name,
         "quantity_text": quantity_text,
         "line_price": _parse_amount(raw.get("line_price")),
     }
+
+
+def _dedupe_discount_duplicates(items):
+    """Second layer of duplicate/discount defense (see _parse_line_item's
+    own docstring): groups already-parsed items by their FINAL normalized
+    name (case-insensitive) — this is what lets "SER GOUDA 135g" (the real
+    purchase) and a second "SER GOUDA 135g" discount row that Gemini
+    reported with NO price at all (neither positive nor negative, so
+    _parse_line_item's own negative-price check never saw anything to
+    reject) both resolve to the same "Сир Гауда" key and be recognized as
+    duplicates here.
+
+    Within a same-name group: if at least one row has a real line_price
+    AND at least one has none at all, the priceless row(s) are dropped —
+    a genuine second unit purchased almost always shows its own price too,
+    so a same-name row with NO price sitting next to one that DOES have a
+    price is exactly the "suspicious metadata" signature of an
+    unlabeled discount/correction line, never a real second item. If
+    EVERY row in the group has a real price (two genuinely identical
+    purchases), all are kept — quantity 2 is a perfectly normal outcome
+    then, not a bug."""
+    groups = {}
+    for i, item in enumerate(items):
+        groups.setdefault(item["name"].strip().lower(), []).append(i)
+
+    drop = set()
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        priced = [i for i in indices if items[i]["line_price"] is not None]
+        unpriced = [i for i in indices if items[i]["line_price"] is None]
+        if priced and unpriced:
+            drop.update(unpriced)
+
+    return [item for i, item in enumerate(items) if i not in drop]
 
 
 def _parse_line_items(raw_items):
@@ -323,7 +470,8 @@ def _parse_line_items(raw_items):
     drops (never rejects the whole receipt for) an individual malformed or
     denylisted entry, since a receipt commonly has many items and one bad
     OCR line/discount row must never block the others. Returns [] if
-    `raw_items` itself isn't a list at all."""
+    `raw_items` itself isn't a list at all. See _dedupe_discount_
+    duplicates for the final same-name-collision pass."""
     if not isinstance(raw_items, list):
         return []
     items = []
@@ -331,7 +479,7 @@ def _parse_line_items(raw_items):
         item = _parse_line_item(raw)
         if item is not None:
             items.append(item)
-    return items
+    return _dedupe_discount_duplicates(items)
 
 
 def _normalize_category_hint(raw_category):
