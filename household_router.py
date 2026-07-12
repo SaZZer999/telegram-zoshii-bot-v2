@@ -107,6 +107,31 @@ _MISTAKE_EXPENSE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Purchase Event Planner V1 — a deterministic, Python-side safety net for
+# add_expense amounts (belt-and-suspenders alongside _amount_literally_in_
+# text and the prompt's own "ambiguous_expense" instruction below): if the
+# message mentions a discount/percentage anywhere, ANY add_expense operation
+# Gemini still returned for it is treated as ambiguous rather than validated
+# normally — see _validate_operations_detailed's `has_discount_marker`. This
+# never depends on Gemini actually following the prompt correctly: a stated
+# original price ("коштує 20 zł") often IS a literal number in the text (so
+# _amount_literally_in_text alone would let it through) even though it is
+# NOT what was actually paid once a discount applies.
+_DISCOUNT_MARKER_RE = re.compile(
+    r"знижк\w*|знижен\w*|відсот\w*|скидк\w*|zniżk\w*|промо\w*|%",
+    re.IGNORECASE,
+)
+
+
+def _dedupe_preserve_order(items):
+    """First-occurrence-wins de-duplication for user-facing reason/fragment/
+    note lists — several validation branches can independently produce the
+    exact same wording for the same underlying problem (e.g. two ops both
+    failing for the same reason); showing it twice is confusing noise, never
+    new information, so every caller that builds one of these lists dedupes
+    right before it reaches the user."""
+    return list(dict.fromkeys(items))
+
 
 def gate(text):
     """True if `text` contains phrasing this router is meant to handle —
@@ -132,7 +157,9 @@ def gate(text):
 # =========================
 # GEMINI PROMPT
 # =========================
-_ALLOWED_OP_TYPES = {"add_shopping", "add_inventory", "consume_inventory", "add_expense", "delete_expense"}
+_ALLOWED_OP_TYPES = {
+    "add_shopping", "add_inventory", "consume_inventory", "add_expense", "delete_expense", "ambiguous_expense",
+}
 
 HOUSEHOLD_ROUTER_PROMPT = (
     "Ти помічник одного домашнього господарства. Користувач пише одне повідомлення про побутові справи: "
@@ -166,6 +193,13 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "«червоної квасолі» → name «Червона квасоля»; «мисливських ковбасок» → name «Мисливські ковбаски». "
     "НІКОЛИ не скорочуй name до одного загального іменника (напр. «Чай», «Молоко», «Йогурт»), якщо в "
     "оригінальному тексті перед іменником був прикметник чи означення.\n"
+    "Якщо кількість написана словом із чітким числовим значенням («пів кілограма», «пів літра», «два "
+    "кілограми») — переведи quantity_text у явний числовий вигляд («0,5 кг», «0,5 л», «2 кг»), а НЕ залишай "
+    "словами (виняток — «пара»/«пару», для них лишай слово, як описано вище). Якщо той самий товар "
+    "згадується в повідомленні кілька разів із кількістю (напр. «купив пів кілограма печива, а потім "
+    "повернувся і купив ще пів») — додай ОКРЕМУ операцію add_inventory з тим самим name на КОЖНУ згадку "
+    "(«0,5 кг» і «0,5 кг» окремо) — Python сам підсумує однакові товари; ти НІКОЛИ сам не підсумовуй "
+    "кількості в одну операцію.\n"
     "Приклад (для «Купив пару сосисок»): {\"type\": \"add_inventory\", \"name\": \"Сосиски\", "
     "\"quantity_text\": \"пару\", \"category\": \"М'ясо та риба\"}\n"
     "Приклад (для «Купив дві пачки сосисок»): {\"type\": \"add_inventory\", \"name\": \"Сосиски\", "
@@ -173,7 +207,9 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "Приклад (для «Додай до покупок 1 шт. тестового чаю»): {\"type\": \"add_shopping\", "
     "\"name\": \"Тестовий чай\", \"quantity_text\": \"1 шт.\", \"category\": \"Напої\"}\n"
     "3. Якщо повідомлення означає «купив X ЗА Y zł» — це ОДНА покупка з ціною: додай ОБИДВІ операції — "
-    "add_inventory (сам товар) І add_expense (сума) в одному масиві operations.\n"
+    "add_inventory (сам товар) І add_expense (сума) в одному масиві operations. Але якщо ця сама ціна "
+    "згадується РАЗОМ зі знижкою/відсотком (напр. «коштує 20 zł, але знижка 50%») — Y НЕ є сумою, яку "
+    "фактично сплачено: не додавай add_expense у цьому випадку, дивись тип 7 (ambiguous_expense) нижче.\n"
     "4. «consume_inventory» — людина з'їла/використала частину запасів (напр. «З'їв 2 ковбаски», "
     "«Використала 200 г масла»). Повертай це ЛИШЕ коли кількість чітко вказана числом і одиницею. Якщо "
     "кількість неясна («з'їв трохи молока») — не вигадуй operations для цього фрагмента, а опиши фрагмент у "
@@ -193,7 +229,14 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "ОДНА позиція з наданого списку останніх витрат явно відповідає опису; якщо жодна або кілька можуть "
     "підходити — не повертай цю операцію, опиши фрагмент у unresolved_fragments замість того, щоб вгадувати. "
     "Поле: selected_numbers — масив з РІВНО одним номером зі списку останніх витрат. Максимум одна операція "
-    "delete_expense на повідомлення.\n\n"
+    "delete_expense на повідомлення.\n"
+    "7. «ambiguous_expense» — повідомлення згадує ціну/суму покупки, але її НЕ можна безпечно перетворити на "
+    "add_expense: разом зі знижкою/відсотком (напр. «коштувало 20, але знижка 50%», «−30%», «акція»), "
+    "оригінальну/довідкову ціну без явно сплаченої суми, або будь-яку суму, яку довелося б обчислювати "
+    "(відсоток, ділення, сума кількох цін). НІКОЛИ не обчислюй і не вигадуй остаточну суму в такому випадку. "
+    "Замість add_expense додай ОДНУ операцію {\"type\": \"ambiguous_expense\", \"note\": \"короткий опис "
+    "українською, чому сума неоднозначна\"}. add_expense дозволено лише коли в тексті є ОДНЕ явне число, яке "
+    "користувач написав як фактично СПЛАЧЕНУ суму, без жодних знижок/відсотків поруч.\n\n"
     "Категорії товарів (для add_shopping/add_inventory): М'ясо та риба, Молочне та яйця, Овочі та зелень, "
     "Фрукти та ягоди, Хліб і випічка, Крупи, макарони та борошно, Соуси, спеції та бакалія, Солодке та "
     "снеки, Напої, Заморожене, Інше їстівне.\n"
@@ -202,14 +245,29 @@ HOUSEHOLD_ROUTER_PROMPT = (
     "Якщо частину повідомлення не можна безпечно перетворити на жодну з цих операцій — додай короткий опис "
     "цього фрагмента в unresolved_fragments (масив рядків) і НЕ вигадуй операцію для нього. Завжди повертай "
     "це поле, навіть порожнім масивом. Якщо unresolved_fragments непорожній — все одно поверни всі операції, "
-    "які вдалося розпізнати впевнено (Python вирішить, блокувати їх чи ні).\n\n"
+    "які вдалося розпізнати впевнено (Python вирішить, блокувати їх чи ні).\n"
+    "ВАЖЛИВО про unresolved_fragments: туди йдуть ЛИШЕ фрагменти, що виглядають як НАМІР дії (товар, "
+    "кількість чи сума), який не вдалося безпечно розпізнати. НІКОЛИ не додавай у unresolved_fragments чисто "
+    "оповідальні деталі, які не описують товар/кількість/суму (хто, де, яка погода, зовнішність людей, "
+    "побічні деталі сюжету) — такі деталі просто ігноруй, вони не впливають на жодну операцію.\n\n"
     "Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON:\n"
     "{\"intent\": \"household_operations\", \"operations\": ["
     "{\"type\": \"add_inventory\", \"name\": \"Масло\", \"quantity_text\": \"\", \"category\": \"Молочне та яйця\"}, "
     "{\"type\": \"add_expense\", \"amount\": \"10\", \"currency\": \"PLN\", \"category\": \"Продукти\", "
     "\"description\": \"Масло\", \"expense_date\": \"2026-07-05\"}"
     "], \"unresolved_fragments\": []}\n"
-    "Приклад none: {\"intent\": \"none\", \"operations\": [], \"unresolved_fragments\": []}"
+    "Приклад none: {\"intent\": \"none\", \"operations\": [], \"unresolved_fragments\": []}\n"
+    "Приклад (для «Вчора після роботи я зайшов в магазин заді дому. Там дід з вусами продавав дуже смачне "
+    "печиво. Воно в загальному коштує 20 злотих, але на нього було 50% знижки. Я купив пів кілограма, але "
+    "воно було таке смачне, що я вернувся і купив ще пів.»): {\"intent\": \"household_operations\", "
+    "\"operations\": ["
+    "{\"type\": \"add_inventory\", \"name\": \"Печиво\", \"quantity_text\": \"0,5 кг\", \"category\": "
+    "\"Солодке та снеки\"}, "
+    "{\"type\": \"add_inventory\", \"name\": \"Печиво\", \"quantity_text\": \"0,5 кг\", \"category\": "
+    "\"Солодке та снеки\"}, "
+    "{\"type\": \"ambiguous_expense\", \"note\": \"Ціна 20 zł зі знижкою 50% — неясно, скільки фактично "
+    "сплачено за пів кілограма, а скільки за обидва рази\"}"
+    "], \"unresolved_fragments\": []}"
 )
 
 
@@ -715,9 +773,17 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
           caller's inventory_targets so confirm-time re-verifies them),
           consume_changes (resolved dicts, see _resolve_consumption shape),
           new_expense (dict or None), delete_expense (dict or None: id +
-          snapshot + display label).
+          snapshot + display label), expense_notes (Purchase Event Planner
+          V1 — [str, ...], possibly empty: non-blocking warnings that a
+          price/amount was mentioned but wasn't safe to turn into an
+          add_expense, e.g. a discount; rendered by format_preview, never
+          written to the database).
       ("unresolved", [fragment_str, ...]) — blocks the entire result.
       ("invalid", [reason_str, ...]) — blocks the entire result.
+      ("ambiguous_expense", [note_str, ...]) — Purchase Event Planner V1,
+          safe response B: the ONLY content recognized in the message was
+          an ambiguous price (no item/quantity/other action at all) — a
+          clarification, never a blocking error, never an invented amount.
       ("clarify", {"item_name", "canonical_name", "category", "existing_items",
                     "add_shopping_items", "add_inventory_items",
                     "consume_changes", "new_expense", "delete_expense"})
@@ -744,7 +810,7 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
     """
     fragments = router_result.get("unresolved_fragments")
     if isinstance(fragments, list):
-        cleaned_fragments = [str(f).strip() for f in fragments if str(f).strip()]
+        cleaned_fragments = _dedupe_preserve_order(str(f).strip() for f in fragments if str(f).strip())
         if cleaned_fragments:
             return "unresolved", cleaned_fragments
 
@@ -762,8 +828,15 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
     consume_representation_conflicts = []
     used_inventory_numbers = set()
     new_expenses = []
+    expense_notes = []
     delete_expense = None
     delete_expense_count = 0
+
+    # Purchase Event Planner V1 — see _DISCOUNT_MARKER_RE's own comment: a
+    # discount/percentage mention anywhere in the ORIGINAL message makes
+    # every add_expense op in this batch ambiguous, regardless of whether
+    # Gemini already followed the prompt's own "ambiguous_expense" instruction.
+    has_discount_marker = bool(source_text) and bool(_DISCOUNT_MARKER_RE.search(source_text))
 
     total_inventory = len(inventory_items)
 
@@ -851,6 +924,27 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             })
 
         elif op_type == "add_expense":
+            if has_discount_marker:
+                # Purchase Event Planner V1 — see has_discount_marker's own
+                # comment above: a discount/percentage anywhere in the
+                # message means this op's amount is never trustworthy
+                # (an original/list price, not what was actually paid), so
+                # it becomes a non-blocking clarification note instead of
+                # either a blocking "invalid" reason or a silently-invented
+                # expense — Gemini's own proposed amount (if any) is quoted
+                # back so the user can tell it apart from unrelated notes.
+                proposed_amount = op.get("amount")
+                if isinstance(proposed_amount, str) and proposed_amount.strip():
+                    expense_notes.append(
+                        f"У повідомленні є знижка — сума ({proposed_amount.strip()} zł?) може бути "
+                        "неточною. Напиши точну сплачену суму, якщо хочеш додати цю витрату."
+                    )
+                else:
+                    expense_notes.append(
+                        "У повідомленні є знижка — сума покупки неоднозначна. Напиши точну сплачену "
+                        "суму, якщо хочеш додати цю витрату."
+                    )
+                continue
             currency = op.get("currency")
             if currency not in (None, "PLN"):
                 reasons.append("Не можу безпечно визначити валюту витрати.")
@@ -878,6 +972,17 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
                 "expense_date": expense_date,
             })
 
+        elif op_type == "ambiguous_expense":
+            # Gemini's own signal (see the prompt's type 7) that a price/
+            # amount was mentioned but can't be safely turned into
+            # add_expense — never blocking, never an invented amount, just
+            # a note attached to whatever else in the message DID validate.
+            note = op.get("note")
+            if isinstance(note, str) and note.strip():
+                expense_notes.append(note.strip())
+            else:
+                expense_notes.append("Сума покупки неоднозначна — уточни, скільки фактично сплачено.")
+
         elif op_type == "delete_expense":
             delete_expense_count += 1
             if delete_expense_count > 1:
@@ -900,7 +1005,21 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             }
 
     if reasons:
-        return "invalid", reasons
+        return "invalid", _dedupe_preserve_order(reasons)
+
+    if has_discount_marker and not expense_notes and not new_expenses:
+        # A discount was mentioned but produced no add_expense AND no
+        # ambiguous_expense note at all (e.g. Gemini silently dropped the
+        # price instead of following the prompt's "ambiguous_expense"
+        # instruction) — still surface it, so "expense amount needs
+        # clarification" is never silently lost (see the module's Purchase
+        # Event Planner V1 docs/regression coverage).
+        expense_notes.append(
+            "У повідомленні згадано знижку — суму витрати не додано. Напиши точну сплачену суму, якщо "
+            "хочеш додати цю витрату."
+        )
+
+    expense_notes = _dedupe_preserve_order(expense_notes)
 
     add_shopping_items = _bot._auto_merge_in_place(add_shopping_raw) if add_shopping_raw else []
     add_inventory_items = _bot._auto_merge_in_place(add_inventory_raw) if add_inventory_raw else []
@@ -948,6 +1067,7 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             "new_expenses": new_expenses,
             "new_expense": _legacy_single_expense(new_expenses),
             "delete_expense": delete_expense,
+            "expense_notes": expense_notes,
         }
     add_inventory_items, inventory_merge_targets = guard_result
 
@@ -963,9 +1083,16 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             "new_expenses": new_expenses,
             "new_expense": _legacy_single_expense(new_expenses),
             "delete_expense": delete_expense,
+            "expense_notes": expense_notes,
         }
 
     if not add_shopping_items and not add_inventory_items and not consume_changes and not new_expenses and not delete_expense:
+        if expense_notes:
+            # Purchase Event Planner V1, safe response B: the ONLY thing in
+            # this message was an ambiguous price (no item/quantity/other
+            # action recognized at all) — ask for clarification instead of
+            # a blocking "invalid" error, and never invent/compute anything.
+            return "ambiguous_expense", expense_notes
         return "invalid", ["Не знайшов жодної дії для виконання."]
 
     return "ok", {
@@ -976,6 +1103,7 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
         "new_expense": _legacy_single_expense(new_expenses),
         "delete_expense": delete_expense,
         "inventory_merge_targets": inventory_merge_targets,
+        "expense_notes": expense_notes,
     }
 
 
@@ -1105,6 +1233,16 @@ def format_preview(payload, header="План змін:"):
         if delete_expense:
             lines.append(f"• Видалити {delete_expense['display']} — {delete_expense['amount_display']}")
 
+    # Purchase Event Planner V1 — a non-blocking warning that a price/amount
+    # was mentioned somewhere in the message but wasn't safe to turn into an
+    # expense (a discount, a computed/derived sum, ...). Never blocks the
+    # rest of the preview; the user can still confirm everything else as-is.
+    expense_notes = payload.get("expense_notes") or []
+    if expense_notes:
+        lines.append("")
+        for note in expense_notes:
+            lines.append(f"⚠️ {note}")
+
     lines.append("")
     lines.append("✅ Так, застосувати")
     lines.append("❌ Скасувати")
@@ -1124,6 +1262,20 @@ def format_invalid_message(reasons):
     lines = ["Не зміг безпечно обробити всі дії. Нічого не було змінено.", "", "Причина:"]
     for reason in reasons:
         lines.append(f"• {reason}")
+    return "\n".join(lines)
+
+
+def format_ambiguous_expense_message(notes):
+    """Purchase Event Planner V1, safe response B — used when a message's
+    ONLY content was an ambiguous price (no item/quantity/other action
+    recognized at all): a clarification, never a blocking error and never
+    an invented amount. Nothing is written; the user's next message can
+    freely retry with an explicit paid amount."""
+    lines = ["Не зовсім зрозуміло, скільки фактично сплачено.", ""]
+    for note in notes:
+        lines.append(f"• {note}")
+    lines.append("")
+    lines.append("Напиши точну суму, яку сплачено, якщо хочеш додати цю витрату.")
     return "\n".join(lines)
 
 

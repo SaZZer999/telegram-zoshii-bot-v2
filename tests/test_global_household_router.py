@@ -231,10 +231,16 @@ class TestAmountMustBeLiterallyTyped(unittest.TestCase):
     case above, none of which pass source_text and all of which still pass."""
 
     def test_computed_discount_amount_is_rejected(self):
+        # Purchase Event Planner V1: a discount-computed amount is no longer
+        # a blocking "invalid" result — the item itself (Печиво) is still
+        # safe to preview, so this is now "ok" with an empty new_expenses
+        # and a non-blocking expense_notes warning instead. The core safety
+        # guarantee this test exists for is unchanged: the fabricated "10"
+        # NEVER reaches new_expenses/DB, discount or not.
         router_result = {
             "intent": "household_operations",
             "operations": [
-                {"type": "add_inventory", "name": "Печиво", "quantity_text": "пів кілограма",
+                {"type": "add_inventory", "name": "Печиво", "quantity_text": "0,5 кг",
                  "category": "Солодке та снеки"},
                 {"type": "add_expense", "amount": "10", "currency": "PLN", "category": "Продукти",
                  "description": "Печиво", "expense_date": "2026-07-05"},
@@ -246,11 +252,15 @@ class TestAmountMustBeLiterallyTyped(unittest.TestCase):
             "але на нього було 50% знижки. Тому я взяв пів кілограма, але потім вернувся "
             "і докупив ще раз так само."
         )
-        kind, reasons = household_router._validate_operations_detailed(
+        kind, payload = household_router._validate_operations_detailed(
             router_result, [], [], NOW, source_text=text,
         )
-        self.assertEqual(kind, "invalid")
-        self.assertTrue(reasons)
+        self.assertEqual(kind, "ok")
+        self.assertEqual(payload["new_expenses"], [])
+        self.assertIsNone(payload["new_expense"])
+        self.assertTrue(payload["expense_notes"])
+        self.assertEqual(len(payload["add_inventory_items"]), 1)
+        self.assertEqual(payload["add_inventory_items"][0]["name"], "Печиво")
 
     def test_explicit_typed_amount_is_accepted(self):
         router_result = {

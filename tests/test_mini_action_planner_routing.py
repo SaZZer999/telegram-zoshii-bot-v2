@@ -351,10 +351,15 @@ class TestTelegramTranscriptRegressions(MiniActionPlannerWebhookTestCase):
     # Case 6 — the complex cookie/discount/past-date prompt: household_
     # router.gate() matches ("купив"), so this is handled entirely by the
     # (pre-existing) Global Household Router command route, BEFORE Phase D
-    # / mini_action_planner is ever reached. Must reject the invented
-    # discount-computed expense — no preview, no DB write — rather than
-    # silently accepting fabricated prices.
-    def test_complex_discount_prompt_never_creates_expense_preview(self):
+    # / mini_action_planner is ever reached. Purchase Event Planner V1: the
+    # invented discount-computed expense must still never reach new_expenses
+    # / apply_global_household_operations — but the item itself (Печиво,
+    # merged to 1 кг) is now safe to show as an inventory-only preview with
+    # a non-blocking warning, instead of refusing the whole message with no
+    # preview at all (see tests/test_global_household_router.py's
+    # TestAmountMustBeLiterallyTyped.test_computed_discount_amount_is_rejected
+    # for the pure validation-layer version of this same guarantee).
+    def test_complex_discount_prompt_creates_safe_inventory_only_preview(self):
         chat_id = 991774
         text = (
             "Вчора в магазині позаду дому я купив печиво по знижці, воно коштувало 20, "
@@ -364,9 +369,9 @@ class TestTelegramTranscriptRegressions(MiniActionPlannerWebhookTestCase):
         fake_router_result = {
             "intent": "household_operations",
             "operations": [
-                {"type": "add_inventory", "name": "Печиво", "quantity_text": "пів кілограма",
+                {"type": "add_inventory", "name": "Печиво", "quantity_text": "0,5 кг",
                  "category": "Солодке та снеки"},
-                {"type": "add_inventory", "name": "Печиво", "quantity_text": "пів кілограма",
+                {"type": "add_inventory", "name": "Печиво", "quantity_text": "0,5 кг",
                  "category": "Солодке та снеки"},
                 {"type": "add_expense", "amount": "10", "currency": "PLN", "category": "Продукти",
                  "description": "Печиво", "expense_date": "2026-07-11"},
@@ -379,9 +384,20 @@ class TestTelegramTranscriptRegressions(MiniActionPlannerWebhookTestCase):
             with patch.object(mini_action_planner, "classify") as mock_classify:
                 with patch.object(bot, "apply_global_household_operations") as mock_apply:
                     _call_webhook(_make_update(991774001, chat_id, text))
+        # No DB write before confirm — a preview only, never applied.
         mock_apply.assert_not_called()
         mock_classify.assert_not_called()
-        self.assertNotIn(chat_id, pending_global_household)
+        self.assertIn(chat_id, pending_global_household)
+        pending = pending_global_household[chat_id]
+        # The fabricated discount-computed "10" never reaches new_expenses.
+        self.assertEqual(pending["new_expenses"], [])
+        self.assertIsNone(pending["new_expense"])
+        self.assertEqual(len(pending["add_inventory_items"]), 1)
+        self.assertEqual(pending["add_inventory_items"][0]["name"], "Печиво")
+        self.assertEqual(pending["add_inventory_items"][0]["quantity_value"], 1)
+        texts = self._sent_texts()
+        self.assertTrue(any("Печиво" in t and "1 кг" in t for t in texts))
+        self.assertTrue(any("знижк" in t.lower() for t in texts))
 
 
 if __name__ == "__main__":

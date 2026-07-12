@@ -3425,6 +3425,13 @@ def _handle_household_router_result(chat_id, kind, payload, household_id, user_d
     if kind == "invalid":
         send_message(chat_id, household_router.format_invalid_message(payload), reply_markup=keyboard)
         return True
+    if kind == "ambiguous_expense":
+        # Purchase Event Planner V1, safe response B — the message only
+        # contained an ambiguous price (no item/quantity/other action at
+        # all): ask for clarification, never a blocking error, nothing
+        # written.
+        send_message(chat_id, household_router.format_ambiguous_expense_message(payload), reply_markup=keyboard)
+        return True
     if kind == "clarify":
         # Inventory Representation Guard: an inferred incoming quantity
         # conflicts with an existing row's representation — block the
@@ -3445,6 +3452,7 @@ def _handle_household_router_result(chat_id, kind, payload, household_id, user_d
             "new_expenses": payload["new_expenses"],
             "new_expense": payload["new_expense"],
             "delete_expense": payload["delete_expense"],
+            "expense_notes": payload.get("expense_notes", []),
         }
         send_message(
             chat_id,
@@ -3473,6 +3481,7 @@ def _handle_household_router_result(chat_id, kind, payload, household_id, user_d
             "new_expense": payload["new_expense"],
             "delete_expense": payload["delete_expense"],
             "representation_resolutions": [],
+            "expense_notes": payload.get("expense_notes", []),
         }
         _send_representation_v2_choice_message(chat_id, payload["conflict"])
         return True
@@ -4011,6 +4020,7 @@ def _continue_inventory_quantity_clarification(chat_id, text):
                 "new_expenses": new_expenses,
                 "new_expense": legacy_new_expense,
                 "delete_expense": data["delete_expense"],
+                "expense_notes": data.get("expense_notes", []),
             }
             send_message(
                 chat_id,
@@ -4031,6 +4041,7 @@ def _continue_inventory_quantity_clarification(chat_id, text):
             "new_expense": legacy_new_expense,
             "delete_expense": data["delete_expense"],
             "inventory_merge_targets": inventory_merge_targets,
+            "expense_notes": data.get("expense_notes", []),
         }
         inventory_targets = _snapshot_targets(payload["consume_changes"]) + payload["inventory_merge_targets"]
         pending_global_household[chat_id] = {
@@ -4119,6 +4130,7 @@ def _advance_representation_v2_queue(chat_id, data, resolution, extra_consume_ch
         "new_expense": data["new_expense"],
         "delete_expense": data["delete_expense"],
         "inventory_representation_resolutions": data["representation_resolutions"],
+        "expense_notes": data.get("expense_notes", []),
     }
     inventory_targets = _snapshot_targets(payload["consume_changes"]) + data["inventory_merge_targets"]
     pending_global_household[chat_id] = {
