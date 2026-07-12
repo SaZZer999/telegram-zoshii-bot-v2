@@ -92,6 +92,7 @@ import meal_ideas
 import preview_editing
 import voice_input
 import photo_receipts
+import mini_action_planner
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
 
@@ -3472,6 +3473,84 @@ def _try_global_household_router(chat_id, user_id, display_name, text):
 
 
 # =========================
+# UNIFIED MINI ACTION PLANNER V1 — bot.py-side glue only. mini_action_
+# planner.py does the actual Gemini call + top-level JSON validation (pure,
+# no Telegram/DB/pending state of its own); this function fetches whatever
+# live snapshot the classified action needs, hands add_to_shopping/add_to_
+# inventory to the SAME household_router preview + confirm/cancel machinery
+# every other household-router-shaped result already uses, and routes
+# ask_inventory/meal_ideas to their existing read-only handlers. Called from
+# message_dispatcher.py's Phase D (see DispatcherDeps.mini_action_planner's
+# docstring) — the LAST attempt before general AI-chat, only ever reached
+# once every deterministic route, cooking mode, meal_ideas' own gate and
+# household_read's own gate+classifier have already declined the message.
+# =========================
+def _try_mini_action_planner(chat_id, user_id, display_name, text):
+    """Returns True if the message was fully handled (a preview, a read-only
+    answer, or an error message was sent) — the caller must not fall through
+    to general AI-chat in that case. Returns False for action=="unknown" (or
+    any validation failure along the way), letting the caller fall through
+    to general_ai_fallback exactly as before this planner existed. Never
+    writes to the database directly — add_to_shopping/add_to_inventory only
+    ever build a pending_global_household preview, identical in shape and
+    confirm/cancel behavior to every other household-router result.
+
+    Defers to the SAME two deterministic, Gemini-free guards
+    _run_general_ai_fallback itself checks before ever calling Gemini
+    (_looks_like_destructive_bulk_household_request/_looks_like_unrouted_
+    household_action) — without this, a bare "Видали все" or a household-
+    action-shaped line ("Прибрати Чай — 1 шт.") this bot deliberately never
+    sends to Gemini for would otherwise burn a real planner call first,
+    only to still land on the exact same controlled message afterward.
+
+    Also defers to mini_action_planner.looks_household_like(text) — a
+    cheap, deterministic pre-gate (see that function's own docstring) that
+    keeps ordinary small-talk ("Привіт, як справи?", "Поясни, чому молоко
+    згортається в каві?") down to the ONE Gemini call general_ai_fallback
+    already makes, instead of burning a second, wasted classify() call on a
+    message this planner was never going to recognize as one of its five
+    actions anyway."""
+    if _looks_like_destructive_bulk_household_request(text) or _looks_like_unrouted_household_action(text):
+        return False
+
+    if not mini_action_planner.looks_household_like(text):
+        return False
+
+    result = mini_action_planner.classify(text)
+    action = result["action"]
+
+    if action == "ask_inventory":
+        household_read_context.answer_inventory_overview(_household_read_deps, chat_id, user_id, display_name)
+        return True
+
+    if action == "meal_ideas":
+        return meal_ideas.try_handle_meal_ideas(_meal_ideas_deps, chat_id, user_id, display_name, text, force=True)
+
+    if action in ("add_to_shopping", "add_to_inventory"):
+        origin = household_router.current_origin(chat_id)
+        keyboard = household_router.origin_keyboard(origin)
+        try:
+            household_id, user_db_id = get_household_and_user(user_id, display_name)
+            alias_map = get_household_alias_map(household_id)
+            validated_items = household_router.validate_mini_planner_add_items(result["items"], alias_map)
+            if not validated_items:
+                # Empty/unsafe item list — nothing safe to preview. Fall
+                # through to general AI-chat rather than guess or open an
+                # empty preview.
+                return False
+            destination = "add_shopping" if action == "add_to_shopping" else "add_inventory"
+            inventory_items = get_inventory_items(household_id) if destination == "add_inventory" else []
+            kind, payload = household_router.build_add_preview_from_items(destination, validated_items, inventory_items)
+            return _handle_household_router_result(chat_id, kind, payload, household_id, user_db_id, origin, keyboard)
+        except Exception:
+            send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+            return True
+
+    # action == "unknown"
+    return False
+
+
+# =========================
 # AMBIGUOUS "ДОДАЙ ... ЗА СУМУ" GUARD — a message starting with the same bare
 # "Додай"/"Додайте" verb Global Explicit Add v1/Global Bare Add v1 both react
 # to, but that ALSO carries a recognized expense amount (zł/zl/pln/a bare
@@ -5503,6 +5582,7 @@ _dispatcher_deps = message_dispatcher.DispatcherDeps(
     household_read=lambda *a, **kw: household_read_context.try_handle_household_read(_household_read_deps, *a, **kw),
     direct_household_read=lambda *a, **kw: household_read_context.try_handle_direct_household_read(_household_read_deps, *a, **kw),
     meal_ideas=lambda *a, **kw: meal_ideas.try_handle_meal_ideas(_meal_ideas_deps, *a, **kw),
+    mini_action_planner=lambda *a, **kw: _try_mini_action_planner(*a, **kw),
 )
 
 
@@ -5985,6 +6065,10 @@ household_router.configure(
         "expenses": EXPENSES_KEYBOARD, "aliases": ALIASES_KEYBOARD,
     },
 )
+
+# Wire mini_action_planner.py's dependency (only call_gemini) the same way —
+# it never imports bot.py either (see its module docstring).
+mini_action_planner.configure(sys.modules[__name__])
 
 
 if __name__ == "__main__":

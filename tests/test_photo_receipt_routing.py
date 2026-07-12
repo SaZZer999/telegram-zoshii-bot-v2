@@ -415,6 +415,9 @@ class TestRegression(PhotoWebhookTestCase):
                 "update_id": 881041001,
                 "message": {"chat": {"id": chat_id}, "text": "Привіт!", "from": {"id": 555, "first_name": "Тест"}},
             })
+        # Unified Mini Action Planner V1's pre-gate rejects "Привіт!" (no
+        # household vocabulary/quantity signal) before ever calling Gemini
+        # — only general AI-chat's own single call happens.
         mock_gemini.assert_called_once()
 
 

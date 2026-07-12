@@ -279,6 +279,9 @@ class TestExpenseWebhookFlow(unittest.TestCase):
         with patch.object(bot, "_ask_gemini_expense_router") as mock_router:
             _call_webhook(_make_update(930000002, chat_id, "Яка сьогодні погода?"))
             mock_router.assert_not_called()
+        # Unified Mini Action Planner V1's pre-gate rejects this text
+        # (no household vocabulary/quantity signal) before ever calling
+        # Gemini — only general AI-chat's own single call happens.
         self.mock_call_gemini.assert_called_once()
         self.assertNotIn(chat_id, bot.pending_expense)
 

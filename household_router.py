@@ -1357,6 +1357,22 @@ def _validate_explicit_add_items(items_raw, alias_map):
     return result
 
 
+def validate_mini_planner_add_items(items_raw, alias_map=None):
+    """Public entrypoint for the Unified Mini Action Planner V1
+    (mini_action_planner.py) — same all-or-nothing validation contract as
+    _validate_explicit_add_items (reject the WHOLE batch if any item is
+    malformed or still leaks a quantity/container phrase into name), so a
+    planner-classified add_to_shopping/add_to_inventory action gets exactly
+    the same safety guarantees Global Explicit Add v1 already has, without
+    duplicating the validation logic. Returns a list of normalized item
+    dicts (possibly empty), or None if `items_raw` itself isn't a list or
+    any entry fails validation — the caller must treat None the same as an
+    empty/unsafe result (fall back, never guess)."""
+    if not isinstance(items_raw, list):
+        return None
+    return _validate_explicit_add_items(items_raw, alias_map)
+
+
 def build_add_preview_from_items(destination, validated_items, inventory_items):
     """Shared tail of Global Explicit Add v1 and Global Bare Add v1: turns an
     already-validated item list plus a decided `destination` ("add_shopping"

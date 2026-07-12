@@ -159,14 +159,21 @@ _EMPTY_INVENTORY_MSG = (
 _MEAL_IDEAS_FALLBACK_MSG = "Не зміг зараз придумати страви. Спробуй ще раз трохи пізніше."
 
 
-def try_handle_meal_ideas(deps, chat_id, user_id, display_name, text):
+def try_handle_meal_ideas(deps, chat_id, user_id, display_name, text, force=False):
     """Public entrypoint. Returns True if `text` was a meal-ideas request
     and a message has already been sent via `deps.send_message` (an idea
     list, the empty-inventory message, or the Gemini-failure fallback);
     False if it wasn't (caller should continue, e.g. to the general AI
     fallback). Never writes to the DB, never opens a preview, never stores
-    any new state of its own — read-only, same as household_read_context.py."""
-    if not _looks_like_meal_ideas_request(text):
+    any new state of its own — read-only, same as household_read_context.py.
+
+    `force=True` (default False, so every existing caller/test is
+    unaffected) skips `_looks_like_meal_ideas_request` entirely — used only
+    by the Unified Mini Action Planner V1 (mini_action_planner.py via
+    bot.py's `_try_mini_action_planner`), which has already classified the
+    message as a meal-ideas request itself and is handing off to this
+    module's existing read-only answer logic rather than duplicating it."""
+    if not force and not _looks_like_meal_ideas_request(text):
         return False
 
     household_id, _ = deps.get_household_and_user(user_id, display_name)

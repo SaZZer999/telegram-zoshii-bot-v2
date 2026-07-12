@@ -618,7 +618,12 @@ class TestExistingRoutesStillWinOverTransform(InventoryTransformWebhookTestCase)
         chat_id = 772023
         with patch.object(bot, "call_gemini", return_value="Бо це білок казеїн реагує на кислоту.") as mock_gemini:
             _call_webhook(_make_update(772000023, chat_id, "Поясни коротко, чому молоко згортається в каві?"))
+        # Unified Mini Action Planner V1's pre-gate rejects this text (an
+        # explanatory question mentioning a product, not a household
+        # action) before ever calling Gemini — only general AI-chat's own
+        # single call happens.
         mock_gemini.assert_called_once()
+        self.assertTrue(any("Бо це білок казеїн реагує на кислоту." == t for t in self._sent_texts()))
         self.assertNotIn(chat_id, pending_inventory_transform)
 
     # 15. After a pending_inventory_transform preview is cancelled, general
@@ -634,6 +639,7 @@ class TestExistingRoutesStillWinOverTransform(InventoryTransformWebhookTestCase)
                 772000025, chat_id, "Поясни коротко, чому молоко згортається в каві?",
             ))
         mock_gemini.assert_called_once()
+        self.assertTrue(any("Бо це білок казеїн реагує на кислоту." == t for t in self._sent_texts()))
 
 
 # =========================

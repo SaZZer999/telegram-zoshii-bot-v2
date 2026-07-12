@@ -444,6 +444,19 @@ def _dispatch_parsed(deps, chat_id, user_id, display_name, parsed):
     return True
 
 
+def answer_inventory_overview(deps, chat_id, user_id, display_name):
+    """Public entrypoint for the Unified Mini Action Planner V1's
+    "ask_inventory" action (mini_action_planner.py via bot.py's
+    `_try_mini_action_planner`) — sends the exact same read-only inventory-
+    overview answer `_dispatch_parsed` already builds for the deterministic
+    "inventory_overview" intent, without going through either the
+    deterministic-pattern or topic-gate/Gemini-classifier path (the planner
+    has already classified the message itself). Never writes to the DB,
+    same as every other answer builder in this module."""
+    household_id, _ = deps.get_household_and_user(user_id, display_name)
+    _answer_inventory_overview(deps, chat_id, household_id)
+
+
 def try_handle_direct_household_read(deps, chat_id, user_id, display_name, text):
     """Direct/deterministic-only entrypoint — no local topic gate, no
     Gemini call, ever, and no new state. Meant to be checked BEFORE the
