@@ -28,6 +28,7 @@ set of pure functions plus the one Gemini call.
 import json
 import re
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 import expenses
@@ -312,6 +313,38 @@ def _looks_like_leaked_quantity_phrase(name):
     for clarification instead of storing a broken canonical name like
     "дві пачки сосисок"."""
     return bool(_LEAKED_QUANTITY_PREFIX_RE.match((name or "").strip()))
+
+
+# An add_expense amount must be a number the user actually TYPED, never one
+# Gemini computed (a discount percentage applied to a stated price, a sum of
+# several mentioned prices, ...). "коштувало 20, але 50% знижки" must never
+# silently become an invented expense of "10" — see
+# _amount_literally_in_text's only caller, the add_expense branch of
+# _validate_operations_detailed, for the full reasoning.
+_NUMBER_TOKEN_RE = re.compile(r"\d+[.,]?\d*")
+
+
+def _amount_literally_in_text(amount, source_text):
+    """True if `amount` (a Decimal) appears as a literal number token
+    somewhere in `source_text` — a genuine explicit amount ("Молоко 10 zł")
+    always passes; a computed/derived one (a discount applied to a stated
+    price, a sum of several prices) never does, since the computed number
+    itself was never typed by the user. `source_text=None` (a caller that
+    doesn't have it, e.g. _validate_operations' own pre-existing external
+    callers) always returns True — never retroactively blocks a caller that
+    can't provide the source text."""
+    if source_text is None:
+        return True
+    if amount is None:
+        return False
+    for token in _NUMBER_TOKEN_RE.findall(source_text):
+        try:
+            token_value = Decimal(token.replace(",", "."))
+        except InvalidOperation:
+            continue
+        if token_value == amount:
+            return True
+    return False
 
 
 def _validate_new_item_op(op, alias_map):
@@ -663,7 +696,7 @@ def _legacy_single_expense(new_expenses):
     return new_expenses[0] if len(new_expenses) == 1 else None
 
 
-def _validate_operations_detailed(router_result, inventory_items, recent_expenses, now, alias_map=None):
+def _validate_operations_detailed(router_result, inventory_items, recent_expenses, now, alias_map=None, source_text=None):
     """Same validation as _validate_operations, but the "clarify" outcome
     carries full structured detail instead of a formatted message — used by
     build_household_operations_preview (and, through it, bot.py's
@@ -825,6 +858,13 @@ def _validate_operations_detailed(router_result, inventory_items, recent_expense
             amount = expenses._parse_expense_amount(op.get("amount"))
             if amount is None:
                 reasons.append("Не можу безпечно визначити суму витрати.")
+                continue
+            if not _amount_literally_in_text(amount, source_text):
+                # The amount doesn't appear anywhere in what the user
+                # actually typed — Gemini computed it (a discount applied to
+                # a stated price, a sum of several mentioned prices, ...)
+                # rather than reading it. Never silently invent a price.
+                reasons.append("Не можу безпечно визначити суму витрати без обчислень зі знижками чи сумами.")
                 continue
             expense_date = expenses._validate_expense_date(op.get("expense_date"), now=now)
             if expense_date is None:
@@ -1107,7 +1147,9 @@ def build_household_operations_preview(text, shopping_items, inventory_items, re
     # _try_global_household_router needs to set up
     # pending_inventory_quantity_clarification instead of just displaying a
     # dead-end message.
-    return _validate_operations_detailed(router_result, inventory_items, recent_expenses, now, alias_map=alias_map)
+    return _validate_operations_detailed(
+        router_result, inventory_items, recent_expenses, now, alias_map=alias_map, source_text=text,
+    )
 
 
 # =========================

@@ -679,7 +679,12 @@ class TestGlobalHouseholdRouterRepresentationGuardWebhook(unittest.TestCase):
                 "unresolved_fragments": [],
             }
             with patch.object(bot, "apply_global_household_operations") as mock_apply:
-                _call_webhook(_make_update(990000010, chat_id, "Купив молоко"))
+                # "за 10 zł" — the mocked expense amount ("10") must be
+                # literally present in the source text (Household Router's
+                # own amount-must-be-typed-not-computed safety check), so
+                # the compound is blocked by the representation conflict
+                # this test is actually about, not by that unrelated check.
+                _call_webhook(_make_update(990000010, chat_id, "Купив молоко за 10 zł"))
                 mock_apply.assert_not_called()
         self.assertNotIn(chat_id, pending_global_household)
         self.assertTrue(any("У запасах уже є «Молоко — 6 л»" in t for t in self._sent_texts()))

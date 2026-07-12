@@ -220,6 +220,81 @@ class TestValidateOperations(unittest.TestCase):
         self.assertEqual(kind, "none")
 
 
+class TestAmountMustBeLiterallyTyped(unittest.TestCase):
+    """Live-bug regression: Gemini must never turn a discount calculation
+    or a summed-up price into an add_expense amount the user never typed —
+    see _amount_literally_in_text's own docstring. Only
+    _validate_operations_detailed (via build_household_operations_preview,
+    which HAS the original text) enforces this; the legacy
+    _validate_operations wrapper (no source_text) is untouched — see
+    test_empty_operations_list_is_none and every other TestValidateOperations
+    case above, none of which pass source_text and all of which still pass."""
+
+    def test_computed_discount_amount_is_rejected(self):
+        router_result = {
+            "intent": "household_operations",
+            "operations": [
+                {"type": "add_inventory", "name": "Печиво", "quantity_text": "пів кілограма",
+                 "category": "Солодке та снеки"},
+                {"type": "add_expense", "amount": "10", "currency": "PLN", "category": "Продукти",
+                 "description": "Печиво", "expense_date": "2026-07-05"},
+            ],
+            "unresolved_fragments": [],
+        }
+        text = (
+            "Вчора в магазині позаду дому я купив печиво по знижці, воно коштувало 20, "
+            "але на нього було 50% знижки. Тому я взяв пів кілограма, але потім вернувся "
+            "і докупив ще раз так само."
+        )
+        kind, reasons = household_router._validate_operations_detailed(
+            router_result, [], [], NOW, source_text=text,
+        )
+        self.assertEqual(kind, "invalid")
+        self.assertTrue(reasons)
+
+    def test_explicit_typed_amount_is_accepted(self):
+        router_result = {
+            "intent": "household_operations",
+            "operations": [
+                {"type": "add_inventory", "name": "Молоко", "quantity_text": "", "category": "Молочне та яйця"},
+                {"type": "add_expense", "amount": "10", "currency": "PLN", "category": "Продукти",
+                 "description": "Молоко", "expense_date": "2026-07-05"},
+            ],
+            "unresolved_fragments": [],
+        }
+        kind, payload = household_router._validate_operations_detailed(
+            router_result, [], [], NOW, source_text="Купив молоко за 10 zł",
+        )
+        self.assertEqual(kind, "ok")
+        self.assertEqual(payload["new_expenses"][0]["amount"], Decimal("10.00"))
+
+    def test_decimal_typed_amount_with_comma_is_accepted(self):
+        router_result = {
+            "intent": "household_operations",
+            "operations": [
+                {"type": "add_expense", "amount": "12.40", "currency": "PLN", "category": "Продукти",
+                 "description": "Хліб", "expense_date": "2026-07-05"},
+            ],
+            "unresolved_fragments": [],
+        }
+        kind, payload = household_router._validate_operations_detailed(
+            router_result, [], [], NOW, source_text="Хліб 12,40 zł",
+        )
+        self.assertEqual(kind, "ok")
+
+    def test_no_source_text_never_retroactively_blocks_legacy_callers(self):
+        router_result = {
+            "intent": "household_operations",
+            "operations": [
+                {"type": "add_expense", "amount": "999", "currency": "PLN", "category": "Продукти",
+                 "description": "X", "expense_date": "2026-07-05"},
+            ],
+            "unresolved_fragments": [],
+        }
+        kind, payload = household_router._validate_operations_detailed(router_result, [], [], NOW)
+        self.assertEqual(kind, "ok")
+
+
 class TestFormatPreview(unittest.TestCase):
     def test_preview_contains_expected_sections(self):
         payload = {

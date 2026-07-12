@@ -166,6 +166,42 @@ _TOPIC_GATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Stronger-action-intent override — checked AFTER deterministic parsing
+# fails but BEFORE the topic gate above is even consulted. This module's own
+# classifier only ever picks a READ intent (inventory_presence/category/
+# overview, shopping_overview/presence) — it has no concept of "add to
+# shopping", "add to inventory" or "meal ideas", so a message that clearly
+# means one of THOSE gets misclassified into the nearest read-intent instead
+# (live bugs: "молока б докупити" -> misread as an inventory_presence
+# lookup for "молоко"; "у нас є 10 яєць і 2 літри молока" -> misread as
+# inventory_presence for "яйця, молоко"; "на вечерю щось з того що є" ->
+# misread as inventory_overview). Declining here (no Gemini call at all)
+# lets Phase D's LATER mini_action_planner slot — which DOES know about
+# add_to_shopping/add_to_inventory/meal_ideas — claim the message instead;
+# if IT also declines (action "unknown"), the message still falls through
+# to general AI-chat exactly as before either module existed. Deliberately
+# narrow (only the three confirmed-broken shapes, never bare product nouns)
+# so it never intercepts a genuine read-question ("Чи є молоко?", "Що є
+# вдома?", "Що треба купити?") — those still resolve exactly as before,
+# most of them via _deterministic_parse before this check is ever reached.
+_PURCHASE_INTENT_OVERRIDE_SUBSTRINGS = ("докуп",)
+_MEAL_INTENT_OVERRIDE_SUBSTRINGS = ("вечер", "обід", "сніданок", "готу", "приготув")
+_DECLARATIVE_HAVE_WITH_QUANTITY_RE = re.compile(
+    r"(?:(?:у|в)\s+нас\s+є|маєм[ои])\b.{0,40}\d", re.IGNORECASE,
+)
+
+
+def _looks_like_stronger_action_intent(text):
+    """True if `text` more plausibly means add-to-shopping/add-to-inventory/
+    meal-ideas than any read intent this module's own classifier can
+    express — see this override's own comment block above."""
+    normalized = (text or "").lower()
+    if any(s in normalized for s in _PURCHASE_INTENT_OVERRIDE_SUBSTRINGS):
+        return True
+    if any(s in normalized for s in _MEAL_INTENT_OVERRIDE_SUBSTRINGS):
+        return True
+    return bool(_DECLARATIVE_HAVE_WITH_QUANTITY_RE.search(normalized))
+
 _ALLOWED_INTENTS = {
     "inventory_presence", "inventory_category", "inventory_overview",
     "shopping_overview", "shopping_presence", "none",
@@ -479,17 +515,20 @@ def try_handle_direct_household_read(deps, chat_id, user_id, display_name, text)
 def try_handle_household_read(deps, chat_id, user_id, display_name, text):
     """Public entrypoint. Returns True if `text` was a household read-
     question and an answer has already been sent via `deps.send_message`;
-    False if it wasn't (caller should continue to the general AI fallback).
-    Never writes to the DB, never opens a preview, never stores any new
-    state of its own. Tries the same deterministic parser
-    `try_handle_direct_household_read` uses first — only a message that
-    parser doesn't recognize ever reaches the local topic gate + Gemini
-    classifier fallback."""
+    False if it wasn't (caller should continue — to Phase D's later
+    mini_action_planner slot, then the general AI fallback). Never writes
+    to the DB, never opens a preview, never stores any new state of its
+    own. Tries the same deterministic parser `try_handle_direct_household_
+    read` uses first — only a message that parser doesn't recognize ever
+    reaches the stronger-action-intent override, then the local topic gate
+    + Gemini classifier fallback."""
     if not isinstance(text, str) or not text.strip():
         return False
 
     parsed = _deterministic_parse(text, deps.category_order)
     if parsed is None:
+        if _looks_like_stronger_action_intent(text):
+            return False
         if not _TOPIC_GATE_RE.search(text):
             return False
         parsed = _classify_with_gemini(deps, text, deps.category_order)

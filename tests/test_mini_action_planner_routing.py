@@ -287,5 +287,102 @@ class TestPreGateWebhookLevel(MiniActionPlannerWebhookTestCase):
         self.assertTrue(any("Омлет" in t for t in self._sent_texts()))
 
 
+class TestTelegramTranscriptRegressions(MiniActionPlannerWebhookTestCase):
+    """The exact live-Telegram bug reports from the "prioritize action
+    intents before inventory reads" work order. household_read/meal_ideas
+    are REAL here (not mocked) — these tests prove the routing fix itself
+    (household_read's new _looks_like_stronger_action_intent override, see
+    tests/test_household_read_context.py for that module's own unit tests),
+    not just that the planner CAN handle these actions in isolation."""
+
+    # Case 3 — "молока б докупити": used to answer "Знайшов декілька
+    # позицій «молоко»..." (household_read misreading it as an inventory
+    # presence lookup). Must now build a shopping preview instead.
+    def test_dokupyty_milk_builds_shopping_preview_not_presence_lookup(self):
+        chat_id = 991771
+        with patch.object(mini_action_planner, "classify", return_value={
+            "action": "add_to_shopping", "items": [{"name": "Молоко", "quantity_text": ""}],
+        }):
+            with patch.object(bot, "apply_global_household_operations") as mock_apply:
+                _call_webhook(_make_update(991771001, chat_id, "молока б докупити"))
+        mock_apply.assert_not_called()
+        self.assertIn(chat_id, pending_global_household)
+        entry = pending_global_household[chat_id]
+        self.assertEqual(entry["add_shopping_items"][0]["name"], "Молоко")
+        texts = self._sent_texts()
+        self.assertFalse(any("Знайшов декілька позицій" in t for t in texts))
+        self.assertFalse(any(t.startswith("Ні, «") for t in texts))
+
+    # Case 4 — "у нас є 10 яєць і 2 літри молока": used to answer "Ні, «яйця,
+    # молоко» зараз немає в запасах." (household_read misreading the
+    # declarative statement as a presence question). Must now build an
+    # inventory preview instead.
+    def test_declarative_have_builds_inventory_preview_not_presence_lookup(self):
+        chat_id = 991772
+        with patch.object(mini_action_planner, "classify", return_value={
+            "action": "add_to_inventory",
+            "items": [{"name": "Яйця", "quantity_text": "10"}, {"name": "Молоко", "quantity_text": "2 л"}],
+        }):
+            with patch.object(bot, "get_inventory_items", return_value=[]):
+                with patch.object(bot, "apply_global_household_operations") as mock_apply:
+                    _call_webhook(_make_update(991772001, chat_id, "у нас є 10 яєць і 2 літри молока"))
+        mock_apply.assert_not_called()
+        self.assertIn(chat_id, pending_global_household)
+        names = {item["name"] for item in pending_global_household[chat_id]["add_inventory_items"]}
+        self.assertEqual(names, {"Яйця", "Молоко"})
+        texts = self._sent_texts()
+        self.assertFalse(any(t.startswith("Ні, «") for t in texts))
+
+    # Case 5 — "на вечерю щось з того що є": used to answer with a full
+    # inventory overview (household_read misreading "що є" as
+    # inventory_overview). Must now route to meal ideas instead.
+    def test_dinner_from_what_we_have_routes_to_meal_ideas_not_overview(self):
+        chat_id = 991773
+        items = [{"name": "Яйця", "quantity_value": Decimal("6"), "quantity_unit": "шт.", "quantity_text": "6 шт."}]
+        with patch.object(mini_action_planner, "classify", return_value={"action": "meal_ideas", "items": []}):
+            with patch.object(bot, "get_inventory_items", return_value=items) as mock_items:
+                with patch.object(bot, "call_gemini", return_value="🍽️ Ідеї з того, що є вдома:\n\n1. Омлет"):
+                    _call_webhook(_make_update(991773001, chat_id, "на вечерю щось з того що є"))
+        mock_items.assert_called_once()
+        texts = self._sent_texts()
+        self.assertTrue(any("Омлет" in t for t in texts))
+        self.assertFalse(any(t.startswith("🧊 Запаси") for t in texts))
+
+    # Case 6 — the complex cookie/discount/past-date prompt: household_
+    # router.gate() matches ("купив"), so this is handled entirely by the
+    # (pre-existing) Global Household Router command route, BEFORE Phase D
+    # / mini_action_planner is ever reached. Must reject the invented
+    # discount-computed expense — no preview, no DB write — rather than
+    # silently accepting fabricated prices.
+    def test_complex_discount_prompt_never_creates_expense_preview(self):
+        chat_id = 991774
+        text = (
+            "Вчора в магазині позаду дому я купив печиво по знижці, воно коштувало 20, "
+            "але на нього було 50% знижки. Тому я взяв пів кілограма, але потім вернувся "
+            "і докупив ще раз так само."
+        )
+        fake_router_result = {
+            "intent": "household_operations",
+            "operations": [
+                {"type": "add_inventory", "name": "Печиво", "quantity_text": "пів кілограма",
+                 "category": "Солодке та снеки"},
+                {"type": "add_inventory", "name": "Печиво", "quantity_text": "пів кілограма",
+                 "category": "Солодке та снеки"},
+                {"type": "add_expense", "amount": "10", "currency": "PLN", "category": "Продукти",
+                 "description": "Печиво", "expense_date": "2026-07-11"},
+                {"type": "add_expense", "amount": "10", "currency": "PLN", "category": "Продукти",
+                 "description": "Печиво", "expense_date": "2026-07-11"},
+            ],
+            "unresolved_fragments": [],
+        }
+        with patch.object(bot.household_router, "_ask_gemini_household_router", return_value=fake_router_result):
+            with patch.object(mini_action_planner, "classify") as mock_classify:
+                with patch.object(bot, "apply_global_household_operations") as mock_apply:
+                    _call_webhook(_make_update(991774001, chat_id, text))
+        mock_apply.assert_not_called()
+        mock_classify.assert_not_called()
+        self.assertNotIn(chat_id, pending_global_household)
+
+
 if __name__ == "__main__":
     unittest.main()

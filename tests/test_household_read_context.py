@@ -343,6 +343,73 @@ class RoutingBoundaryTests(unittest.TestCase):
                 self.assertNotIn("DELETE", str(call).upper())
 
 
+class StrongerActionIntentOverrideTests(unittest.TestCase):
+    """Live-bug regression coverage: household_read's own classifier only
+    ever picks a READ intent, so a message that actually means add-to-
+    shopping/add-to-inventory/meal-ideas used to get misclassified into the
+    nearest read intent instead — see _looks_like_stronger_action_intent's
+    own docstring. These three phrases must now be DECLINED here (no
+    Gemini call), letting Phase D's later mini_action_planner slot claim
+    them instead (see tests/test_mini_action_planner_routing.py for that
+    side)."""
+
+    def test_pure_function_purchase_intent(self):
+        self.assertTrue(hrc._looks_like_stronger_action_intent("молока б докупити"))
+
+    def test_pure_function_declarative_have_with_quantity(self):
+        self.assertTrue(hrc._looks_like_stronger_action_intent("у нас є 10 яєць і 2 літри молока"))
+
+    def test_pure_function_meal_words(self):
+        self.assertTrue(hrc._looks_like_stronger_action_intent("на вечерю щось з того що є"))
+
+    def test_pure_function_plain_read_question_not_overridden(self):
+        self.assertFalse(hrc._looks_like_stronger_action_intent("Чи є молоко?"))
+        self.assertFalse(hrc._looks_like_stronger_action_intent("Що є вдома?"))
+
+    def test_docupyty_declines_without_calling_gemini(self):
+        call_gemini = MagicMock(return_value=None)
+        deps = _make_deps(inventory_items=[_milk_row(), _milk_row(id=2)], call_gemini=call_gemini)
+
+        handled = hrc.try_handle_household_read(deps, 1, 555, "Тест", "молока б докупити")
+
+        self.assertFalse(handled)
+        call_gemini.assert_not_called()
+        deps.send_message.assert_not_called()
+
+    def test_declarative_have_with_quantity_declines_without_calling_gemini(self):
+        call_gemini = MagicMock(return_value=None)
+        deps = _make_deps(inventory_items=[], call_gemini=call_gemini)
+
+        handled = hrc.try_handle_household_read(deps, 1, 555, "Тест", "у нас є 10 яєць і 2 літри молока")
+
+        self.assertFalse(handled)
+        call_gemini.assert_not_called()
+        deps.send_message.assert_not_called()
+
+    def test_dinner_meal_words_decline_without_calling_gemini(self):
+        call_gemini = MagicMock(return_value=None)
+        deps = _make_deps(inventory_items=[_milk_row()], call_gemini=call_gemini)
+
+        handled = hrc.try_handle_household_read(deps, 1, 555, "Тест", "на вечерю щось з того що є")
+
+        self.assertFalse(handled)
+        call_gemini.assert_not_called()
+        deps.send_message.assert_not_called()
+
+    def test_plain_read_question_still_resolves_deterministically(self):
+        # "Що є вдома?" is in _OVERVIEW_PHRASES — matched by the
+        # deterministic parser before this override is ever consulted, so
+        # it must keep answering exactly as before, zero Gemini calls.
+        call_gemini = MagicMock(return_value=None)
+        deps = _make_deps(inventory_items=[_milk_row()], call_gemini=call_gemini)
+
+        handled = hrc.try_handle_household_read(deps, 1, 555, "Тест", "Що є вдома?")
+
+        self.assertTrue(handled)
+        call_gemini.assert_not_called()
+        deps.send_message.assert_called_once()
+
+
 class DirectHouseholdReadEntryPointTests(unittest.TestCase):
     """try_handle_direct_household_read: deterministic-only, no topic gate,
     no Gemini, ever — the routing fix's actual new public entrypoint."""
