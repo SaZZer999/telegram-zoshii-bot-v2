@@ -18,6 +18,7 @@ from quantities import (
 HOUSEHOLD_NAME = "Спільний дім"
 DEFAULT_CATEGORY = "Інше їстівне"
 VALID_LIST_CONTEXTS = {"shopping_saved", "inventory_saved"}
+VALID_VOICE_LANGUAGES = {"uk", "pl", "en", "ru"}
 
 # =========================
 # STRUCTURED QUANTITY HELPERS (DB-local)
@@ -246,6 +247,9 @@ def init_db():
                     display_name       TEXT,
                     created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
+            """)
+            cur.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS voice_language TEXT
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS shopping_items (
@@ -507,6 +511,40 @@ def get_or_create_user(telegram_user_id, household_id, display_name=None):
             row = cur.fetchone()
         conn.commit()
     return row[0]
+
+
+def get_user_voice_language(telegram_user_id):
+    """The user's saved voice-transcription language ('uk'/'pl'/'en'/'ru'),
+    or None if unset or the user has no row yet — callers must treat None
+    as "use the current VOICE_LANGUAGE/no-hint behavior", never guess."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT voice_language FROM users WHERE telegram_user_id = %s",
+                (telegram_user_id,),
+            )
+            row = cur.fetchone()
+    return row[0] if row else None
+
+
+def set_user_voice_language(telegram_user_id, language_code):
+    """Save `telegram_user_id`'s voice-transcription language. Raises
+    ValueError for anything outside VALID_VOICE_LANGUAGES — the caller (a
+    fixed 4-button menu) should never send an invalid code, so this is a
+    defensive boundary check, not user-facing validation. Only updates an
+    EXISTING users row (the caller already resolved it via
+    get_household_and_user before offering the language menu); no rows
+    affected is silently a no-op, mirroring get_user_voice_language's own
+    "no row yet" -> None behavior."""
+    if language_code not in VALID_VOICE_LANGUAGES:
+        raise ValueError(f"Invalid voice language: {language_code!r}")
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET voice_language = %s WHERE telegram_user_id = %s",
+                (language_code, telegram_user_id),
+            )
+        conn.commit()
 
 # =========================
 # HOUSEHOLD ALIASES

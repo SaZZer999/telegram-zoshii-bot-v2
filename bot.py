@@ -55,6 +55,8 @@ from database import (
     apply_global_household_operations,
     get_latest_undoable_action,
     apply_undo_action,
+    get_user_voice_language,
+    set_user_voice_language,
 )
 import expenses
 import household_router
@@ -861,6 +863,7 @@ MAIN_KEYBOARD = {
         ["🛒 Покупки", "🧊 Запаси"],
         ["🍽️ Що приготувати", "ℹ️ Допомога"],
         ["🧠 Назви товарів", "💸 Витрати"],
+        ["⚙️ Налаштування"],
         [action_history.UNDO_BUTTON_TEXT],
     ],
     "resize_keyboard": True,
@@ -1095,6 +1098,51 @@ ALIAS_DELETE_CONFIRM_KEYBOARD = {
     ],
     "resize_keyboard": True,
     "one_time_keyboard": True,
+}
+
+# =========================
+# LANGUAGE SETTINGS V1 — per-user voice-transcription language, stored on
+# users.voice_language (see database.get_user_voice_language/
+# set_user_voice_language). UI-only for now: no other bot text is
+# translated, this only changes the language hint handed to Groq Whisper
+# (see _resolve_voice_language below, used by _handle_voice_message).
+# =========================
+SETTINGS_KEYBOARD = {
+    "keyboard": [
+        ["🌐 Мова"],
+        ["⬅️ Головне меню"],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+LANGUAGE_KEYBOARD = {
+    "keyboard": [
+        ["🇺🇦 Українська", "🇵🇱 Polski"],
+        ["🇬🇧 English", "🇷🇺 Русский"],
+        ["⬅️ Головне меню"],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+# Exact button text -> voice_language code. Matched against text AFTER
+# message_dispatcher.strip_variation_selectors, same as every other
+# special-button route in _try_handle_special_button — none of these four
+# happen to carry U+FE0F/FE0E, but stripping is harmless and keeps the
+# lookup correct if a Telegram client ever sends one anyway.
+VOICE_LANGUAGE_BUTTONS = {
+    "🇺🇦 Українська": "uk",
+    "🇵🇱 Polski": "pl",
+    "🇬🇧 English": "en",
+    "🇷🇺 Русский": "ru",
+}
+
+VOICE_LANGUAGE_NAMES = {
+    "uk": "🇺🇦 Українська",
+    "pl": "🇵🇱 Polski",
+    "en": "🇬🇧 English",
+    "ru": "🇷🇺 Русский",
 }
 
 # Expense keyboards now live in expenses.py (EXPENSES_KEYBOARD already
@@ -4936,6 +4984,45 @@ def _try_handle_special_button(chat_id, user_id, display_name, text):
         )
         return True
 
+    if text == "⚙ Налаштування":
+        active_list_context.pop(chat_id, None)
+        clear_shopping_state(chat_id)
+        clear_inventory_state(chat_id)
+        waiting_for_ingredients.pop(chat_id, None)
+        send_message(chat_id, "⚙️ Налаштування:", reply_markup=SETTINGS_KEYBOARD)
+        return True
+
+    if text == "🌐 Мова":
+        try:
+            current = get_user_voice_language(user_id)
+        except Exception:
+            current = None
+        current_label = VOICE_LANGUAGE_NAMES.get(current)
+        intro = "🌐 Обери мову для розпізнавання голосових повідомлень:"
+        if current_label:
+            intro += f"\n\nПоточна мова: {current_label}"
+        send_message(chat_id, intro, reply_markup=LANGUAGE_KEYBOARD)
+        return True
+
+    if text in VOICE_LANGUAGE_BUTTONS:
+        language_code = VOICE_LANGUAGE_BUTTONS[text]
+        try:
+            get_household_and_user(user_id, display_name)  # ensure users row exists
+            set_user_voice_language(user_id, language_code)
+        except Exception:
+            send_message(
+                chat_id,
+                "Не вдалося зберегти мову. Спробуй ще раз трохи пізніше.",
+                reply_markup=LANGUAGE_KEYBOARD,
+            )
+            return True
+        send_message(
+            chat_id,
+            f"✅ Мову голосових команд встановлено: {text}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return True
+
     return False
 
 
@@ -5685,7 +5772,25 @@ def _download_telegram_voice_to_temp(file_id):
     return temp_path
 
 
-def _handle_voice_message(chat_id, voice):
+def _resolve_voice_language(user_id):
+    """The Groq `language` hint for this Telegram user's transcription, or
+    None to fall back to voice_input's own VOICE_LANGUAGE env default (the
+    pre-Language-Settings-V1 behavior). Looks up users.voice_language
+    directly by telegram_user_id — no household/user_db_id resolution
+    needed, since this is a personal, not shared, preference. Any DB
+    failure or an unrecognized/unset value is treated the same as "no
+    preference saved" — voice input must never break because a language
+    lookup failed."""
+    if user_id is None:
+        return None
+    try:
+        language = get_user_voice_language(user_id)
+    except Exception:
+        return None
+    return language if language in VOICE_LANGUAGE_BUTTONS.values() else None
+
+
+def _handle_voice_message(chat_id, voice, user_id=None):
     """Full Voice Input V1 pipeline for one Telegram `voice` object —
     disabled/misconfigured check, duration guard, download, transcribe,
     empty-transcript guard, optional "🎙️ Розпізнав:" echo. Every failure
@@ -5695,6 +5800,13 @@ def _handle_voice_message(chat_id, voice):
     dispatch(...) — the SAME call a typed text message already goes
     through, so every preview/confirm/cancel/undo/stale-protection route
     behaves identically regardless of how the text arrived.
+
+    `user_id` (the Telegram user id, already available in webhook() before
+    any household/user_db_id resolution) is used only to look up a saved
+    voice_language preference (Language Settings V1) — see
+    _resolve_voice_language. Omitting it (the default) preserves the exact
+    pre-Language-Settings-V1 behavior: no language hint passed, so
+    voice_input falls back to its own VOICE_LANGUAGE env default.
     """
     duration = voice.get("duration") or 0
     logger.info("voice_received: chat_id=%s duration=%ss", chat_id, duration)
@@ -5723,8 +5835,10 @@ def _handle_voice_message(chat_id, voice):
             send_message(chat_id, VOICE_DOWNLOAD_FAILED_MSG)
             return None
 
+        language = _resolve_voice_language(user_id)
+        transcribe_kwargs = {"language": language} if language else {}
         try:
-            transcript = voice_input.transcribe_audio_file(temp_path)
+            transcript = voice_input.transcribe_audio_file(temp_path, **transcribe_kwargs)
         except voice_input.VoiceInputError as e:
             send_message(chat_id, str(e))
             return None
@@ -6022,7 +6136,7 @@ def webhook():
     # empty/missing transcript.
     # =========================
     if voice is not None:
-        text = _handle_voice_message(chat_id, voice)
+        text = _handle_voice_message(chat_id, voice, user_id)
         if not text:
             return "ok"
 
