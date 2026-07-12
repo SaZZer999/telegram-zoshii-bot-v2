@@ -14,6 +14,17 @@ correctly-identified target could still only ever come back as
 "no_change"). V2 also supports combined corrections in ONE message ("Х не
 А, а Х Б, і ціна за Y не N, а M") applying multiple patches together.
 
+V3 adds update_inventory_quantity/update_shopping_quantity — the THIRD
+live bug this fixes: "Сир Гауда, не 2, а 400 грамів." on a pending
+"SER GOUDA — 2 шт." inventory row renamed the item (rename_inventory_item
+was the only operation touching inventory rows at all) but silently
+dropped the quantity half of the correction, since V1/V2's own prompt
+explicitly forbade ANY operation from ever touching a quantity — the same
+class of bug update_expense_amount already fixed for expenses, now fixed
+for inventory/shopping quantities too. A single message combining a rename
+and a quantity correction on the SAME row (the exact live example) now
+returns two patches sharing one target_id, applied together.
+
 Still the LAST-RESORT semantic fallback, tried only after every
 deterministic handler (quantity/rename parser, text correction, price
 clarification) has already failed (see bot.py's
@@ -28,13 +39,15 @@ alongside the user's correction text. Gemini returns STRICT JSON:
 
     {"patches": [ {"operation": ..., "target_id": "exp_1", ...}, ... ]}
 
-naming one or more of seven operations:
+naming one or more of nine operations:
 
     rename_expense_description  -> {"target_id": "exp_N", "new_value": "..."}
     rename_inventory_item       -> {"target_id": "inv_N", "new_value": "..."}
     rename_shopping_item        -> {"target_id": "shop_N", "new_value": "..."}
     update_expense_amount       -> {"target_id": "exp_N", "new_amount": "..."}
     update_expense_context_note -> {"target_id": "exp_N", "new_context_note": "..."}
+    update_inventory_quantity   -> {"target_id": "inv_N", "new_quantity": "...", "new_unit": "..."}
+    update_shopping_quantity    -> {"target_id": "shop_N", "new_quantity": "...", "new_unit": "..."}
     no_change                   -> (no target recognized in the correction)
     ask_clarification           -> {"question": "..."} (2+ plausible targets,
                                     or Gemini itself can't safely pick one)
@@ -43,18 +56,23 @@ Python validates EVERYTHING before ever handing a result back to the
 caller, patch by patch: the operation name, that `target_id` names a REAL
 row of the CORRESPONDING list in the current pending state (never guessed,
 never out of range), that `new_value`/`new_context_note` are non-empty
-strings, and — the one genuinely new safety-critical check in V2 — that
-`update_expense_amount`'s `new_amount` (a) parses to a positive Decimal
-within expenses.EXPENSE_MAX_AMOUNT via expenses._parse_expense_amount, the
-exact same parser/bounds check the household router itself uses for a
-freshly-typed expense amount, and (b) appears LITERALLY as a number token
-somewhere in the user's own correction text (see _amount_literally_in_text
-below — the same anti-hallucination contract as household_router.py's own
-_amount_literally_in_text, reimplemented locally here rather than imported,
-to keep this module free of any dependency on household_router's own
-_bot-configured state). Currency is NEVER accepted from Gemini for this
-operation — the existing expense's currency is always left untouched,
-closing off that entire vector rather than validating it.
+strings, that `update_expense_amount`'s `new_amount` (a) parses to a
+positive Decimal within expenses.EXPENSE_MAX_AMOUNT via expenses.
+_parse_expense_amount, the exact same parser/bounds check the household
+router itself uses for a freshly-typed expense amount, and (b) appears
+LITERALLY as a number token somewhere in the user's own correction text
+(see _amount_literally_in_text below — the same anti-hallucination
+contract as household_router.py's own _amount_literally_in_text,
+reimplemented locally here rather than imported, to keep this module free
+of any dependency on household_router's own _bot-configured state), and
+that a quantity patch's `new_quantity` is likewise a positive number
+LITERALLY present in the user's text (the exact same anti-hallucination
+check, reused for quantities too) with `new_unit` one of exactly шт/кг/г/
+л/мл (quantities.STRUCTURED_UNITS' own short-form vocabulary — an
+unrecognized unit is never trusted, no guessing). Currency is NEVER
+accepted from Gemini for update_expense_amount — the existing expense's
+currency is always left untouched, closing off that entire vector rather
+than validating it.
 
 Safety choice for a message with MULTIPLE patches (rule 6 of the work
 order: "either apply only valid patches and show a warning, or ask
@@ -115,7 +133,20 @@ _AMOUNT_OPERATION = "update_expense_amount"
 _CONTEXT_NOTE_OPERATION = "update_expense_context_note"
 _EXPENSE_ONLY_OPERATIONS = {_AMOUNT_OPERATION, _CONTEXT_NOTE_OPERATION}
 
-_REAL_OPERATIONS = set(_RENAME_OPERATIONS) | _EXPENSE_ONLY_OPERATIONS
+_QUANTITY_OPERATIONS = {
+    "update_inventory_quantity": "add_inventory_items",
+    "update_shopping_quantity": "add_shopping_items",
+}
+# Same short-form vocabulary Gemini is asked for in the prompt below — kept
+# local rather than imported (see module docstring's "no heavy imports"
+# policy); an unrecognized unit is never trusted, the whole patch simply
+# fails validation rather than guessing. Values map to quantities.
+# STRUCTURED_UNITS' own canonical spelling ("шт." WITH the dot — every
+# other item in this codebase carries that exact string, never bare "шт").
+_VALID_QUANTITY_UNITS = {"шт", "кг", "г", "л", "мл"}
+_QUANTITY_UNIT_CANONICAL = {"шт": "шт.", "кг": "кг", "г": "г", "л": "л", "мл": "мл"}
+
+_REAL_OPERATIONS = set(_RENAME_OPERATIONS) | _EXPENSE_ONLY_OPERATIONS | set(_QUANTITY_OPERATIONS)
 _ALL_OPERATIONS = _REAL_OPERATIONS | {"no_change", "ask_clarification"}
 
 _NO_CHANGE = {"status": "no_change"}
@@ -139,7 +170,9 @@ def _amount_literally_in_text(amount, source_text):
     """True if `amount` (a Decimal) appears as a literal number token
     somewhere in `source_text` — a genuinely typed new price ("528")
     always passes; a number Gemini invented or silently carried over from
-    somewhere else never does."""
+    somewhere else never does. Also used for a quantity patch's
+    `new_quantity` — the exact same anti-hallucination contract applies
+    equally well to "400" in "не 2, а 400 грамів" as it does to a price."""
     for token in _NUMBER_TOKEN_RE.findall(source_text or ""):
         try:
             token_value = Decimal(token.replace(",", "."))
@@ -148,6 +181,29 @@ def _amount_literally_in_text(amount, source_text):
         if token_value == amount:
             return True
     return False
+
+
+def _parse_quantity_value(raw_quantity):
+    """A quantity patch's `new_quantity` -> a positive Decimal, or None if
+    missing/unparseable/non-positive. Deliberately separate from expenses.
+    _parse_expense_amount (money-specific bounds/currency-text stripping
+    don't belong on a plain quantity number)."""
+    if isinstance(raw_quantity, bool):
+        return None
+    if isinstance(raw_quantity, (int, float)):
+        raw_quantity = str(raw_quantity)
+    if not isinstance(raw_quantity, str):
+        return None
+    cleaned = raw_quantity.strip().replace(",", ".")
+    if not cleaned:
+        return None
+    try:
+        value = Decimal(cleaned)
+    except InvalidOperation:
+        return None
+    if value <= 0:
+        return None
+    return value
 
 
 PREVIEW_EDIT_PLANNER_PROMPT = (
@@ -172,22 +228,31 @@ PREVIEW_EDIT_PLANNER_PROMPT = (
     "update_expense_amount, коли у витрати вже є примітка (наприклад «Оригінальна ціна 627 zł, куплено за "
     "527 zł») і виправлення стосується чисел усередині неї — онови ЛИШЕ числа, стиль формулювання лиши "
     "тим самим.\n"
+    "- \"update_inventory_quantity\" — {\"target_id\": \"inv_N\", \"new_quantity\": \"нове число, ЛИШЕ як "
+    "у тексті користувача, напр. \\\"400\\\"\", \"new_unit\": \"одне з: шт, кг, г, л, мл\"} — виправити "
+    "кількість ОДНОГО товару зі списку «Товари для запасів».\n"
+    "- \"update_shopping_quantity\" — те саме, що update_inventory_quantity, але для \"shop_N\" зі списку "
+    "«Товари для покупок».\n"
     "- \"no_change\" — жодне з виправлень не стосується жодного рядка з наданих списків. Якщо повертаєш "
     "\"no_change\", це МАЄ бути єдиний елемент у \"patches\".\n"
     "- \"ask_clarification\" — {\"question\": \"одне коротке уточнююче запитання українською\"} — коли "
     "два чи більше рядків підходять під виправлення однаково добре, або незрозуміло, що саме змінити. Якщо "
     "повертаєш \"ask_clarification\", це МАЄ бути єдиний елемент у \"patches\".\n\n"
     "СУВОРІ ПРАВИЛА:\n"
-    "1. НІКОЛИ не змінюй кількість, одиницю, дату чи категорію — таких полів немає в жодній дозволеній дії.\n"
+    "1. НІКОЛИ не змінюй дату чи категорію — таких полів немає в жодній дозволеній дії. Суму витрати "
+    "змінюй ЛИШЕ через update_expense_amount, а кількість товару ЛИШЕ через update_inventory_quantity/"
+    "update_shopping_quantity — ніколи неявно через rename.\n"
     "2. НІКОЛИ не вигадуй target_id, якого немає у наданих списках.\n"
     "3. Українські відмінки того самого слова/імені — це ОДНЕ й те саме (напр. «сестрі» і «для сестри» "
-    "стосуються однієї й тієї ж людини) — не вважай відмінкову різницю причиною для no_change чи "
-    "ask_clarification, якщо очевидно йдеться про той самий рядок.\n"
-    "4. Для update_expense_amount вказуй ЛИШЕ число, яке користувач явно написав у своєму повідомленні — "
-    "ніколи не рахуй суму сам і ніколи не вигадуй її.\n"
+    "стосуються однієї й тієї ж людини; так само «SER GOUDA» і «Сир Гауда» можуть стосуватися ОДНОГО й "
+    "того самого товару) — не вважай мовну чи відмінкову різницю причиною для no_change чи ask_clarification, "
+    "якщо очевидно йдеться про той самий рядок.\n"
+    "4. Для update_expense_amount/update_inventory_quantity/update_shopping_quantity вказуй ЛИШЕ число, яке "
+    "користувач явно написав у своєму повідомленні — ніколи не рахуй його сам і ніколи не вигадуй.\n"
     "5. Одне повідомлення користувача може містити кілька незалежних виправлень одразу (наприклад, "
-    "перейменування ОДНІЄЇ витрати і зміну суми ІНШОЇ) — тоді поверни кілька елементів у \"patches\", по "
-    "одному на кожну незалежну зміну.\n"
+    "перейменування товару РАЗОМ зі зміною його кількості, або перейменування ОДНІЄЇ витрати і зміну суми "
+    "ІНШОЇ) — тоді поверни кілька елементів у \"patches\" з ОДНАКОВИМ target_id (якщо це той самий рядок) "
+    "чи різними (якщо це різні рядки).\n"
     "6. Якщо однозначно неясно, який САМЕ рядок виправити (кілька підходять однаково, або жоден) — обирай "
     "\"ask_clarification\" чи \"no_change\" відповідно, НІКОЛИ не вгадуй.\n\n"
     "Приклад (одна зміна суми й примітки): Витрати: exp_1. Комод — 527,00 zł; примітка: Оригінальна ціна "
@@ -201,6 +266,11 @@ PREVIEW_EDIT_PLANNER_PROMPT = (
     "{\"patches\": [{\"operation\": \"rename_expense_description\", \"target_id\": \"exp_1\", "
     "\"new_value\": \"Подарунок дочці\"}, {\"operation\": \"update_expense_amount\", \"target_id\": "
     "\"exp_2\", \"new_amount\": \"528\"}]}\n"
+    "Приклад (перейменування ТА зміна кількості одного й того самого товару): Товари для запасів: inv_1. "
+    "SER GOUDA; виправлення: «Сир Гауда, не 2, а 400 грамів.»:\n"
+    "{\"patches\": [{\"operation\": \"rename_inventory_item\", \"target_id\": \"inv_1\", \"new_value\": "
+    "\"Сир Гауда\"}, {\"operation\": \"update_inventory_quantity\", \"target_id\": \"inv_1\", "
+    "\"new_quantity\": \"400\", \"new_unit\": \"г\"}]}\n"
     "Приклад (нічого підходящого): {\"patches\": [{\"operation\": \"no_change\"}]}\n"
     "Приклад (кілька підходять): {\"patches\": [{\"operation\": \"ask_clarification\", \"question\": "
     "\"У плані кілька витрат з схожою назвою — яку саме виправити?\"}]}"
@@ -231,13 +301,17 @@ def _format_pending_summary(pending):
     if shopping:
         lines.append("Товари для покупок:")
         for i, item in enumerate(shopping):
-            lines.append(f"shop_{i + 1}. {item.get('name')}")
+            qty = item.get("quantity_text")
+            suffix = f" — {qty}" if qty else ""
+            lines.append(f"shop_{i + 1}. {item.get('name')}{suffix}")
 
     inventory = pending.get("add_inventory_items") or []
     if inventory:
         lines.append("Товари для запасів:")
         for i, item in enumerate(inventory):
-            lines.append(f"inv_{i + 1}. {item.get('name')}")
+            qty = item.get("quantity_text")
+            suffix = f" — {qty}" if qty else ""
+            lines.append(f"inv_{i + 1}. {item.get('name')}{suffix}")
 
     new_expenses = pending.get("new_expenses") or []
     if new_expenses:
@@ -298,6 +372,20 @@ def _validate_real_patch(raw_patch, id_map, user_text):
         if not isinstance(new_note, str) or not new_note.strip():
             return None
         return {"operation": operation, "list_key": list_key, "index": index, "new_context_note": new_note.strip()}
+
+    if operation in _QUANTITY_OPERATIONS:
+        if _QUANTITY_OPERATIONS[operation] != list_key:
+            return None
+        new_quantity = _parse_quantity_value(raw_patch.get("new_quantity"))
+        if new_quantity is None or not _amount_literally_in_text(new_quantity, user_text):
+            return None
+        new_unit = raw_patch.get("new_unit")
+        if not isinstance(new_unit, str) or new_unit.strip().lower() not in _VALID_QUANTITY_UNITS:
+            return None
+        return {
+            "operation": operation, "list_key": list_key, "index": index,
+            "new_quantity": new_quantity, "new_unit": _QUANTITY_UNIT_CANONICAL[new_unit.strip().lower()],
+        }
 
     return None
 

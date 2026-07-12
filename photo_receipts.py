@@ -108,8 +108,14 @@ RECEIPT_PROMPT = (
     "  - unit: ОДНЕ з рівно п'яти значень — \"шт\", \"кг\", \"г\", \"л\", \"мл\" (переклади польську/іншу "
     "одиницю на ці — напр. \"szt\"→\"шт\", \"kg\"→\"кг\"), або null якщо неясно.\n"
     "  - line_price: сума за ЦЮ позицію (число, як на чеку), або null якщо не видно.\n"
-    "НІКОЛИ не додавай у line_items: знижки/rabat/promocja, заставу/kaucja, пакет/торбу/reklamówkę, бонусні "
-    "бали/картку лояльності, ПДВ/готівку/решту/суму карткою — це не товари, це рядки оплати чи знижок.\n"
+    "НІКОЛИ не додавай у line_items: знижки/rabat/promocja/kupon/voucher, заставу/kaucja, пакет/торбу/"
+    "reklamówkę, бонусні бали/картку лояльності, ПДВ/готівку/решту/суму карткою — це не товари, це рядки "
+    "оплати чи знижок.\n"
+    "ОСОБЛИВО ВАЖЛИВО: якщо той самий товар з'являється на чеку ДРУГИЙ раз як рядок знижки/rabat/promocja "
+    "НА ЦЕЙ САМЕ товар (напр. «SER GOUDA» — товар, потім «SER GOUDA» чи «RABAT» з від'ємною сумою нижче) — "
+    "це ОДНА позиція, а не дві: не додавай другий рядок у line_items взагалі (навіть з тим самим ім'ям), "
+    "і якщо все ж сумніваєшся — постав line_price ВІД'ЄМНИМ числом (напр. \"-1.00\") для рядка знижки, "
+    "ніколи не показуй його як окрему кількість товару.\n"
     "Формат відповіді:\n"
     '{"is_receipt": true, "merchant": "Biedronka", "total_amount": "86.40", "currency": "PLN", '
     '"date": "2026-07-10", "category": "grocery", "confidence": "high", "warnings": [], "line_items": '
@@ -199,11 +205,14 @@ _VALID_CATEGORY_HINTS = {"grocery", "pharmacy", "other"}
 _VALID_CONFIDENCE = {"high", "medium", "low"}
 
 
-def _parse_amount(raw_amount):
+def _parse_amount(raw_amount, *, require_positive=True):
     """Parse a Gemini-provided amount into an exact Decimal — never float.
     Accepts comma or dot decimal separators and stray currency text
-    (Polish receipts commonly use a comma, e.g. "86,40"). Returns a
-    Decimal rounded to 2 places, or None if unparseable/non-positive."""
+    (Polish receipts commonly use a comma, e.g. "86,40"), and a leading
+    minus sign (a discount/refund row's own negative price). Returns a
+    Decimal rounded to 2 places, or None if unparseable — or, when
+    `require_positive` (the default, used everywhere except the Receipt
+    V2 discount-row sign check below), non-positive too."""
     if raw_amount is None:
         return None
     if isinstance(raw_amount, (int, float)):
@@ -219,7 +228,7 @@ def _parse_amount(raw_amount):
         amount = Decimal(cleaned)
     except (InvalidOperation, ValueError):
         return None
-    if amount <= 0:
+    if require_positive and amount <= 0:
         return None
     return amount.quantize(Decimal("0.01"))
 
@@ -239,13 +248,16 @@ _VALID_ITEM_UNITS = {"шт", "кг", "г", "л", "мл"}
 # include them — never trust a single layer of "Gemini was told not to".
 # Deliberately a plain case-insensitive substring match (Polish AND
 # Ukrainian spellings) rather than an exact-word list, since receipt OCR
-# text commonly has no clean word boundaries.
+# text commonly has no clean word boundaries. Stems (e.g. "promocj",
+# "znizk"/"zniżk", "platnos"/"płatnoś") deliberately cover multiple word
+# forms (promocja/promocji, zniżka/zniżki, płatność/płatności) without
+# listing every inflection.
 _NON_INVENTORY_NAME_KEYWORDS = (
-    "rabat", "znizka", "zniżka", "знижка", "promocja", "промо",
-    "kaucja", "застава", "deposit", "depozyt",
+    "rabat", "znizk", "zniżk", "знижка", "promocj", "промо", "discount", "kupon", "voucher",
+    "kaucja", "застава", "deposit", "depozyt", "zwrot", "korekt",
     "reklamówka", "reklamowka", "torba", "торба", "пакет",
     "punkty", "bonus", "бонус", "lojalnoś", "лояльност",
-    "opłata", "oplata", "opłata",
+    "opłata", "oplata", "płatnoś", "platnos",
     "gotówka", "gotowka", "готівка", "reszta", "решта", "karta płat", "картою",
     "vat", "pdv", "пдв", "suma", "razem", "total", "разом", "підсумок",
     "paragon", "rachunek", "чек",
@@ -270,10 +282,16 @@ def _format_plain_number(value):
 def _parse_line_item(raw):
     """One raw Gemini line_items entry -> {"name", "quantity_text",
     "line_price"} or None if malformed/blank/obviously not an inventory
-    item (see _looks_like_non_inventory_name). `quantity_text` is either a
-    clean "<number> <unit>" string (only when BOTH parsed cleanly) or ""
-    (an unclear quantity — safely defaults downstream, never guessed
-    here). Never raises."""
+    item (see _looks_like_non_inventory_name) OR a discount/refund row for
+    a real product — a receipt commonly repeats the EXACT SAME product
+    name on its own discount line (e.g. two "SER GOUDA" rows: one the real
+    purchase, one "-1,00" knocked off it), with no distinguishing keyword
+    at all; only the row's own NEGATIVE price marks it as a discount, not
+    a second unit purchased — a name-only keyword filter would auto-merge
+    that second row into the real one (1+1 -> "2 шт.", the live bug this
+    fixes). `quantity_text` is either a clean "<number> <unit>" string
+    (only when BOTH parsed cleanly) or "" (an unclear quantity — safely
+    defaults downstream, never guessed here). Never raises."""
     if not isinstance(raw, dict):
         return None
     name = raw.get("name")
@@ -281,6 +299,10 @@ def _parse_line_item(raw):
         return None
     name = name.strip()
     if _looks_like_non_inventory_name(name):
+        return None
+
+    signed_price = _parse_amount(raw.get("line_price"), require_positive=False)
+    if signed_price is not None and signed_price < 0:
         return None
 
     quantity_text = ""

@@ -4017,13 +4017,16 @@ def _try_apply_preview_edit_planner(chat_id, data, text):
     naming "сестрі" [dative] — no substring match at all, even though a
     person instantly sees these are the same gift); Gemini can. V2 adds
     amount/context-note corrections (e.g. "оригінальна ціна 628, купили за
-    528" on a pending expense) and lets ONE correction message apply
-    several independent patches at once (e.g. a rename AND an amount fix
-    together). See preview_edit_planner.plan_preview_edit's own docstring
-    for the full safety story — every patch is independently bounds-
-    checked against the CURRENT pending state before Python ever applies
-    it, and a batch with any invalid patch is discarded whole (never
-    partially applied).
+    528" on a pending expense). V3 adds inventory/shopping QUANTITY
+    corrections (e.g. V3's own live bug: "Сир Гауда, не 2, а 400 грамів."
+    on a pending "SER GOUDA — 2 шт." row renamed the item but silently
+    dropped the quantity, since no operation could touch it yet). Any of
+    these can share a single correction message and apply together (e.g. a
+    rename AND a quantity fix on the very same row). See preview_edit_
+    planner.plan_preview_edit's own docstring for the full safety story —
+    every patch is independently bounds-checked against the CURRENT
+    pending state before Python ever applies it, and a batch with any
+    invalid patch is discarded whole (never partially applied).
 
     Returns True if `text` was fully handled (an updated preview or a
     targeted clarification question was already sent) — False if the
@@ -4056,6 +4059,18 @@ def _try_apply_preview_edit_planner(chat_id, data, text):
             data["new_expenses"][index]["amount"] = patch["new_amount"]
         elif operation == "update_expense_context_note":
             data["new_expenses"][index]["context_note"] = patch["new_context_note"]
+        elif operation == "update_inventory_quantity":
+            item = data["add_inventory_items"][index]
+            item["quantity_value"] = patch["new_quantity"]
+            item["quantity_unit"] = patch["new_unit"]
+            item["quantity_inferred"] = False
+            item["quantity_text"] = format_quantity_display(patch["new_quantity"], patch["new_unit"])
+        elif operation == "update_shopping_quantity":
+            item = data["add_shopping_items"][index]
+            item["quantity_value"] = patch["new_quantity"]
+            item["quantity_unit"] = patch["new_unit"]
+            item["quantity_inferred"] = False
+            item["quantity_text"] = format_quantity_display(patch["new_quantity"], patch["new_unit"])
 
     preview = household_router.format_preview(data, header="Оновив план:")
     send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)

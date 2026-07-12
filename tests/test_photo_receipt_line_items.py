@@ -365,5 +365,69 @@ class TestPreviewEditPlannerStillEditsResult(PhotoLineItemsWebhookTestCase):
         self.assertEqual(quantities.get("молоко"), "1 л")
 
 
+# =========================
+# Live bug: a discount/rabat row for a product ALREADY on the receipt
+# (SER GOUDA appearing once as the real purchase and once as a negative-
+# priced discount on that same cheese) must never be merged into the real
+# item's quantity — see photo_receipts._parse_line_item's own docstring
+# for the exact mechanism (a negative line_price drops the row entirely,
+# BEFORE household_router's own auto-merge-by-name ever sees a duplicate
+# to combine).
+# =========================
+class TestReceiptDiscountRowNeverDuplicatesProduct(unittest.TestCase):
+    def test_negative_priced_duplicate_is_dropped_by_the_parser(self):
+        # Pure unit level: the exact live shape — same name twice, second
+        # occurrence carries the receipt's own negative discount price.
+        raw_items = [
+            {"name": "SER GOUDA", "quantity": None, "unit": None, "line_price": "9.98"},
+            {"name": "SER GOUDA", "quantity": None, "unit": None, "line_price": "-2.00"},
+            {"name": "OLEJ BARTEK", "quantity": "1", "unit": "л", "line_price": "6.50"},
+            {"name": "CZOSNEK", "quantity": "1", "unit": "шт", "line_price": "1.80"},
+        ]
+        items = photo_receipts._parse_line_items(raw_items)
+        names = [i["name"] for i in items]
+        self.assertEqual(names.count("SER GOUDA"), 1)
+        self.assertEqual(len(items), 3)
+
+    def test_zabka_receipt_gives_one_cheese_item_not_two(self):
+        # Webhook level: the exact live receipt from the bug report —
+        # 3 real products + a discount duplicate for the cheese — must
+        # produce exactly one cheese row in the preview, never "2 шт.".
+        chat_id = 998010
+        raw_items = [
+            {"name": "OLEJ BARTEK", "quantity": "1", "unit": "л", "line_price": "6.50"},
+            {"name": "SER GOUDA", "quantity": None, "unit": None, "line_price": "9.98"},
+            {"name": "SER GOUDA", "quantity": None, "unit": None, "line_price": "-2.00"},
+            {"name": "CZOSNEK", "quantity": "1", "unit": "шт", "line_price": "1.80"},
+        ]
+        candidate = _receipt_candidate(
+            merchant="Żabka", amount=Decimal("27.28"),
+            line_items=photo_receipts._parse_line_items(raw_items),
+        )
+
+        pending_expense.clear()
+        pending_global_household.clear()
+        with patch.object(bot, "send_message") as mock_send, \
+             patch.object(bot, "get_household_and_user", return_value=(1, 10)), \
+             patch.object(bot, "get_household_alias_map", return_value={}), \
+             patch.object(bot, "get_inventory_items", return_value=[]), \
+             patch.object(bot, "_download_telegram_photo_to_temp", return_value="/tmp/zabka.jpg"), \
+             patch("os.remove"), \
+             patch.object(photo_receipts, "extract_receipt_from_image", return_value=candidate):
+            _call_webhook(_make_photo_update(998010001, chat_id))
+
+        data = pending_global_household[chat_id]
+        cheese_items = [i for i in data["add_inventory_items"] if i["canonical_name"] == "ser gouda"]
+        self.assertEqual(len(cheese_items), 1)
+        self.assertEqual(cheese_items[0]["quantity_value"], Decimal("1"))
+        self.assertEqual(len(data["add_inventory_items"]), 3)
+        # Total expense stays exactly what the receipt said, unaffected by
+        # excluding the discount row from inventory.
+        self.assertEqual(data["new_expenses"][0]["amount"], Decimal("27.28"))
+        self.assertEqual(data["new_expenses"][0]["description"], "Żabka")
+        pending_expense.clear()
+        pending_global_household.clear()
+
+
 if __name__ == "__main__":
     unittest.main()
