@@ -143,6 +143,12 @@ class ReceiptCandidate:
     confidence: str = "low"
     warnings: list = field(default_factory=list)
     line_items: list = field(default_factory=list)  # [{"name", "quantity_text", "line_price"}, ...]
+    # Receipt Debug/Explain V1 — one entry per RAW Gemini line_items row (in
+    # original order), regardless of whether it survived parsing/dedup; see
+    # _parse_line_items_with_debug's own docstring for the exact shape.
+    # Always [] when line_items is [] (nothing to explain), never affects
+    # any existing is_receipt/amount/line_items behavior.
+    line_item_debug: list = field(default_factory=list)
 
 
 def _resolve_api_key(api_key):
@@ -375,7 +381,20 @@ def _normalize_product_name(name):
     return " ".join(result)
 
 
-def _parse_line_item(raw):
+def _debug_row(raw_name=None, normalized_name=None, quantity_text="", line_price=None,
+                kept=False, drop_reason=None):
+    """One Receipt Debug/Explain V1 row — see ReceiptCandidate.line_item_
+    debug's own docstring for the field contract. `dedupe_reason` is never
+    set here (always None at this point) — only _dedupe_discount_
+    duplicates ever fills it in, once it can see every same-name row
+    together."""
+    return {
+        "raw_name": raw_name, "normalized_name": normalized_name, "quantity_text": quantity_text,
+        "line_price": line_price, "kept": kept, "drop_reason": drop_reason, "dedupe_reason": None,
+    }
+
+
+def _parse_line_item(raw, *, debug=False):
     """One raw Gemini line_items entry -> {"name", "quantity_text",
     "line_price"} or None if malformed/blank/obviously not an inventory
     item (see _looks_like_non_inventory_name) OR a discount/refund row for
@@ -398,19 +417,37 @@ def _parse_line_item(raw):
     _normalize_product_name); an unrecognized word (a brand name) is kept,
     only its casing is cleaned up. `quantity_text` is either a clean
     "<number> <unit>" string or "" (an unclear quantity — safely defaults
-    downstream, never guessed here). Never raises."""
+    downstream, never guessed here). Never raises.
+
+    debug=True (Receipt Debug/Explain V1) returns (item_or_None, debug_row)
+    instead of just item_or_None — every caller outside this module keeps
+    using the default (debug=False, plain item_or_None) unchanged; only
+    _parse_line_items_with_debug passes debug=True."""
+    def _result(item, row):
+        return (item, row) if debug else item
+
     if not isinstance(raw, dict):
-        return None
+        return _result(None, _debug_row(drop_reason="рядок чека має некоректний формат"))
     raw_name = raw.get("name")
     if not isinstance(raw_name, str) or not raw_name.strip():
-        return None
+        return _result(None, _debug_row(
+            raw_name=raw_name if isinstance(raw_name, str) else None,
+            drop_reason="порожня назва товару",
+        ))
     raw_name = raw_name.strip()
     if _looks_like_non_inventory_name(raw_name):
-        return None
+        return _result(None, _debug_row(
+            raw_name=raw_name,
+            line_price=_parse_amount(raw.get("line_price"), require_positive=False),
+            drop_reason="схоже на знижку/тару/оплату — не товар",
+        ))
 
     signed_price = _parse_amount(raw.get("line_price"), require_positive=False)
     if signed_price is not None and signed_price < 0:
-        return None
+        return _result(None, _debug_row(
+            raw_name=raw_name, line_price=signed_price,
+            drop_reason="від'ємна ціна — рядок знижки на цей товар",
+        ))
 
     stripped_name, embedded_quantity_text = _strip_package_size(raw_name)
     display_name = _normalize_product_name(stripped_name)
@@ -423,11 +460,15 @@ def _parse_line_item(raw):
     if not quantity_text and embedded_quantity_text:
         quantity_text = embedded_quantity_text
 
-    return {
+    item = {
         "name": display_name,
         "quantity_text": quantity_text,
         "line_price": _parse_amount(raw.get("line_price")),
     }
+    return _result(item, _debug_row(
+        raw_name=raw_name, normalized_name=display_name, quantity_text=quantity_text,
+        line_price=item["line_price"], kept=True,
+    ))
 
 
 def _pick_best_duplicate(items, indices):
@@ -444,7 +485,7 @@ def _pick_best_duplicate(items, indices):
     return indices[0]
 
 
-def _dedupe_discount_duplicates(items):
+def _dedupe_discount_duplicates(items, debug_rows=None, debug_index=None):
     """Second layer of duplicate/discount defense (see _parse_line_item's
     own docstring): groups already-parsed items by their FINAL normalized
     name (case-insensitive) — this is what lets "SER GOUDA 135g" (the real
@@ -468,10 +509,20 @@ def _dedupe_discount_duplicates(items):
       - EVERY row in the group priceless (zero price evidence either way):
         same-name rows with no price backing either of them are not proof
         of two purchased units either — keep only one (see
-        _pick_best_duplicate)."""
+        _pick_best_duplicate).
+
+    debug_rows/debug_index (Receipt Debug/Explain V1, both optional): when
+    given, debug_rows[debug_index[i]] is the debug row for items[i] — this
+    fills in that row's own "dedupe_reason" (and "kept"/"drop_reason" for
+    anything dropped here) IN PLACE, purely additive bookkeeping that never
+    changes which items are kept or dropped."""
     groups = {}
     for i, item in enumerate(items):
         groups.setdefault(item["name"].strip().lower(), []).append(i)
+
+    def _note(i, dedupe_reason):
+        if debug_rows is not None:
+            debug_rows[debug_index[i]]["dedupe_reason"] = dedupe_reason
 
     drop = set()
     for indices in groups.values():
@@ -481,11 +532,54 @@ def _dedupe_discount_duplicates(items):
         unpriced = [i for i in indices if items[i]["line_price"] is None]
         if priced and unpriced:
             drop.update(unpriced)
+            for i in unpriced:
+                if debug_rows is not None:
+                    row = debug_rows[debug_index[i]]
+                    row["kept"] = False
+                    row["drop_reason"] = "дублікат без ціни поруч із ціновим рядком того ж товару"
+                _note(i, "без ціни поруч із ціновим рядком того ж товару — прибрано як ймовірну знижку/корекцію")
+            for i in priced:
+                _note(i, "рядок з реальною ціною серед дублікатів — залишено")
         elif not priced:
             keep = _pick_best_duplicate(items, indices)
-            drop.update(i for i in indices if i != keep)
+            dropped = [i for i in indices if i != keep]
+            drop.update(dropped)
+            for i in dropped:
+                if debug_rows is not None:
+                    row = debug_rows[debug_index[i]]
+                    row["kept"] = False
+                    row["drop_reason"] = "дублікат без жодної цінової ознаки — залишено інший рядок цього товару"
+                _note(i, "без жодної цінової ознаки — залишено лише один рядок цього товару")
+            _note(keep, "обрано як основний серед безцінових дублікатів (є кількість/розмір пакування, або перший у чеку)")
+        else:
+            for i in indices:
+                _note(i, "усі дублікати мають реальну ціну — це справжні окремі покупки")
 
     return [item for i, item in enumerate(items) if i not in drop]
+
+
+def _parse_line_items_with_debug(raw_items):
+    """Receipt Debug/Explain V1: same filtering/dedup as _parse_line_items,
+    but also returns a debug_rows list with ONE entry per raw input row (in
+    original order), regardless of whether it survived parsing or dedup —
+    see _debug_row's own field contract. Returns ([], []) if `raw_items`
+    isn't a list at all. `_parse_line_items` (below) is a thin wrapper
+    around this that only ever returns the items half, so every existing
+    caller/test of `_parse_line_items` is completely unaffected."""
+    if not isinstance(raw_items, list):
+        return [], []
+    items = []
+    debug_rows = []
+    item_debug_index = []
+    for raw in raw_items:
+        item, debug_row = _parse_line_item(raw, debug=True)
+        debug_rows.append(debug_row)
+        if item is not None:
+            items.append(item)
+            item_debug_index.append(len(debug_rows) - 1)
+
+    final_items = _dedupe_discount_duplicates(items, debug_rows=debug_rows, debug_index=item_debug_index)
+    return final_items, debug_rows
 
 
 def _parse_line_items(raw_items):
@@ -495,14 +589,7 @@ def _parse_line_items(raw_items):
     OCR line/discount row must never block the others. Returns [] if
     `raw_items` itself isn't a list at all. See _dedupe_discount_
     duplicates for the final same-name-collision pass."""
-    if not isinstance(raw_items, list):
-        return []
-    items = []
-    for raw in raw_items:
-        item = _parse_line_item(raw)
-        if item is not None:
-            items.append(item)
-    return _dedupe_discount_duplicates(items)
+    return _parse_line_items_with_debug(raw_items)[0]
 
 
 def _normalize_category_hint(raw_category):
@@ -544,6 +631,8 @@ def _parse_receipt_json(raw_text):
     raw_warnings = data.get("warnings")
     warnings = [str(w).strip() for w in raw_warnings if str(w).strip()] if isinstance(raw_warnings, list) else []
 
+    line_items, line_item_debug = _parse_line_items_with_debug(data.get("line_items"))
+
     return ReceiptCandidate(
         is_receipt=bool(data.get("is_receipt")),
         merchant=merchant,
@@ -553,7 +642,8 @@ def _parse_receipt_json(raw_text):
         category_hint=_normalize_category_hint(data.get("category")),
         confidence=confidence,
         warnings=warnings,
-        line_items=_parse_line_items(data.get("line_items")),
+        line_items=line_items,
+        line_item_debug=line_item_debug,
     )
 
 
@@ -649,15 +739,22 @@ def decide_receipt_outcome(candidate, now=None):
           there are no line items at all (candidate.line_items empty) —
           every existing caller/test that never sets line_items keeps
           getting exactly this, regardless of any Receipt V2 code below.
-      ("ok_with_items", {**same keys as "ok", "line_items": [...]})
+      ("ok_with_items", {**same keys as "ok", "line_items": [...],
+                          "line_item_debug": [...]})
           -- Receipt V2: a usable total AND 1+ usable line items.
       ("items_only", {"merchant": str, "expense_date": date,
                        "category_hint": str|None, "confidence": str,
-                       "warnings": [...], "line_items": [...]})
+                       "warnings": [...], "line_items": [...],
+                       "line_item_debug": [...]})
           -- Receipt V2: 1+ usable line items but NO usable total — an
           inventory-only preview, never an invented expense amount.
     `merchant` always falls back to "Чек" when Gemini didn't report one;
     `expense_date` is always a concrete date (see _resolve_expense_date).
+    `line_item_debug` (Receipt Debug/Explain V1, only present on the two
+    line-items outcomes — the plain "ok" shape stays byte-for-byte
+    unchanged for every existing caller) is candidate.line_item_debug
+    verbatim, for bot.py to stash on the resulting pending preview so a
+    later "чому так?"/"debug чек" request can explain the parse.
     Never raises — a malformed candidate (Gemini JSON that didn't parse at
     all) is PhotoInputError'd by extract_receipt_from_image BEFORE this is
     ever called.
@@ -680,5 +777,53 @@ def decide_receipt_outcome(candidate, now=None):
     if not line_items:
         return "ok", {**base_payload, "amount": candidate.amount}
     if candidate.amount is not None:
-        return "ok_with_items", {**base_payload, "amount": candidate.amount, "line_items": line_items}
-    return "items_only", {**base_payload, "line_items": line_items}
+        return "ok_with_items", {
+            **base_payload, "amount": candidate.amount, "line_items": line_items,
+            "line_item_debug": candidate.line_item_debug,
+        }
+    return "items_only", {**base_payload, "line_items": line_items, "line_item_debug": candidate.line_item_debug}
+
+
+# =========================
+# RECEIPT DEBUG/EXPLAIN V1 — a short, user-facing Ukrainian explanation of
+# what the receipt parser saw for every raw Gemini line_items row and why
+# each one ended up kept or dropped (see _parse_line_items_with_debug).
+# Shown ONLY on an explicit user request during an active receipt-built
+# preview (bot.py owns that gate — see _handle_receipt_debug_request) —
+# never sent automatically, never logged in full to Render logs (see
+# extract_receipt_from_image's own logging, which stays confidence/counts
+# only, no item names/prices). Pure text formatting: no Gemini, no
+# Telegram, no state, no image bytes/secrets anywhere in the output.
+# =========================
+NO_RECEIPT_DEBUG_DATA_MSG = "Немає даних для розбору цього чека."
+
+
+def format_receipt_debug_summary(debug_rows):
+    """`debug_rows` is a ReceiptCandidate.line_item_debug list (or the same
+    list carried on a pending preview's own "receipt_debug" key) — one
+    entry per RAW Gemini line_items row, in original receipt order. Always
+    returns a non-empty string; NO_RECEIPT_DEBUG_DATA_MSG for an empty/
+    missing list (the caller decides whether that's even reachable —
+    bot.py's own gate already gives a more specific "нічого розбирати"
+    reply before ever calling this with an empty list)."""
+    if not debug_rows:
+        return NO_RECEIPT_DEBUG_DATA_MSG
+
+    lines = [f"🧾 Розбір чека — Gemini повернув {len(debug_rows)} рядків:", ""]
+    for i, row in enumerate(debug_rows, start=1):
+        raw_name = row.get("raw_name") or "(без назви)"
+        entry = f'{i}. «{raw_name}»'
+        if row.get("kept"):
+            normalized = row.get("normalized_name") or raw_name
+            quantity_text = row.get("quantity_text") or "кількість не вказана"
+            price = row.get("line_price")
+            price_text = f"{price} zł" if price is not None else "ціна не вказана"
+            entry += f" → {normalized}, {quantity_text}, {price_text} ✅ додано"
+        else:
+            entry += f" ❌ відкинуто: {row.get('drop_reason') or 'причина невідома'}"
+        dedupe_reason = row.get("dedupe_reason")
+        if dedupe_reason:
+            entry += f"\n   ↳ дублікат: {dedupe_reason}"
+        lines.append(entry)
+
+    return "\n".join(lines)

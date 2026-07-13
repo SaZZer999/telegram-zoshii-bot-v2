@@ -6432,6 +6432,82 @@ def _build_receipt_line_items_preview(chat_id, household_id, user_db_id, kind, p
     origin = household_router.current_origin(chat_id)
     keyboard = household_router.origin_keyboard(origin)
     _handle_household_router_result(chat_id, item_kind, item_payload, household_id, user_db_id, origin, keyboard)
+    if chat_id in pending_global_household:
+        # Receipt Debug/Explain V1 — only ever read back by
+        # _handle_receipt_debug_request on an explicit user request (never
+        # shown automatically, never logged); absent entirely when the
+        # router result above didn't actually end up creating a preview
+        # (e.g. it hit a representation-guard clarification instead).
+        pending_global_household[chat_id]["receipt_debug"] = payload["line_item_debug"]
+
+
+# =========================
+# RECEIPT DEBUG/EXPLAIN V1 — "покажи розбір чеку" / "чому так?" / "чому
+# сир 2 штуки?" / "debug чек" during (or without) an active receipt-built
+# pending_global_household preview. Deterministic gate only (no Gemini) —
+# _looks_like_receipt_debug_request is intentionally checked BEFORE
+# message_dispatcher.dispatch(...) in webhook() itself (see the call site
+# below), never inside the dispatcher's own pending-route chain, so it
+# answers identically whether or not any preview is currently open: no
+# active pending_global_household at all -> "нема активного прев'ю";
+# an active preview that isn't receipt-built (no "receipt_debug" key,
+# e.g. a typed "Купив молоко" command) -> "це прев'ю не з чека"; an active
+# receipt-built preview -> photo_receipts.format_receipt_debug_summary of
+# whatever was stashed on it by _build_receipt_line_items_preview above.
+# Never writes to the database, never mutates the pending preview itself,
+# never blocks confirm/cancel/the preview edit planner — those keep
+# reading the exact same pending_global_household[chat_id] afterward.
+# =========================
+NO_RECEIPT_DEBUG_PENDING_MSG = "Немає активного прев'ю чека для розбору."
+NO_RECEIPT_DEBUG_FOR_PREVIEW_MSG = "Це прев'ю не з фото чека — розбору немає."
+
+
+_RECEIPT_DEBUG_WHY_HINT_RE = re.compile(r"\bтак\b|\bшт\b|штук|\d")
+_RECEIPT_DEBUG_WHY_MAX_LEN = 80
+
+
+def _looks_like_receipt_debug_request(text):
+    """Deterministic (no Gemini) match for the four documented trigger
+    phrases and close variants — "покажи розбір чеку", "чому так?", "чому
+    сир 2 штуки?", "debug чек". This check runs BEFORE the message
+    dispatcher for every incoming text (see webhook()), so it deliberately
+    does NOT treat every "чому..." question as a debug request — that
+    would silently steal genuine general-AI-chat questions starting with
+    "чому" (e.g. "Чому молоко скисає?", see docs/DEPLOYMENT_RUNBOOK.md's
+    own smoke-test list) instead of answering them. A short "чому"
+    question is only treated as a preview-explanation request when it also
+    hints at "the current state" — "так", a bare "шт"/"штук", or any digit
+    (covers "чому так?" and "чому сир 2 штуки?" while leaving an unrelated
+    knowledge question alone)."""
+    if not isinstance(text, str):
+        return False
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+    if "розбір чек" in normalized:
+        return True
+    if "debug" in normalized and ("чек" in normalized or "розбір" in normalized):
+        return True
+    if normalized.startswith("чому") and len(normalized) <= _RECEIPT_DEBUG_WHY_MAX_LEN:
+        rest = normalized[len("чому"):].strip()
+        if not rest or _RECEIPT_DEBUG_WHY_HINT_RE.search(rest):
+            return True
+    return False
+
+
+def _handle_receipt_debug_request(chat_id):
+    """Always fully handles the message — caller must not fall through to
+    the message dispatcher for it. See this section's own module comment
+    for the three possible outcomes."""
+    data = pending_global_household.get(chat_id)
+    if data is None:
+        send_message(chat_id, NO_RECEIPT_DEBUG_PENDING_MSG)
+        return
+    debug_rows = data.get("receipt_debug")
+    if not debug_rows:
+        send_message(chat_id, NO_RECEIPT_DEBUG_FOR_PREVIEW_MSG)
+        return
+    send_message(chat_id, photo_receipts.format_receipt_debug_summary(debug_rows))
 
 
 @app.route("/")
@@ -6508,6 +6584,18 @@ def webhook():
         text = _handle_voice_message(chat_id, voice, user_id)
         if not text:
             return "ok"
+
+    # =========================
+    # RECEIPT DEBUG/EXPLAIN V1 — checked ahead of the message dispatcher
+    # (deterministic, no Gemini) so "чому так?"/"debug чек"/... answers the
+    # SAME way whether or not a pending_global_household preview is
+    # currently open — see _looks_like_receipt_debug_request's own
+    # docstring for why this sits here rather than inside the dispatcher's
+    # pending-route chain.
+    # =========================
+    if _looks_like_receipt_debug_request(text):
+        _handle_receipt_debug_request(chat_id)
+        return "ok"
 
     # =========================
     # MESSAGE DISPATCHER V1/V2A/V2B/V3A/V3B (message_dispatcher.py)
