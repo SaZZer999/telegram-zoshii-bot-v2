@@ -1099,6 +1099,42 @@ _DELETE_BULK_PRONOUN_RE = re.compile(r"^(?:все|всі|усе|усі)(?:\s*,?\
 # only); never claimed, even though nothing else handles it yet either.
 _SHOPPING_LOCATION_RE = re.compile(r"(?:зі?\s+списку\s+покупок|з\s+покупок|із\s+покупок)\s*\.?\s*$", re.IGNORECASE)
 
+# Inventory Delete Quantity-Match v1 — a trailing EXPLANATORY clause a
+# household member commonly tacks onto a delete request ("...,  воно вже
+# не потрібно") must never survive into the matched product name/quantity
+# hint; this tiny, deliberately narrow whitelist (never fuzzy/NLP) is
+# stripped BEFORE any name/quantity splitting below, exactly like the
+# location-suffix strip above. Matched at the very END of the phrase only
+# (optional leading comma/whitespace, optional trailing punctuation), so a
+# product that happens to legitimately be named with one of these words
+# is never touched (there is no such product in this household's actual
+# grocery vocabulary).
+_EXPLANATORY_TAIL_RE = re.compile(
+    r"\s*,?\s*(?:воно\s+вже\s+не\s+потрібно|це\s+вже\s+не\s+треба|більше\s+не\s+треба|закінчилось)\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+# A leading spelled-out "one" determiner directly in front of the product
+# name ("видали одне молоко" = "delete one [unit of] milk") — grammatical
+# gender varies with the noun it modifies (одне/одна/один), so all three
+# forms are recognized; always resolves to the same "1 шт." hint a numeric
+# "1 шт" would. Checked BEFORE the trailing-quantity checks below since it
+# sits at the OPPOSITE end of the phrase from every other quantity hint
+# this function recognizes.
+_LEADING_ONE_QUANTITY_RE = re.compile(r"^(?:одне|одна|один)\s+(?P<name>\S.*)$", re.IGNORECASE)
+
+# A trailing spelled-out "one piece" phrase ("одна штука"/"одну штуку") —
+# the WORD-form equivalent of a numeric "1 шт"/"1 штуку", which quantities.
+# parse_structured_quantity already handles (see the generic 2-word
+# structured-quantity check further down) but can't parse here since
+# "одна"/"одну" isn't a digit. Deliberately narrow (exactly these two
+# count-words + exactly these two piece-nouns) rather than a general
+# word-number parser — never guesses at "дві штуки"/"три штуки" etc.,
+# which stay unrecognized (candidate count alone must disambiguate, same
+# as any other quantity phrase this function doesn't understand).
+_ONE_PIECE_COUNT_WORDS = {"одна", "одну"}
+_PIECE_NOUN_WORDS = {"штука", "штуку"}
+
 
 def parse_inventory_delete_request(text):
     """Deterministically detect a delete request ("видали X із запасів",
@@ -1130,8 +1166,17 @@ def parse_inventory_delete_request(text):
     inventory row's own quantity_text is stored in (e.g. "1 шт."), so
     "прибери Молоко 1 шт"/"прибери Молоко — 1 шт"/"прибери молоко 1 штуку"
     all resolve to the exact stored "1 шт." — never blocked by a trailing-
-    dot/unit-spelling mismatch. Returns (None, None) if `text` doesn't match
-    this shape at all.
+    dot/unit-spelling mismatch.
+
+    A trailing EXPLANATORY clause ("... воно вже не потрібно"/"це вже не
+    треба"/"більше не треба"/"закінчилось", see _EXPLANATORY_TAIL_RE) is
+    stripped before any of the above, so it never becomes part of the
+    matched name. A spelled-out "one" count — leading ("видали одне
+    молоко", see _LEADING_ONE_QUANTITY_RE) or trailing ("видали молоко
+    одна штука", see _ONE_PIECE_COUNT_WORDS/_PIECE_NOUN_WORDS) — resolves
+    to the same "1 шт." hint a numeric "1 шт" would.
+
+    Returns (None, None) if `text` doesn't match this shape at all.
     """
     stripped = (text or "").strip()
     if not stripped:
@@ -1143,9 +1188,16 @@ def parse_inventory_delete_request(text):
     if _SHOPPING_LOCATION_RE.search(raw_rest):
         return None, None
     rest = _ADMIN_LOCATION_SUFFIX_RE.sub("", raw_rest).strip()
+    rest = _EXPLANATORY_TAIL_RE.sub("", rest).strip()
     rest = rest.rstrip(".!?").strip()
     if not rest or _DELETE_BULK_PRONOUN_RE.match(rest):
         return None, None
+
+    leading_match = _LEADING_ONE_QUANTITY_RE.match(rest)
+    if leading_match:
+        name_part = leading_match.group("name").strip()
+        if name_part:
+            return name_part, "1 шт."
 
     dash_match = _ADMIN_DASH_RE.search(rest)
     if dash_match:
@@ -1155,6 +1207,16 @@ def parse_inventory_delete_request(text):
             return name_part, _normalize_numeric_quantity_hint(qty_part)
 
     words = rest.split()
+
+    if (
+        len(words) >= 3
+        and words[-2].lower() in _ONE_PIECE_COUNT_WORDS
+        and words[-1].lower() in _PIECE_NOUN_WORDS
+    ):
+        name_part = " ".join(words[:-2]).strip()
+        if name_part:
+            return name_part, "1 шт."
+
     if len(words) >= 2 and words[-1].lower() in _WORD_NUMBER_QUANTITIES:
         return " ".join(words[:-1]).strip(), words[-1]
 
