@@ -1108,9 +1108,16 @@ _SHOPPING_LOCATION_RE = re.compile(r"(?:зі?\s+списку\s+покупок|з
 # (optional leading comma/whitespace, optional trailing punctuation), so a
 # product that happens to legitimately be named with one of these words
 # is never touched (there is no such product in this household's actual
-# grocery vocabulary).
+# grocery vocabulary). A second, separate alternative strips an open-ended
+# ", бо ..." causal clause ("...,  бо воно зіпсувалося") — the comma is
+# REQUIRED for this one (unlike the fixed-phrase whitelist above, which
+# tolerates a missing comma) specifically so a hypothetical product name
+# containing the bare word "бо" without a preceding comma is never
+# mistaken for one; deliberately still not a general NLP guess since it
+# only fires on the literal conjunction "бо" right after a comma.
 _EXPLANATORY_TAIL_RE = re.compile(
-    r"\s*,?\s*(?:воно\s+вже\s+не\s+потрібно|це\s+вже\s+не\s+треба|більше\s+не\s+треба|закінчилось)\s*[.!?]*\s*$",
+    r"\s*,?\s*(?:воно\s+вже\s+не\s+потрібно|це\s+вже\s+не\s+треба|більше\s+не\s+треба|закінчилось)\s*[.!?]*\s*$"
+    r"|\s*,\s*бо\s+.+$",
     re.IGNORECASE,
 )
 
@@ -1169,7 +1176,8 @@ def parse_inventory_delete_request(text):
     dot/unit-spelling mismatch.
 
     A trailing EXPLANATORY clause ("... воно вже не потрібно"/"це вже не
-    треба"/"більше не треба"/"закінчилось", see _EXPLANATORY_TAIL_RE) is
+    треба"/"більше не треба"/"закінчилось", or an open-ended ", бо ..."
+    causal clause, see _EXPLANATORY_TAIL_RE) is
     stripped before any of the above, so it never becomes part of the
     matched name. A spelled-out "one" count — leading ("видали одне
     молоко", see _LEADING_ONE_QUANTITY_RE) or trailing ("видали молоко

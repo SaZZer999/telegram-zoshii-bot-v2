@@ -62,6 +62,18 @@ class TestExplanatoryTailStripped(unittest.TestCase):
         self.assertEqual(name, "масло")
         self.assertIsNone(qty)
 
+    def test_bo_causal_clause_after_quantity_stripped(self):
+        name, qty = inventory.parse_inventory_delete_request(
+            "Видали молоко одна штука, бо воно зіпсувалося"
+        )
+        self.assertEqual(name, "молоко")
+        self.assertEqual(qty, "1 шт.")
+
+    def test_bo_causal_clause_without_quantity_stripped(self):
+        name, qty = inventory.parse_inventory_delete_request("видали сир, бо запліснявів")
+        self.assertEqual(name, "сир")
+        self.assertIsNone(qty)
+
 
 class TestSpelledOutOneQuantity(unittest.TestCase):
     def test_trailing_odna_shtuka(self):
@@ -193,6 +205,19 @@ class TestVoicedOnePieceWithTailSelectsCorrectRow(MilkQuantityDeleteWebhookTestC
         chat_id = 773001
         with patch.object(bot, "get_inventory_items", return_value=_milk_one_piece_and_liters_inventory()):
             _call_webhook(_make_update(773001001, chat_id, "Видали молоко одна штука, воно вже не потрібно."))
+        self.assertIn(chat_id, pending_cleanup_admin)
+        self.assertEqual(pending_cleanup_admin[chat_id]["item_id"], 7)
+        texts = self._sent_texts()
+        self.assertTrue(any("Молоко — 1 шт." in t for t in texts))
+
+
+# 1b — a ", бо ..." causal tail (instead of "воно вже не потрібно") is
+# stripped the same way and never blocks the "1 шт." row selection.
+class TestBoCausalTailSelectsCorrectRow(MilkQuantityDeleteWebhookTestCase):
+    def test_selects_one_piece_milk_row(self):
+        chat_id = 773008
+        with patch.object(bot, "get_inventory_items", return_value=_milk_one_piece_and_liters_inventory()):
+            _call_webhook(_make_update(773008001, chat_id, "Видали молоко одна штука, бо воно зіпсувалося"))
         self.assertIn(chat_id, pending_cleanup_admin)
         self.assertEqual(pending_cleanup_admin[chat_id]["item_id"], 7)
         texts = self._sent_texts()
