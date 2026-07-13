@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unicodedata
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 from flask import Flask, request
@@ -204,6 +204,37 @@ pending_cleanup_admin = {}   # chat_id -> {action: "rename"|"delete", household_
 # instead of ever falling through to general AI-chat.
 pending_cleanup_admin_disambiguation = {}  # chat_id -> {action: "rename"|"delete", candidates: [row, ...],
                               #             new_phrase (rename only, raw), household_id, user_db_id, origin}
+# Inventory Delete By Visible Number v1 — a RAM-only "recency" marker, NOT a
+# snapshot of the actual list contents: set whenever this chat was just
+# shown the numbered "🧊 Запаси" listing (_mark_inventory_list_shown, wired
+# into legacy_inventory_flow.py's handle_open_inventory_menu/handle_show_
+# inventory_list/handle_start_inventory_remove) OR whenever an inventory
+# delete-by-name request just failed to find any match (_start_inventory_
+# delete's "not found" branch) — either origin is treated identically, per
+# the live bug this fixes: "Видали сир із запасів" failing, then a bare "9"
+# reply should still resolve against row 9 of the inventory the user is
+# looking at. A bare number is ALWAYS resolved against a FRESH live
+# inventory fetch (never a stored item snapshot — see resolve_inventory_
+# number_reference), so this dict only ever needs to answer "is a bare
+# number plausible right now for this chat", never "what did row 9 used to
+# be". Expires after INVENTORY_NUMBER_CONTEXT_TTL so a bare number typed
+# long after any inventory activity is never silently reinterpreted as a
+# delete.
+pending_inventory_number_context = {}  # chat_id -> {"household_id": id, "ts": datetime}
+INVENTORY_NUMBER_CONTEXT_TTL = timedelta(minutes=20)
+
+
+def _mark_inventory_list_shown(chat_id, household_id):
+    pending_inventory_number_context[chat_id] = {"household_id": household_id, "ts": datetime.now()}
+
+
+def _has_recent_inventory_number_context(chat_id):
+    context = pending_inventory_number_context.get(chat_id)
+    if context is None:
+        return False
+    return datetime.now() - context["ts"] <= INVENTORY_NUMBER_CONTEXT_TTL
+
+
 # Inventory Transform V1 — awaiting confirm/cancel on a lossy combine of 2+
 # existing inventory rows into ONE new record (see household_router-adjacent
 # route _route_inventory_transform / inventory.parse_inventory_transform_
@@ -3071,6 +3102,12 @@ def _start_inventory_delete(chat_id, user_id, display_name, name_phrase, quantit
 
     candidates = _resolve_inventory_admin_candidates(chat_id, household_id, items, name_phrase, quantity_hint)
     if not candidates:
+        # Inventory Delete By Visible Number v1: a failed name match still
+        # arms the number-reference context for this chat — a name-based
+        # delete failing is exactly the situation where an immediate
+        # follow-up bare number ("9") most plausibly refers to the row the
+        # user actually meant (see this dict's own module comment).
+        _mark_inventory_list_shown(chat_id, household_id)
         send_message(chat_id, INVENTORY_ADMIN_NOT_FOUND_MSG, reply_markup=INVENTORY_KEYBOARD)
         return
     if len(candidates) > 1:
@@ -3096,7 +3133,52 @@ def _start_inventory_delete(chat_id, user_id, display_name, name_phrase, quantit
     send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
 
 
+def _start_inventory_delete_by_number(chat_id, user_id, display_name, number):
+    """Inventory Delete By Visible Number v1 — "видали 9"/"видали номер 9"
+    (explicit) or a bare "9" continuation (caller already checked _has_
+    recent_inventory_number_context before reaching here). Always resolves
+    against a FRESH live inventory fetch — never a stored item snapshot —
+    using the exact same numbering algorithm the "🧊 Запаси" listing itself
+    uses (inventory.resolve_inventory_number_reference), so a row that
+    changed position (or disappeared) since it was last shown is never
+    silently mismatched: an unknown number gets a controlled error, never a
+    guess. Builds the SAME pending_cleanup_admin preview/confirm/cancel/
+    undo path as name-based delete — nothing about confirm/cancel/undo
+    changes for this entry point."""
+    origin = household_router.current_origin(chat_id)
+    if _has_blocking_pending_state_for_reports(chat_id):
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        items = get_inventory_items(household_id)
+    except Exception:
+        send_message(chat_id, INVENTORY_ERROR_MSG)
+        return
+
+    row = inventory.resolve_inventory_number_reference(number, items, CATEGORY_ORDER, DEFAULT_CATEGORY)
+    if row is None:
+        send_message(chat_id, inventory.format_inventory_number_not_found_message(number), reply_markup=INVENTORY_KEYBOARD)
+        return
+
+    quantity_text = _effective_quantity(row)[2]
+    pending_cleanup_notice.pop(chat_id, None)
+    pending_inventory_number_context.pop(chat_id, None)
+    pending_cleanup_admin[chat_id] = {
+        "action": "delete",
+        "household_id": household_id, "user_db_id": user_db_id, "origin": origin,
+        "item_id": row["id"], "target": _inventory_admin_target(row),
+    }
+    preview = inventory.format_inventory_delete_preview(row["name"], quantity_text)
+    send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
+
+
 def _route_inventory_admin(chat_id, user_id, display_name, text):
+    delete_number = inventory.parse_inventory_delete_by_number(text)
+    if delete_number is not None:
+        _start_inventory_delete_by_number(chat_id, user_id, display_name, delete_number)
+        return True
+
     old_phrase, new_phrase = inventory.parse_inventory_rename_request(text)
     if old_phrase is not None:
         _start_inventory_rename(chat_id, user_id, display_name, old_phrase, new_phrase)
@@ -3105,6 +3187,18 @@ def _route_inventory_admin(chat_id, user_id, display_name, text):
     name_phrase, quantity_hint = inventory.parse_inventory_delete_request(text)
     if name_phrase is not None:
         _start_inventory_delete(chat_id, user_id, display_name, name_phrase, quantity_hint)
+        return True
+
+    # Bare-number continuation ("9" alone, no verb) — only ever claimed
+    # when this chat recently viewed the numbered inventory list or just
+    # had a failed name-based delete attempt (see pending_inventory_number_
+    # context's own module comment); without that recent context a bare
+    # number is left alone (returns False here, same as before this route
+    # existed) so it can still fall through to whatever else would
+    # otherwise handle it, never a silent/unexpected delete.
+    bare_number = inventory.parse_bare_inventory_number_reference(text)
+    if bare_number is not None and _has_recent_inventory_number_context(chat_id):
+        _start_inventory_delete_by_number(chat_id, user_id, display_name, bare_number)
         return True
 
     return False
@@ -4581,6 +4675,7 @@ _inventory_deps = legacy_inventory_flow.InventoryFlowDeps(
     format_unresolved_fragments_message=lambda *a, **kw: _format_unresolved_fragments_message(*a, **kw),
     resolve_numbered_inventory_delete_selection=lambda *a, **kw: _resolve_numbered_inventory_delete_selection(*a, **kw),
     format_numbered_delete_mismatch_message=lambda *a, **kw: _format_numbered_delete_mismatch_message(*a, **kw),
+    mark_inventory_list_shown=lambda *a, **kw: _mark_inventory_list_shown(*a, **kw),
     clear_shopping_state=lambda *a, **kw: clear_shopping_state(*a, **kw),
     clear_inventory_state=lambda *a, **kw: clear_inventory_state(*a, **kw),
     active_list_context=active_list_context,

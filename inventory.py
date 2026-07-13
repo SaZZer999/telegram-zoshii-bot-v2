@@ -1045,7 +1045,13 @@ _RENAME_TRIGGER_RE = re.compile(
     r"^(?:перейменуй|виправ|зміни\s+назву|заміни)\s+(?P<old>.+?)\s+на\s+(?P<new>.+)$",
     re.IGNORECASE,
 )
-_ADMIN_LOCATION_SUFFIX_RE = re.compile(r"\s*(?:із|з|в|у)\s+запас\w*\.?\s*$", re.IGNORECASE)
+# "з"/"із" (Ukrainian) and "из" (Russian, common in mixed-language
+# household speech — see parse_inventory_delete_request's own docstring)
+# all mean the same "from" preposition here; "запас\w*" already matches
+# both the Ukrainian "запасів"/"запасах" and Russian "запасов" endings on
+# its own (\w matches any word character), so only the preposition itself
+# needed the Russian spelling added.
+_ADMIN_LOCATION_SUFFIX_RE = re.compile(r"\s*(?:із|из|з|в|у)\s+запас\w*\.?\s*$", re.IGNORECASE)
 
 
 def parse_inventory_rename_request(text):
@@ -1097,7 +1103,13 @@ _SHOPPING_LOCATION_RE = re.compile(r"(?:зі?\s+списку\s+покупок|з
 def parse_inventory_delete_request(text):
     """Deterministically detect a delete request ("видали X із запасів",
     "прибери X", "прибери запис X", "видали X <text-quantity>", "прибери X
-    — <text-quantity>"). Deliberately excludes "прибери ... дублікат..."
+    — <text-quantity>"). The trailing location phrase is stripped via
+    _ADMIN_LOCATION_SUFFIX_RE regardless of whether it's spelled the
+    Ukrainian way ("із запасів"/"з запасів") or the Russian way ("из
+    запасов") — real household speech mixes both freely (e.g. "Видали сир
+    из запасов"), and a Russian preposition must never survive into the
+    matched product name/end up blocking the match entirely. Deliberately
+    excludes "прибери ... дублікат..."
     (Inventory Cleanup / Merge v1's own trigger — caller must try that gate
     FIRST, see bot.py's dispatch order) — this function has no "дублікат"
     special-case of its own, so a duplicate-cleanup phrase simply produces a
@@ -1173,6 +1185,89 @@ def _normalize_numeric_quantity_hint(text):
     if value is None:
         return text
     return format_quantity_display(value, unit)
+
+
+# =========================
+# INVENTORY DELETE BY VISIBLE NUMBER — "видали 9"/"видали номер 9"/"прибери
+# №9" (an explicit reference to a row's position in the numbered "🧊
+# Запаси" listing, instead of a product name) and the bare-number
+# continuation ("9" alone, with no verb at all) that only applies after a
+# recent inventory list view or a recent failed name-based delete attempt
+# (bot.py owns that recency gate — see pending_inventory_number_context —
+# this module stays pure text-parsing/candidate-resolution only, same
+# "no Gemini, no DB, no bot.py" posture as the rest of Inventory Cleanup
+# Admin v1 above).
+# =========================
+_DELETE_BY_NUMBER_RE = re.compile(
+    r"^(?:видали|прибери)\s+(?:запис\s+)?(?:№\s*|номер\s+|#\s*)?(?P<number>\d+)\s*\.?\s*$",
+    re.IGNORECASE,
+)
+_BARE_NUMBER_REFERENCE_RE = re.compile(r"^(?:№\s*|номер\s+|#\s*)?(?P<number>\d+)\s*\.?\s*$", re.IGNORECASE)
+
+
+def parse_inventory_delete_by_number(text):
+    """Deterministically detect an explicit delete-by-VISIBLE-NUMBER
+    request — the same trigger verbs as parse_inventory_delete_request
+    ("видали"/"прибери", optionally "запис"), naming a row's 1-based
+    position in the last-shown numbered inventory listing ("видали 9",
+    "видали номер 9", "прибери №9") instead of a product name. Returns the
+    number (int, always >= 1) or None if `text` doesn't match this shape
+    at all — in particular, None for anything with a non-numeric remainder
+    ("видали молоко"), so the caller's existing name-based parser is never
+    shadowed. Caller resolves the number against a FRESH numbered snapshot
+    (see resolve_inventory_number_reference) — this function never touches
+    inventory data itself."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    match = _DELETE_BY_NUMBER_RE.match(stripped)
+    if not match:
+        return None
+    number = int(match.group("number"))
+    return number if number >= 1 else None
+
+
+def parse_bare_inventory_number_reference(text):
+    """Detect a message that is JUST a row number ("9", "№9", "номер 9",
+    "#9") with no delete verb at all. Deliberately narrow (the ENTIRE
+    message, nothing else) — used ONLY as a continuation after a recent
+    inventory list view or a recent failed inventory delete attempt (see
+    bot.py's pending_inventory_number_context/_has_recent_inventory_
+    number_context), never claimed on its own initiative, since a bare
+    number could mean many other things in an unrelated context. Returns
+    the number (int, always >= 1) or None."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    match = _BARE_NUMBER_REFERENCE_RE.match(stripped)
+    if not match:
+        return None
+    number = int(match.group("number"))
+    return number if number >= 1 else None
+
+
+def resolve_inventory_number_reference(number, items, category_order, default_category):
+    """Resolve a 1-based visible row number (as shown in "🧊 Запаси") against
+    a FRESH inventory_items snapshot — reuses _numbered_inventory_display_
+    items directly, so "number N" can never mean anything different here
+    than what the user actually sees on screen. Returns the matching item
+    dict, or None if the number doesn't exist in the CURRENT list (caller
+    shows a controlled error via format_inventory_number_not_found_message,
+    never guesses)."""
+    numbered = _numbered_inventory_display_items(items, category_order, default_category)
+    by_number = {n: item for n, item in numbered}
+    return by_number.get(number)
+
+
+def format_inventory_number_not_found_message(number):
+    """Controlled error for an inventory delete-by-number reference to a
+    row that doesn't exist in the CURRENT list — never silently guesses a
+    different row, mirrors _format_numbered_delete_mismatch_message's own
+    "show the list again" guidance."""
+    return (
+        f"Номер {number} не існує в поточному списку запасів.\n\n"
+        "Покажи список запасів ще раз і вибери актуальний номер."
+    )
 
 
 # =========================

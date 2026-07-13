@@ -74,6 +74,13 @@ class InventoryFlowDeps:
     valid_categories: set
     inventory_error_msg: str
     selection_error_msg: str
+    # Inventory Delete By Visible Number v1 (optional, defaults to a no-op
+    # so every pre-existing InventoryFlowDeps(...) construction across the
+    # test suite that predates this field keeps working unchanged) — lets
+    # bot.py record "this chat just saw the numbered inventory list" so a
+    # later bare number reference ("9") can be resolved as a delete-by-
+    # number request instead of falling through to general AI-chat.
+    mark_inventory_list_shown: Callable = None
 
 
 # =========================
@@ -158,6 +165,15 @@ def parse_inventory_list_with_gemini(deps, text, alias_map=None):
         return None
 
 
+def _mark_inventory_list_shown(deps, chat_id, household_id):
+    """Thin None-guard so every InventoryFlowDeps construction that
+    predates this optional field (the whole existing test suite) keeps
+    working unchanged — see InventoryFlowDeps.mark_inventory_list_shown's
+    own docstring."""
+    if deps.mark_inventory_list_shown is not None:
+        deps.mark_inventory_list_shown(chat_id, household_id)
+
+
 # =========================
 # PREVIEWS
 # =========================
@@ -184,6 +200,7 @@ def handle_open_inventory_menu(deps, chat_id, user_id, display_name):
         household_id, _ = deps.get_household_and_user(user_id, display_name)
         deps.save_list_context(chat_id, household_id, "inventory_saved")
         items = deps.get_inventory_items(household_id)
+        _mark_inventory_list_shown(deps, chat_id, household_id)
         deps.send_message(chat_id, deps.format_inventory_list(items), reply_markup=deps.inventory_keyboard)
     except Exception:
         deps.send_message(chat_id, deps.inventory_error_msg, reply_markup=deps.inventory_keyboard)
@@ -206,6 +223,7 @@ def handle_show_inventory_list(deps, chat_id, user_id, display_name):
         household_id, _ = deps.get_household_and_user(user_id, display_name)
         deps.save_list_context(chat_id, household_id, "inventory_saved")
         items = deps.get_inventory_items(household_id)
+        _mark_inventory_list_shown(deps, chat_id, household_id)
         deps.send_message(chat_id, deps.format_inventory_list(items))
     except Exception:
         deps.send_message(chat_id, deps.inventory_error_msg)
@@ -218,6 +236,7 @@ def handle_start_inventory_remove(deps, chat_id, user_id, display_name):
     try:
         household_id, user_db_id = deps.get_household_and_user(user_id, display_name)
         items = deps.get_inventory_items(household_id)
+        _mark_inventory_list_shown(deps, chat_id, household_id)
         if not items:
             deps.send_message(chat_id, "Запаси поки порожні.")
         else:
