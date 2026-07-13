@@ -300,19 +300,26 @@ _PACKAGE_SIZE_UNIT_DISPLAY = {"g": "г", "kg": "кг", "ml": "мл", "l": "л"}
 
 def _strip_package_size(name):
     """Remove the FIRST embedded package-size token (e.g. "135g", "1L",
-    "500 ml") from `name`, returning (cleaned_name, embedded_quantity_text)
-    — embedded_quantity_text is None if no such token was found. The
-    caller only ever uses embedded_quantity_text as a FALLBACK when
-    Gemini's own separate quantity/unit fields for this line item came
-    back blank — a separately-reported quantity always wins over a token
-    parsed back out of the name text."""
+    "500 ml") from `name`, returning (cleaned_name, package_value,
+    package_unit) — package_value/package_unit are both None if no such
+    token was found. package_value is an exact Decimal, package_unit is
+    already the display unit ("г"/"кг"/"мл"/"л").
+
+    Receipt V2.2: this package size is the MOST RELIABLE quantity signal
+    on a receipt line — a receipt commonly prints "SER GOUDA 130g" for a
+    variable-weight product but Gemini's own separate quantity/unit fields
+    for that same row report a plain PACKAGE COUNT ("1 шт", "2 шт" — how
+    many of that package were bought), never the weight itself. See
+    _parse_line_item's own docstring for how the two are combined (count
+    × package size, e.g. 2 × 130g = 260 г) rather than one silently
+    overriding the other."""
     m = _PACKAGE_SIZE_RE.search(name)
     if not m:
-        return name, None
+        return name, None, None
     cleaned = re.sub(r"\s+", " ", (name[:m.start()] + name[m.end():])).strip()
-    unit_display = _PACKAGE_SIZE_UNIT_DISPLAY[m.group(2).lower()]
-    embedded_quantity_text = f"{m.group(1).replace(',', '.')} {unit_display}"
-    return cleaned, embedded_quantity_text
+    package_unit = _PACKAGE_SIZE_UNIT_DISPLAY[m.group(2).lower()]
+    package_value = Decimal(m.group(1).replace(",", "."))
+    return cleaned, package_value, package_unit
 
 
 # Deterministic Polish/English -> Ukrainian grocery-word translation,
@@ -381,43 +388,102 @@ def _normalize_product_name(name):
     return " ".join(result)
 
 
+# Receipt V2.2 — deterministic category assignment. Checked against the
+# already-normalized (translated to Ukrainian) display name, word by word
+# (never a substring match — a substring match would misfire on something
+# like "десерт" containing "сир"-adjacent letters); this is why it runs
+# AFTER _normalize_product_name, not on the raw Polish/English text. Every
+# category string here is one of bot.py's own fixed VALID_CATEGORIES
+# values verbatim (photo_receipts.py never imports bot.py — see this
+# module's own docstring — so these are deliberately duplicated literals,
+# not a shared import); an unrecognized product returns None, which
+# bot.py's household_router._validate_new_item_op already treats the same
+# as "no category given" (falls back to DEFAULT_CATEGORY) — a safe,
+# explicitly-allowed default, never a guess dressed up as certainty.
+_CATEGORY_BY_WORD = {
+    "сир": "Молочне та яйця", "гауда": "Молочне та яйця",
+    "молоко": "Молочне та яйця", "масло": "Молочне та яйця",
+    "яйця": "Молочне та яйця",
+    "часник": "Овочі та зелень",
+    "олія": "Інше їстівне",
+    "хліб": "Хліб і випічка", "булка": "Хліб і випічка",
+    "печиво": "Солодке та снеки",
+    "банан": "Фрукти та ягоди", "банани": "Фрукти та ягоди", "фрукти": "Фрукти та ягоди",
+    "напої": "Напої", "напій": "Напої", "сік": "Напої", "вода": "Напої",
+}
+
+
+def _categorize_display_name(display_name):
+    """Deterministic Receipt V2.2 categorizer — see _CATEGORY_BY_WORD's
+    own docstring. Exact whole-word match only (never substring), checked
+    against every word of the already-translated Ukrainian display name;
+    returns the FIRST matching category in word order, or None if nothing
+    in the name is recognized. Never raises."""
+    for word in display_name.lower().replace(",", " ").split():
+        category = _CATEGORY_BY_WORD.get(word)
+        if category:
+            return category
+    return None
+
+
 def _debug_row(raw_name=None, normalized_name=None, quantity_text="", line_price=None,
-                kept=False, drop_reason=None):
+                kept=False, drop_reason=None, category=None, package_size_text=None):
     """One Receipt Debug/Explain V1 row — see ReceiptCandidate.line_item_
     debug's own docstring for the field contract. `dedupe_reason` is never
     set here (always None at this point) — only _dedupe_discount_
     duplicates ever fills it in, once it can see every same-name row
-    together."""
+    together. `package_size_text` (Receipt V2.2) is the raw package-size
+    token detected in the name (e.g. "130 г"), or None if the row had
+    none — purely informational, shown alongside the final quantity_text
+    so a "why 260 г?" question can be answered (count × package size)."""
     return {
         "raw_name": raw_name, "normalized_name": normalized_name, "quantity_text": quantity_text,
         "line_price": line_price, "kept": kept, "drop_reason": drop_reason, "dedupe_reason": None,
+        "category": category, "package_size_text": package_size_text,
     }
 
 
 def _parse_line_item(raw, *, debug=False):
     """One raw Gemini line_items entry -> {"name", "quantity_text",
-    "line_price"} or None if malformed/blank/obviously not an inventory
-    item (see _looks_like_non_inventory_name) OR a discount/refund row for
-    a real product — a receipt commonly repeats the EXACT SAME product
-    name on its own discount line (e.g. two "SER GOUDA" rows: one the real
-    purchase, one "-1,00" knocked off it), with no distinguishing keyword
-    at all; only the row's own NEGATIVE price marks it as a discount, not
-    a second unit purchased — a name-only keyword filter would auto-merge
-    that second row into the real one (1+1 -> "2 шт.", the live bug this
-    fixes). A second live bug (a discount row that DOESN'T even get a
-    negative price from Gemini — just no price at all) is handled one
-    level up, in _parse_line_items' own dedup pass, once every row's FINAL
-    normalized name is known.
+    "line_price", "category"} or None if malformed/blank/obviously not an
+    inventory item (see _looks_like_non_inventory_name) OR a discount/
+    refund row for a real product — a receipt commonly repeats the EXACT
+    SAME product name on its own discount line (e.g. two "SER GOUDA" rows:
+    one the real purchase, one "-1,00" knocked off it), with no
+    distinguishing keyword at all; only the row's own NEGATIVE price marks
+    it as a discount, not a second unit purchased — a name-only keyword
+    filter would auto-merge that second row into the real one (1+1 ->
+    "2 шт.", the live bug this fixes). A second live bug (a discount row
+    that DOESN'T even get a negative price from Gemini — just no price at
+    all) is handled one level up, in _parse_line_items' own dedup pass,
+    once every row's FINAL normalized name is known.
 
     `name` is normalized before being returned: any embedded package-size
-    token ("135g", "1L", ...) is stripped out (see _strip_package_size) —
-    used as a FALLBACK quantity only when Gemini's own quantity/unit for
-    this row came back blank, never overriding a real one — and known
-    Polish/English grocery words are translated to Ukrainian (see
-    _normalize_product_name); an unrecognized word (a brand name) is kept,
-    only its casing is cleaned up. `quantity_text` is either a clean
-    "<number> <unit>" string or "" (an unclear quantity — safely defaults
-    downstream, never guessed here). Never raises.
+    token ("135g", "1L", ...) is stripped out (see _strip_package_size),
+    and known Polish/English grocery words are translated to Ukrainian
+    (see _normalize_product_name); an unrecognized word (a brand name) is
+    kept, only its casing is cleaned up.
+
+    `quantity_text` (Receipt V2.2 — see _strip_package_size's own
+    docstring for why): when the name carries a package-size token, that
+    size is the TRUE unit — Gemini's own separate "quantity" field for
+    that row is then a package COUNT, not a weight/volume, so the final
+    quantity is count × package size (e.g. "SER GOUDA 130g" with
+    quantity=2 -> "260 г", not "2 шт."; quantity blank/missing defaults
+    the count to 1 -> "130 г", never "1 шт."). The one exception: if
+    Gemini's own unit for the row is ALREADY a weight/volume unit (not a
+    plain "шт." count), that's a direct per-row reading (e.g. a scale
+    receipt printing the exact weight bought) and is trusted as-is, package
+    token only used as a quantity fallback if that reading is itself
+    missing. With no package-size token at all, this falls back to
+    Gemini's own quantity+unit verbatim, or "" if unclear/missing (a safe
+    default handled downstream, never guessed here). Never raises.
+
+    `category` (Receipt V2.2): a deterministic keyword categorization of
+    the FINAL display name (see _categorize_display_name) — or None if
+    unrecognized, which household_router._validate_new_item_op already
+    treats as "no category given" (falls back to the same default every
+    other uncategorized item gets), never a fabricated guess.
 
     debug=True (Receipt Debug/Explain V1) returns (item_or_None, debug_row)
     instead of just item_or_None — every caller outside this module keeps
@@ -449,25 +515,42 @@ def _parse_line_item(raw, *, debug=False):
             drop_reason="від'ємна ціна — рядок знижки на цей товар",
         ))
 
-    stripped_name, embedded_quantity_text = _strip_package_size(raw_name)
+    stripped_name, package_value, package_unit = _strip_package_size(raw_name)
     display_name = _normalize_product_name(stripped_name)
+    package_size_text = f"{_format_plain_number(package_value)} {package_unit}" if package_value is not None else None
 
-    quantity_text = ""
     quantity_value = _parse_amount(raw.get("quantity"))
-    raw_unit = raw.get("unit")
-    if quantity_value is not None and isinstance(raw_unit, str) and raw_unit.strip().lower() in _VALID_ITEM_UNITS:
-        quantity_text = f"{_format_plain_number(quantity_value)} {raw_unit.strip().lower()}"
-    if not quantity_text and embedded_quantity_text:
-        quantity_text = embedded_quantity_text
+    raw_unit_raw = raw.get("unit")
+    raw_unit = raw_unit_raw.strip().lower() if isinstance(raw_unit_raw, str) else None
+    unit_is_direct_reading = raw_unit in _VALID_ITEM_UNITS and raw_unit != "шт"
+
+    if package_value is not None and not unit_is_direct_reading:
+        # Package size is the true unit; Gemini's own quantity here (if
+        # any) is a PACKAGE COUNT multiplier, defaulting to 1 (a single
+        # package) — never "1 шт."/"2 шт." for a weight/volume product.
+        count = quantity_value if quantity_value is not None else Decimal("1")
+        total_value = count * package_value
+        quantity_text = f"{_format_plain_number(total_value)} {package_unit}"
+    elif quantity_value is not None and raw_unit in _VALID_ITEM_UNITS:
+        quantity_text = f"{_format_plain_number(quantity_value)} {raw_unit}"
+    elif package_value is not None:
+        # unit_is_direct_reading was True but quantity_value itself was
+        # blank — fall back to the package size alone (count of 1).
+        quantity_text = f"{_format_plain_number(package_value)} {package_unit}"
+    else:
+        quantity_text = ""
+
+    category = _categorize_display_name(display_name)
 
     item = {
         "name": display_name,
         "quantity_text": quantity_text,
         "line_price": _parse_amount(raw.get("line_price")),
+        "category": category,
     }
     return _result(item, _debug_row(
         raw_name=raw_name, normalized_name=display_name, quantity_text=quantity_text,
-        line_price=item["line_price"], kept=True,
+        line_price=item["line_price"], kept=True, category=category, package_size_text=package_size_text,
     ))
 
 
@@ -818,7 +901,11 @@ def format_receipt_debug_summary(debug_rows):
             quantity_text = row.get("quantity_text") or "кількість не вказана"
             price = row.get("line_price")
             price_text = f"{price} zł" if price is not None else "ціна не вказана"
-            entry += f" → {normalized}, {quantity_text}, {price_text} ✅ додано"
+            category = row.get("category") or "категорія не визначена"
+            entry += f" → {normalized}, {quantity_text}, {price_text}, категорія: {category} ✅ додано"
+            package_size_text = row.get("package_size_text")
+            if package_size_text:
+                entry += f"\n   ↳ розмір пакування на чеку: {package_size_text}"
         else:
             entry += f" ❌ відкинуто: {row.get('drop_reason') or 'причина невідома'}"
         dedupe_reason = row.get("dedupe_reason")

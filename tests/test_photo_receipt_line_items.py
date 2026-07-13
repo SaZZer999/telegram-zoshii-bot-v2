@@ -452,12 +452,17 @@ class TestProductNameNormalization(unittest.TestCase):
         self.assertEqual(item["name"], "Сир Гауда")
         self.assertEqual(item["quantity_text"], "135 г")
 
-    def test_separate_gemini_quantity_wins_over_embedded_package_size(self):
+    def test_package_size_count_multiplies_into_total_weight(self):
+        # Receipt V2.2 (live bug fix): Gemini's own "quantity"/"unit" for a
+        # weighed product row is a PACKAGE COUNT ("2 шт." = two 135g
+        # packages), never the weight itself — the package size wins and
+        # is multiplied by the count, so this is "270 г", never "2 шт.".
         item = photo_receipts._parse_line_item({
             "name": "SER GOUDA 135g", "quantity": "2", "unit": "шт", "line_price": "19.96",
         })
         self.assertEqual(item["name"], "Сир Гауда")
-        self.assertEqual(item["quantity_text"], "2 шт")
+        self.assertEqual(item["quantity_text"], "270 г")
+        self.assertEqual(item["category"], "Молочне та яйця")
 
     def test_olej_bartek_preserves_brand_name(self):
         # 2 — "OLEJ BARTEK" -> "Олія Bartek": translated grocery word +
@@ -569,6 +574,147 @@ class TestMissingPriceDuplicateIsDropped(unittest.TestCase):
         ]
         items = photo_receipts._parse_line_items(raw_items)
         self.assertEqual(len(items), 1)
+
+
+# =========================
+# Receipt V2.2 — package-size quantities (weight/volume, not "шт.") and
+# deterministic category assignment, end to end through the same webhook
+# path a real receipt photo uses (household_router auto-merge across rows,
+# the Inventory Representation Guard, and the final add_inventory_items
+# preview payload).
+# =========================
+class TestPackageQuantitiesAndCategories(PhotoLineItemsWebhookTestCase):
+    def test_two_real_130g_cheese_rows_merge_into_260g_dairy(self):
+        chat_id = 998020
+        raw_items = [
+            {"name": "SER GOUDA 130g", "quantity": None, "unit": None, "line_price": "6.50"},
+            {"name": "SER GOUDA 130g", "quantity": None, "unit": None, "line_price": "6.50"},
+        ]
+        candidate = _receipt_candidate(line_items=photo_receipts._parse_line_items(raw_items))
+        self._send_photo(998020001, chat_id, candidate)
+        data = pending_global_household[chat_id]
+        cheese = [i for i in data["add_inventory_items"] if i["canonical_name"] == "сир гауда"]
+        self.assertEqual(len(cheese), 1)
+        self.assertEqual(cheese[0]["quantity_value"], Decimal("260"))
+        self.assertEqual(cheese[0]["quantity_unit"], "г")
+        self.assertEqual(cheese[0]["category"], "Молочне та яйця")
+
+    def test_single_135g_cheese_row_shows_grams_not_piece(self):
+        chat_id = 998021
+        raw_items = [{"name": "SER GOUDA 135g", "quantity": None, "unit": None, "line_price": "9.98"}]
+        candidate = _receipt_candidate(line_items=photo_receipts._parse_line_items(raw_items))
+        self._send_photo(998021001, chat_id, candidate)
+        item = pending_global_household[chat_id]["add_inventory_items"][0]
+        self.assertEqual(item["quantity_value"], Decimal("135"))
+        self.assertEqual(item["quantity_unit"], "г")
+        self.assertEqual(item["category"], "Молочне та яйця")
+
+    def test_real_130g_row_plus_suspicious_priceless_duplicate_stays_130g(self):
+        chat_id = 998022
+        raw_items = [
+            {"name": "SER GOUDA 130g", "quantity": None, "unit": None, "line_price": "6.50"},
+            {"name": "SER GOUDA 130g", "quantity": None, "unit": None, "line_price": None},
+        ]
+        candidate = _receipt_candidate(line_items=photo_receipts._parse_line_items(raw_items))
+        self._send_photo(998022001, chat_id, candidate)
+        data = pending_global_household[chat_id]
+        cheese = [i for i in data["add_inventory_items"] if i["canonical_name"] == "сир гауда"]
+        self.assertEqual(len(cheese), 1)
+        self.assertEqual(cheese[0]["quantity_value"], Decimal("130"))
+        self.assertEqual(cheese[0]["quantity_unit"], "г")
+
+    def test_two_mleko_1l_rows_merge_into_two_liters_dairy(self):
+        chat_id = 998023
+        raw_items = [
+            {"name": "MLEKO 1L", "quantity": None, "unit": None, "line_price": "4.50"},
+            {"name": "MLEKO 1L", "quantity": None, "unit": None, "line_price": "4.50"},
+        ]
+        candidate = _receipt_candidate(line_items=photo_receipts._parse_line_items(raw_items))
+        self._send_photo(998023001, chat_id, candidate)
+        data = pending_global_household[chat_id]
+        milk = [i for i in data["add_inventory_items"] if i["canonical_name"] == "молоко"]
+        self.assertEqual(len(milk), 1)
+        self.assertEqual(milk[0]["quantity_value"], Decimal("2"))
+        self.assertEqual(milk[0]["quantity_unit"], "л")
+        self.assertEqual(milk[0]["category"], "Молочне та яйця")
+
+    def test_olej_bartek_gets_sensible_category(self):
+        chat_id = 998024
+        raw_items = [{"name": "OLEJ BARTEK 1L", "quantity": "1", "unit": "л", "line_price": "6.50"}]
+        candidate = _receipt_candidate(line_items=photo_receipts._parse_line_items(raw_items))
+        self._send_photo(998024001, chat_id, candidate)
+        item = pending_global_household[chat_id]["add_inventory_items"][0]
+        self.assertEqual(item["quantity_value"], Decimal("1"))
+        self.assertEqual(item["quantity_unit"], "л")
+        self.assertEqual(item["category"], "Інше їстівне")
+
+    def test_czosnek_gets_vegetable_category(self):
+        chat_id = 998025
+        raw_items = [{"name": "CZOSNEK", "quantity": "1", "unit": "шт", "line_price": "1.80"}]
+        candidate = _receipt_candidate(line_items=photo_receipts._parse_line_items(raw_items))
+        self._send_photo(998025001, chat_id, candidate)
+        item = pending_global_household[chat_id]["add_inventory_items"][0]
+        self.assertEqual(item["quantity_value"], Decimal("1"))
+        self.assertEqual(item["quantity_unit"], "шт.")
+        self.assertEqual(item["category"], "Овочі та зелень")
+
+    def test_receipt_items_never_all_default_to_other_food_category(self):
+        # The live bug's second half: every item used to silently land in
+        # "Інше їстівне" because raw_items never carried a category at
+        # all — known dairy must now land in its real category.
+        chat_id = 998026
+        raw_items = [
+            {"name": "OLEJ BARTEK", "quantity": "1", "unit": "л", "line_price": "6.50"},
+            {"name": "SER GOUDA", "quantity": None, "unit": None, "line_price": "9.98"},
+            {"name": "CZOSNEK", "quantity": "1", "unit": "шт", "line_price": "1.80"},
+        ]
+        candidate = _receipt_candidate(
+            merchant="Żabka", amount=Decimal("27.28"),
+            line_items=photo_receipts._parse_line_items(raw_items),
+        )
+        self._send_photo(998026001, chat_id, candidate)
+        data = pending_global_household[chat_id]
+        categories = {i["canonical_name"]: i["category"] for i in data["add_inventory_items"]}
+        self.assertEqual(categories["сир гауда"], "Молочне та яйця")
+        self.assertEqual(categories["часник"], "Овочі та зелень")
+        self.assertNotEqual(categories["сир гауда"], bot.DEFAULT_CATEGORY)
+
+    def test_confirm_writes_corrected_categories_and_quantities(self):
+        chat_id = 998027
+        raw_items = [
+            {"name": "SER GOUDA 130g", "quantity": None, "unit": None, "line_price": "6.50"},
+            {"name": "SER GOUDA 130g", "quantity": None, "unit": None, "line_price": "6.50"},
+        ]
+        candidate = _receipt_candidate(line_items=photo_receipts._parse_line_items(raw_items))
+        self._send_photo(998027001, chat_id, candidate)
+        with patch.object(bot, "apply_global_household_operations") as mock_apply:
+            mock_apply.return_value = {
+                "shopping_added": 0, "inventory_added": 1, "inventory_updated": 0,
+                "inventory_removed": 0, "expense_added_id": 1, "expense_deleted": False,
+            }
+            _call_webhook({
+                "update_id": 998027002,
+                "message": {"chat": {"id": chat_id}, "text": "✅ Так, застосувати", "from": {"id": 555, "first_name": "Тест"}},
+            })
+        mock_apply.assert_called_once()
+        _, kwargs = mock_apply.call_args
+        cheese = kwargs["add_inventory_items"][0]
+        self.assertEqual(cheese["quantity_value"], Decimal("260"))
+        self.assertEqual(cheese["quantity_unit"], "г")
+        self.assertEqual(cheese["category"], "Молочне та яйця")
+
+    def test_cancel_after_package_quantity_preview_writes_nothing(self):
+        chat_id = 998028
+        raw_items = [{"name": "SER GOUDA 130g", "quantity": None, "unit": None, "line_price": "6.50"}]
+        candidate = _receipt_candidate(line_items=photo_receipts._parse_line_items(raw_items))
+        self._send_photo(998028001, chat_id, candidate)
+        with patch.object(bot, "apply_global_household_operations") as mock_apply:
+            _call_webhook({
+                "update_id": 998028002,
+                "message": {"chat": {"id": chat_id}, "text": "❌ Скасувати", "from": {"id": 555, "first_name": "Тест"}},
+            })
+        mock_apply.assert_not_called()
+        self.assertNotIn(chat_id, pending_global_household)
 
 
 if __name__ == "__main__":

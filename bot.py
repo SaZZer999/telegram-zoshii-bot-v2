@@ -6500,7 +6500,10 @@ def _build_receipt_line_items_preview(chat_id, household_id, user_db_id, kind, p
     exactly what the user pointed the camera at.
     """
     alias_map = get_household_alias_map(household_id)
-    raw_items = [{"name": li["name"], "quantity_text": li["quantity_text"]} for li in payload["line_items"]]
+    raw_items = [
+        {"name": li["name"], "quantity_text": li["quantity_text"], "category": li.get("category")}
+        for li in payload["line_items"]
+    ]
     validated_items = household_router.validate_mini_planner_add_items(raw_items, alias_map)
     if not validated_items:
         send_message(chat_id, PHOTO_PROCESSING_FAILED_MSG)

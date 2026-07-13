@@ -69,7 +69,10 @@ class TestParseLineItemsWithDebug(unittest.TestCase):
         items = photo_receipts._parse_line_items([
             {"name": "Mleko", "quantity": "2", "unit": "л", "line_price": "8.00"},
         ])
-        self.assertEqual(items, [{"name": "Молоко", "quantity_text": "2 л", "line_price": Decimal("8.00")}])
+        self.assertEqual(items, [{
+            "name": "Молоко", "quantity_text": "2 л", "line_price": Decimal("8.00"),
+            "category": "Молочне та яйця",
+        }])
 
 
 class TestFormatReceiptDebugSummary(unittest.TestCase):
