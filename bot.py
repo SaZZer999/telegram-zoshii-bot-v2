@@ -4007,6 +4007,43 @@ def _try_apply_text_correction(chat_id, data, items, text):
     return True
 
 
+def _refresh_inventory_representation_warnings(data):
+    """Recompute the Inventory Representation Guard's per-item
+    `_representation_outcome`/`_representation_note` preview annotations
+    after a preview edit (deterministic quantity/rename parser or the
+    Pending Preview Edit Planner) has changed an add_inventory_items row's
+    quantity or name — those annotations are ONLY ever read by household_
+    router.format_preview for display (apply_global_household_operations/
+    database.py never read them), so recomputing them here can never change
+    what confirm ultimately writes, only what the preview text says before
+    that. Uses a FRESH inventory snapshot (never whatever was fetched when
+    this preview was first built), so a conflicting row that appeared or
+    disappeared meanwhile is reflected too — the live bug this fixes is a
+    "⚠️ ... вже є у запасах: 400 г. Нове надходження: 2 шт." warning
+    surviving unchanged after the item itself was edited to 130 г.
+
+    If the fresh guard pass would now BLOCK the whole preview ("clarify" —
+    the edited quantity is an ambiguous inferred guess against incompatible
+    existing rows), this deliberately does NOT switch into that
+    continuation flow mid preview-edit — it strips the stale warning from
+    every add_inventory_items row instead, so the preview never shows an
+    old, wrong quantity in a warning even though a full clarification flow
+    doesn't fire here."""
+    items = data.get("add_inventory_items")
+    if not items:
+        return
+    inventory_items = get_inventory_items(data["household_id"])
+    guard_kind, guard_result = household_router.apply_inventory_representation_guard(items, inventory_items)
+    if guard_kind == "clarify":
+        for item in items:
+            item.pop("_representation_outcome", None)
+            item.pop("_representation_note", None)
+        return
+    updated_items, inventory_merge_targets = guard_result
+    data["add_inventory_items"] = updated_items
+    data["inventory_targets"] = _snapshot_targets(data["consume_changes"]) + inventory_merge_targets
+
+
 def _try_apply_preview_edit_planner(chat_id, data, text):
     """Pending Preview Edit Planner — the LAST-RESORT semantic fallback,
     tried only after every deterministic preview-edit handler (quantity/
@@ -4072,6 +4109,13 @@ def _try_apply_preview_edit_planner(chat_id, data, text):
             item["quantity_inferred"] = False
             item["quantity_text"] = format_quantity_display(patch["new_quantity"], patch["new_unit"])
 
+    inventory_edited = any(
+        patch["operation"] in ("update_inventory_quantity", "rename_inventory_item")
+        for patch in result["patches"]
+    )
+    if inventory_edited:
+        _refresh_inventory_representation_warnings(data)
+
     preview = household_router.format_preview(data, header="Оновив план:")
     send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
     return True
@@ -4087,6 +4131,9 @@ def _handle_global_household_edit_text(chat_id, text):
         ok, result = preview_editing.parse_household_add_preview_edit(text, items)
         if ok:
             preview_editing.apply_household_add_preview_edits(items, result, canonicalize_name, inventory.capitalize_first)
+            inventory_start = len(data["add_shopping_items"])
+            if any(edit["index"] >= inventory_start for edit in result):
+                _refresh_inventory_representation_warnings(data)
             preview = household_router.format_preview(data, header="Оновив план:")
             send_message(chat_id, preview, reply_markup=GLOBAL_HOUSEHOLD_PREVIEW_KEYBOARD)
             return

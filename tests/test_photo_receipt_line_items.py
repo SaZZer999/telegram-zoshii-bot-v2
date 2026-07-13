@@ -509,6 +509,31 @@ class TestMissingPriceDuplicateIsDropped(unittest.TestCase):
         self.assertEqual(items[0]["name"], "Сир Гауда")
         self.assertEqual(items[0]["line_price"], Decimal("9.98"))
 
+    def test_one_real_one_priceless_cheese_duplicate_keeps_one(self):
+        # Work order test 1: SER GOUDA duplicated, one row has a real
+        # positive price, the other has no price at all (not negative,
+        # just missing) — the priceless one is dropped, never "2 шт.".
+        raw_items = [
+            {"name": "SER GOUDA", "quantity": None, "unit": None, "line_price": "9.98"},
+            {"name": "SER GOUDA", "quantity": None, "unit": None, "line_price": None},
+        ]
+        items = photo_receipts._parse_line_items(raw_items)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["name"], "Сир Гауда")
+        self.assertEqual(items[0]["line_price"], Decimal("9.98"))
+
+    def test_both_priceless_cheese_duplicates_collapsed_to_one(self):
+        # Work order test 2: SER GOUDA duplicated, BOTH rows missing price
+        # — no evidence of two purchased units, so only one cheese row
+        # survives, never "2 шт.".
+        raw_items = [
+            {"name": "SER GOUDA", "quantity": None, "unit": None, "line_price": None},
+            {"name": "SER GOUDA", "quantity": None, "unit": None, "line_price": None},
+        ]
+        items = photo_receipts._parse_line_items(raw_items)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["name"], "Сир Гауда")
+
     def test_two_genuinely_priced_identical_products_both_kept(self):
         # 5 — two CLEARLY real purchases (both have their own real price)
         # of the identical product must still be allowed to become 2 шт.
@@ -519,16 +544,31 @@ class TestMissingPriceDuplicateIsDropped(unittest.TestCase):
         items = photo_receipts._parse_line_items(raw_items)
         self.assertEqual(len(items), 2)
 
-    def test_both_priceless_duplicates_kept_as_is(self):
-        # No stronger signal (a priced row to compare against) exists here
-        # — nothing safe to drop, so both survive unchanged rather than
-        # guessing which one (if either) is the discount.
+    def test_package_size_plus_suspicious_duplicate_never_becomes_two(self):
+        # Work order test 4: "SER GOUDA 135g" plus a suspicious priceless
+        # duplicate of the SAME cheese (no package-size token this time) —
+        # final result is one cheese row; since the 135g variant is kept
+        # (it carries real quantity_text), it wins over the blank one.
+        raw_items = [
+            {"name": "SER GOUDA 135g", "quantity": None, "unit": None, "line_price": None},
+            {"name": "SER GOUDA", "quantity": None, "unit": None, "line_price": None},
+        ]
+        items = photo_receipts._parse_line_items(raw_items)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["name"], "Сир Гауда")
+        self.assertEqual(items[0]["quantity_text"], "135 г")
+
+    def test_both_priceless_duplicates_are_collapsed_to_one(self):
+        # Neither row has any price evidence at all — that's not proof of
+        # two purchased units either, so only one survives (conservative
+        # receipt duplicate policy: never invent a 2nd unit without real
+        # evidence — see _dedupe_discount_duplicates).
         raw_items = [
             {"name": "Chleb", "quantity": None, "unit": None, "line_price": None},
             {"name": "Chleb", "quantity": None, "unit": None, "line_price": None},
         ]
         items = photo_receipts._parse_line_items(raw_items)
-        self.assertEqual(len(items), 2)
+        self.assertEqual(len(items), 1)
 
 
 if __name__ == "__main__":

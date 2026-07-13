@@ -430,6 +430,20 @@ def _parse_line_item(raw):
     }
 
 
+def _pick_best_duplicate(items, indices):
+    """Among a group of same-name rows with NO price evidence at all (see
+    _dedupe_discount_duplicates), pick the single row to keep: prefer one
+    that already carries a real quantity_text (e.g. from an embedded
+    package-size token like "135g", see _strip_package_size) over a blank
+    one — that's real information about the actual purchased amount, never
+    guessed — otherwise just the first row encountered, so the receipt's
+    own row order decides ties."""
+    for i in indices:
+        if items[i]["quantity_text"]:
+            return i
+    return indices[0]
+
+
 def _dedupe_discount_duplicates(items):
     """Second layer of duplicate/discount defense (see _parse_line_item's
     own docstring): groups already-parsed items by their FINAL normalized
@@ -440,15 +454,21 @@ def _dedupe_discount_duplicates(items):
     reject) both resolve to the same "Сир Гауда" key and be recognized as
     duplicates here.
 
-    Within a same-name group: if at least one row has a real line_price
-    AND at least one has none at all, the priceless row(s) are dropped —
-    a genuine second unit purchased almost always shows its own price too,
-    so a same-name row with NO price sitting next to one that DOES have a
-    price is exactly the "suspicious metadata" signature of an
-    unlabeled discount/correction line, never a real second item. If
-    EVERY row in the group has a real price (two genuinely identical
-    purchases), all are kept — quantity 2 is a perfectly normal outcome
-    then, not a bug."""
+    Within a same-name group, conservative-by-default (never invent a 2nd
+    purchased unit without real evidence):
+      - at least one row priced AND at least one row priceless: the
+        priceless row(s) are dropped — a genuine second unit purchased
+        almost always shows its own price too, so a same-name row with NO
+        price sitting next to one that DOES have a price is exactly the
+        "suspicious metadata" signature of an unlabeled discount/
+        correction line, never a real second item.
+      - EVERY row in the group priced (two genuinely identical purchases):
+        all are kept — quantity 2 is a perfectly normal outcome then, not
+        a bug, since a real price on every row IS the strong evidence.
+      - EVERY row in the group priceless (zero price evidence either way):
+        same-name rows with no price backing either of them are not proof
+        of two purchased units either — keep only one (see
+        _pick_best_duplicate)."""
     groups = {}
     for i, item in enumerate(items):
         groups.setdefault(item["name"].strip().lower(), []).append(i)
@@ -461,6 +481,9 @@ def _dedupe_discount_duplicates(items):
         unpriced = [i for i in indices if items[i]["line_price"] is None]
         if priced and unpriced:
             drop.update(unpriced)
+        elif not priced:
+            keep = _pick_best_duplicate(items, indices)
+            drop.update(i for i in indices if i != keep)
 
     return [item for i, item in enumerate(items) if i not in drop]
 

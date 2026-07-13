@@ -412,5 +412,72 @@ class TestConfirmCancelAfterQuantityEdit(PreviewEditPlannerQuantityWebhookTestCa
         self.assertTrue(any("Зміни скасовано." in t for t in self._sent_texts()))
 
 
+# Live bug: a stale Inventory Representation Guard warning ("Нове
+# надходження: 2 шт.") must never survive a quantity edit that changes the
+# outcome (here: "separate" -> "merge", since 400 г + 130 г are the same
+# mergeable unit) — see bot._refresh_inventory_representation_warnings.
+class TestStaleRepresentationWarningRefreshedAfterQuantityEdit(PreviewEditPlannerQuantityWebhookTestCase):
+    def _pending_with_stale_separate_warning(self):
+        data = _ser_gouda_inventory_preview()
+        item = data["add_inventory_items"][0]
+        item["_representation_outcome"] = "separate"
+        item["_representation_note"] = (
+            "⚠️ Сир Гауда вже є у запасах: 400 г.\n"
+            "Нове надходження: 2 шт.\n"
+            "Його буде збережено окремою позицією, без об'єднання."
+        )
+        return data
+
+    def _existing_cheese_row(self):
+        return [{
+            "id": 501, "name": "Сир Гауда", "canonical_name": "сир гауда",
+            "category": "Молочне та яйця",
+            "quantity_value": Decimal("400"), "quantity_unit": "г", "quantity_text": "400 г",
+        }]
+
+    def test_stale_2_pieces_warning_disappears_after_edit_to_grams(self):
+        chat_id = 996209
+        pending_global_household[chat_id] = self._pending_with_stale_separate_warning()
+        self.mock_call_gemini.return_value = (
+            '{"patches": ['
+            '{"operation": "rename_inventory_item", "target_id": "inv_1", "new_value": "Сир Гауда"},'
+            '{"operation": "update_inventory_quantity", "target_id": "inv_1", "new_quantity": "130", "new_unit": "г"}'
+            ']}'
+        )
+        with patch.object(bot, "get_inventory_items", return_value=self._existing_cheese_row()):
+            _call_webhook(_make_update(996209001, chat_id, "Сир Гауда, не 2, а 130 грамів."))
+
+        texts = self._sent_texts()
+        self.assertTrue(texts)
+        last_text = texts[-1]
+        self.assertNotIn("2 шт", last_text)
+        self.assertNotIn("Нове надходження", last_text)
+
+        item = pending_global_household[chat_id]["add_inventory_items"][0]
+        self.assertEqual(item.get("_representation_outcome"), "merge")
+        self.assertNotIn("2 шт", item["_representation_note"])
+        self.assertIn("130 г", item["_representation_note"])
+
+    def test_confirm_after_stale_warning_refresh_writes_130g_not_2_pieces(self):
+        chat_id = 996210
+        pending_global_household[chat_id] = self._pending_with_stale_separate_warning()
+        self.mock_call_gemini.return_value = (
+            '{"patches": [{"operation": "update_inventory_quantity", "target_id": "inv_1", '
+            '"new_quantity": "130", "new_unit": "г"}]}'
+        )
+        with patch.object(bot, "get_inventory_items", return_value=self._existing_cheese_row()):
+            _call_webhook(_make_update(996210001, chat_id, "не 2, а 130 грамів."))
+            with patch.object(bot, "apply_global_household_operations") as mock_apply:
+                mock_apply.return_value = {
+                    "shopping_added": 0, "inventory_added": 1, "inventory_updated": 0,
+                    "inventory_removed": 0, "expense_added_id": None, "expense_deleted": False,
+                }
+                _call_webhook(_make_update(996210002, chat_id, "✅ Так, застосувати"))
+        mock_apply.assert_called_once()
+        _, kwargs = mock_apply.call_args
+        self.assertEqual(kwargs["add_inventory_items"][0]["quantity_value"], Decimal("130"))
+        self.assertEqual(kwargs["add_inventory_items"][0]["quantity_unit"], "г")
+
+
 if __name__ == "__main__":
     unittest.main()
