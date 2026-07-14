@@ -34,6 +34,7 @@ SDK — canonicalize_name/capitalize_first are injected callables (bot.py's
 own product-name synonym table lives in bot.py and must stay there, same
 reasoning as quantities.py's own module docstring).
 """
+import json
 import re
 from decimal import Decimal
 
@@ -249,6 +250,275 @@ def apply_inventory_transform_patch(pending_data, patch, canonicalize_name, capi
     pending_data["target_name"] = new_name
     pending_data["target_canonical_name"] = new_canonical_name
     return True, None
+
+
+# =========================
+# PREVIEW EDIT PLANNER V2 — Gemini-assisted fallback for editing an ACTIVE
+# pending_inventory_transform preview, tried ONLY after parse_inventory_
+# transform_edit (the deterministic Preview Edit V1 parser above) has
+# already returned None for the SAME text (see bot.py's _handle_inventory_
+# transform_edit_text, the only caller). Deterministic parsing stays the
+# free, zero-Gemini fast path for every already-supported phrasing — this
+# section exists for natural phrasing/paraphrases and Whisper transcription
+# slips ("Запаши" instead of "Запиши") V1's plain-regex parser was never
+# going to anticipate, without resorting to an ever-growing hard-coded
+# phrase list.
+#
+# NOT `action_planner.py` — that module recognizes NEW inventory
+# transform/merge/rename/delete requests and builds a NEW pending preview;
+# this section can only ever mutate the TARGET side (name/quantity) of the
+# SAME pending_inventory_transform dict already awaiting confirm/cancel. It
+# can never touch source_item_ids/the source snapshot, never confirms or
+# cancels the plan on the user's own behalf, never creates a new household
+# operation, and never writes to the database — every validated result is
+# converted (preview_edit_plan_to_patch) into the SAME patch shape
+# apply_inventory_transform_patch above already applies, so the actual
+# mutation logic is never duplicated.
+#
+# No import of bot.py, database.py, Flask, Telegram, psycopg or any Gemini
+# SDK — `call_gemini` is passed in directly as a plain function argument
+# (same explicit-injection style this module already uses for
+# canonicalize_name/capitalize_first above), not through a module-level
+# `_bot`/configure() indirection like household_router.py/action_planner.py
+# use — bot.py already has call_gemini in scope at the one call site.
+# =========================
+
+PREVIEW_EDIT_PLANNER_UNSUPPORTED_MSG = (
+    "Не зрозумів, що змінити в плані. Напиши, наприклад: «Назви результат М'ясо» або «Зроби 2 шт»."
+)
+
+_PREVIEW_EDIT_PLANNER_ALLOWED_ACTIONS = {
+    "set_target_name", "set_target_quantity", "set_target_name_and_quantity", "clarify", "unsupported",
+}
+_PREVIEW_EDIT_PLANNER_ALLOWED_ARGUMENT_KEYS = {
+    "set_target_name": {"target_name"},
+    "set_target_quantity": {"quantity"},
+    "set_target_name_and_quantity": {"target_name", "quantity"},
+    "clarify": set(),
+    "unsupported": set(),
+}
+_PREVIEW_EDIT_PLANNER_MAX_NAME_LENGTH = 200
+_PREVIEW_EDIT_PLANNER_MAX_CLARIFICATION_LENGTH = 500
+_PREVIEW_EDIT_PLANNER_MAX_TEXT_LENGTH = 300
+
+_PREVIEW_EDIT_PLANNER_FALLBACK = {
+    "version": 1, "action": "unsupported", "target_name": None, "quantity_text": None,
+    "clarification_question": None,
+}
+
+PREVIEW_EDIT_PLANNER_V2_PROMPT = (
+    "Ти допомагаєш редагувати вже готовий план об'єднання кількох позицій запасів в ОДНУ нову позицію "
+    "(Inventory Transform). Вихідні позиції (source items), які буде прибрано із запасів, уже зафіксовані "
+    "й у цьому режимі редагування ЗМІНЮВАТИ ЇХ НЕ МОЖНА. Користувач зараз хоче відредагувати лише "
+    "РЕЗУЛЬТАТ цього плану: назву нової позиції, її кількість, або обидва значення разом.\n\n"
+    "Дозволені дії (action) — рівно одна з:\n"
+    "- \"set_target_name\" — змінити лише назву результату.\n"
+    "- \"set_target_quantity\" — змінити лише кількість результату.\n"
+    "- \"set_target_name_and_quantity\" — змінити і назву, і кількість одночасно.\n"
+    "- \"clarify\" — незрозуміло, що саме міняти (назву, кількість чи обидва) — постав ОДНЕ коротке "
+    "уточнювальне запитання українською в clarification_question.\n"
+    "- \"unsupported\" — повідомлення НЕ є редагуванням цього плану (нова побутова дія, звичайна розмова, "
+    "спроба підтвердити чи скасувати план текстом) — ти НІКОЛИ сам не підтверджуєш і не скасовуєш план, і "
+    "НІКОЛИ не створюєш нову побутову дію чи операцію із запасами.\n\n"
+    "Для set_target_name/set_target_name_and_quantity заповни arguments.target_name — сама назва без "
+    "слів про кількість.\n"
+    "Для set_target_quantity/set_target_name_and_quantity заповни arguments.quantity — об'єкт "
+    "{\"value\": число як рядок, \"unit\": одиниця РІВНО так, як у тексті (напр. \"шт\", \"г\", \"л\")} — "
+    "Python сам перевірить і нормалізує одиницю, ти не обчислюєш нічого сам.\n"
+    "Текст може містити помилки розпізнавання голосу (Whisper) — якщо слово, схоже на команду редагування, "
+    "написане з помилкою (наприклад «Запаши» замість «Запиши»), все одно розпізнай найправдоподібніший "
+    "намір, а не відповідай unsupported лише через помилку розпізнавання.\n\n"
+    "Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON:\n"
+    "{\"version\": 1, \"action\": \"set_target_name_and_quantity\", \"arguments\": {\"target_name\": "
+    "\"М'ясо\", \"quantity\": {\"value\": \"2\", \"unit\": \"шт\"}}, \"clarification_question\": null}\n\n"
+    "Приклади:\n"
+    "\"Запиши просто як м'ясо 2 штуки\" -> {\"version\": 1, \"action\": \"set_target_name_and_quantity\", "
+    "\"arguments\": {\"target_name\": \"М'ясо\", \"quantity\": {\"value\": \"2\", \"unit\": \"шт\"}}, "
+    "\"clarification_question\": null}\n"
+    "\"Запаши просто як м'ясо 2 штуки.\" (ймовірна помилка Whisper замість «Запиши») -> {\"version\": 1, "
+    "\"action\": \"set_target_name_and_quantity\", \"arguments\": {\"target_name\": \"М'ясо\", \"quantity\": "
+    "{\"value\": \"2\", \"unit\": \"шт\"}}, \"clarification_question\": null}\n"
+    "\"Назви результат м'ясні продукти\" -> {\"version\": 1, \"action\": \"set_target_name\", \"arguments\": "
+    "{\"target_name\": \"М'ясні продукти\"}, \"clarification_question\": null}\n"
+    "\"Зроби 4 штуки\" -> {\"version\": 1, \"action\": \"set_target_quantity\", \"arguments\": "
+    "{\"quantity\": {\"value\": \"4\", \"unit\": \"шт\"}}, \"clarification_question\": null}\n"
+    "\"Нехай буде м'ясо\" -> {\"version\": 1, \"action\": \"set_target_name\", \"arguments\": "
+    "{\"target_name\": \"М'ясо\"}, \"clarification_question\": null}\n"
+    "\"М'ясо, 2 шт\" -> {\"version\": 1, \"action\": \"set_target_name_and_quantity\", \"arguments\": "
+    "{\"target_name\": \"М'ясо\", \"quantity\": {\"value\": \"2\", \"unit\": \"шт\"}}, "
+    "\"clarification_question\": null}\n"
+    "\"Додай молоко до покупок\" -> {\"version\": 1, \"action\": \"unsupported\", \"arguments\": {}, "
+    "\"clarification_question\": null}"
+)
+
+
+def _extract_preview_edit_json(raw):
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        m = re.search(r"```(?:json)?\s*\n?([\s\S]*?)\n?```", cleaned)
+        if m:
+            cleaned = m.group(1).strip()
+    return json.loads(cleaned)
+
+
+def _clean_preview_edit_target_name(value):
+    if not isinstance(value, str):
+        return None
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    if not cleaned or len(cleaned) > _PREVIEW_EDIT_PLANNER_MAX_NAME_LENGTH:
+        return None
+    return cleaned
+
+
+def _validate_preview_edit_quantity_argument(raw_quantity):
+    """Returns a canonical "<value> <unit>" quantity string — safe to hand
+    straight to apply_inventory_transform_patch's own set_target_quantity/
+    set_target path, which re-parses it via quantities.parse_structured_
+    quantity itself, the SAME reused normalization every other quantity
+    edit in this module already goes through — or None if unsafe/
+    unparseable. Never trusts Gemini's own claimed unit: the combined
+    "value unit" string is re-validated here via that exact parser, and a
+    non-positive value is rejected even though parse_structured_quantity
+    itself doesn't reject a sign (this module's own responsibility, not a
+    global change to quantities.py)."""
+    if not isinstance(raw_quantity, dict):
+        return None
+    if set(raw_quantity.keys()) - {"value", "unit"}:
+        return None
+    raw_value = raw_quantity.get("value")
+    raw_unit = raw_quantity.get("unit")
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return None
+    if not isinstance(raw_unit, str) or not raw_unit.strip():
+        return None
+    value, unit = parse_structured_quantity(f"{raw_value.strip()} {raw_unit.strip()}")
+    if value is None or value <= 0:
+        return None
+    return format_quantity_display(value, unit)
+
+
+def _validate_preview_edit_plan(data):
+    """Full Preview Edit Planner V2 JSON-schema validation. Returns a
+    normalized plan dict (version/action/target_name/quantity_text/
+    clarification_question) or None if anything is unsafe/malformed; the
+    caller (classify_inventory_transform_preview_edit) collapses None to
+    _PREVIEW_EDIT_PLANNER_FALLBACK, exactly like every other failure mode —
+    invalid JSON, an unrecognized action, a wrong version, a disallowed
+    extra argument key (a DB id, SQL, code, an executor/function name, ...),
+    a non-positive/unparseable quantity, or a missing/blank clarification
+    question for "clarify" are all rejected the same way, never partially
+    trusted."""
+    if not isinstance(data, dict):
+        return None
+    if data.get("version") != 1:
+        return None
+    action = data.get("action")
+    if action not in _PREVIEW_EDIT_PLANNER_ALLOWED_ACTIONS:
+        return None
+
+    raw_arguments = data.get("arguments")
+    if raw_arguments is None:
+        raw_arguments = {}
+    if not isinstance(raw_arguments, dict):
+        return None
+    if set(raw_arguments.keys()) - _PREVIEW_EDIT_PLANNER_ALLOWED_ARGUMENT_KEYS[action]:
+        return None
+
+    target_name = None
+    quantity_text = None
+    if action in ("set_target_name", "set_target_name_and_quantity"):
+        target_name = _clean_preview_edit_target_name(raw_arguments.get("target_name"))
+        if target_name is None:
+            return None
+    if action in ("set_target_quantity", "set_target_name_and_quantity"):
+        quantity_text = _validate_preview_edit_quantity_argument(raw_arguments.get("quantity"))
+        if quantity_text is None:
+            return None
+
+    clarification_question = None
+    if action == "clarify":
+        raw_question = data.get("clarification_question")
+        if not isinstance(raw_question, str) or not raw_question.strip():
+            return None
+        clarification_question = re.sub(
+            r"\s+", " ", raw_question,
+        ).strip()[:_PREVIEW_EDIT_PLANNER_MAX_CLARIFICATION_LENGTH]
+
+    return {
+        "version": 1, "action": action, "target_name": target_name, "quantity_text": quantity_text,
+        "clarification_question": clarification_question,
+    }
+
+
+def looks_like_transform_preview_edit_attempt(text):
+    """Cheap, deterministic pre-gate for whether `text` is worth ONE real
+    classify_inventory_transform_preview_edit() Gemini call at all — never
+    calls Gemini itself. Deliberately permissive: an active pending_
+    inventory_transform preview already claims ANY non-confirm/cancel text
+    per message_dispatcher's own routing contract (see this module's own
+    "PREVIEW EDIT V1"/"PREVIEW EDIT PLANNER V2" section docstrings) — there
+    is no OTHER route a false positive here could have gone to instead, so
+    this only guards against burning a real Gemini call on text implausible
+    for a short preview-edit instruction at all: blank, or a pasted
+    paragraph far longer than any of the supported edit shapes."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return len(stripped) <= _PREVIEW_EDIT_PLANNER_MAX_TEXT_LENGTH
+
+
+def classify_inventory_transform_preview_edit(text, call_gemini):
+    """Public entrypoint. ONE Gemini call, structured-edit-only — never asked
+    to (and never allowed to) confirm/cancel the plan or create a new
+    household action. `call_gemini` is the caller's own call_gemini(history,
+    system_prompt, temperature=...) callable, injected directly (see this
+    section's own module docstring for why).
+
+    Returns a validated plan dict — see _validate_preview_edit_plan for its
+    exact shape. Never raises: any failure at any step (no API key, network
+    error, timeout, empty response, malformed JSON, wrong top-level shape,
+    an invalid/unsafe plan) collapses to the same safe
+    _PREVIEW_EDIT_PLANNER_FALLBACK dict (action "unsupported") — never
+    guessed, never partially trusted. Never calls Gemini for blank/non-
+    string input."""
+    if not isinstance(text, str) or not text.strip():
+        return dict(_PREVIEW_EDIT_PLANNER_FALLBACK)
+    raw = call_gemini([{"role": "user", "content": text}], PREVIEW_EDIT_PLANNER_V2_PROMPT, temperature=0.0)
+    if not raw:
+        return dict(_PREVIEW_EDIT_PLANNER_FALLBACK)
+    try:
+        data = _extract_preview_edit_json(raw)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return dict(_PREVIEW_EDIT_PLANNER_FALLBACK)
+    plan = _validate_preview_edit_plan(data)
+    if plan is None:
+        return dict(_PREVIEW_EDIT_PLANNER_FALLBACK)
+    return plan
+
+
+def preview_edit_plan_to_patch(plan):
+    """Convert a validated Preview Edit Planner V2 plan (see
+    classify_inventory_transform_preview_edit) into the SAME patch shape
+    apply_inventory_transform_patch (Preview Edit V1, above) already
+    applies — no duplicated mutation logic; the actual pending-dict write
+    stays owned by that one function. Returns None for "clarify" and
+    "unsupported" — the caller must handle "clarify" by sending
+    plan["clarification_question"] as-is (never turned into a patch, never
+    mutates the pending preview) and "unsupported" as a controlled failure
+    (PREVIEW_EDIT_PLANNER_UNSUPPORTED_MSG) BEFORE ever calling this
+    function with those two actions in practice — this still returns None
+    defensively either way, so a caller that skips that check never mutates
+    the pending preview from an unresolved plan."""
+    action = plan["action"]
+    if action == "set_target_name":
+        return {"action": "set_target_name", "name": plan["target_name"]}
+    if action == "set_target_quantity":
+        return {"action": "set_target_quantity", "quantity": plan["quantity_text"]}
+    if action == "set_target_name_and_quantity":
+        return {"action": "set_target", "name": plan["target_name"], "quantity": plan["quantity_text"]}
+    return None
 
 
 # =========================

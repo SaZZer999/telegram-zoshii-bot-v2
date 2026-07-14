@@ -426,40 +426,52 @@ class TestPreviewEditV1(InventoryTransformWebhookTestCase):
         self.assertEqual(updated["target_quantity_unit"], "мл")
         self.assertEqual(updated["target_quantity_text"], "500 мл")
 
-    # 6. Unparseable edit text — controlled message, pending preview
-    # unchanged, never falls through to general AI.
+    # 6. Unparseable edit text — deterministic parser declines, Preview Edit
+    # Planner V2's Gemini fallback also declines (mocked "unsupported") —
+    # controlled message, pending preview unchanged, never falls through to
+    # general AI. See tests/test_preview_edit_planner_v2_transform.py for
+    # the Preview Edit Planner V2 module/routing tests themselves.
     def test_unparseable_edit_text_leaves_preview_unchanged(self):
         chat_id = 772106
         entry = self._seed(chat_id)
         original = dict(entry)
-        with patch.object(bot, "call_gemini") as mock_gemini:
+        unsupported_json = '{"version": 1, "action": "unsupported", "arguments": {}, "clarification_question": null}'
+        with patch.object(bot, "call_gemini", return_value=unsupported_json) as mock_gemini:
             _call_webhook(_make_update(772106001, chat_id, "хм, не знаю, подумай сам"))
-        mock_gemini.assert_not_called()
+        mock_gemini.assert_called_once()
         self.assertEqual(pending_inventory_transform[chat_id], original)
-        self.assertTrue(any(preview_editing.UNPARSEABLE_EDIT_MSG == t for t in self._sent_texts()))
+        self.assertTrue(any(preview_editing.PREVIEW_EDIT_PLANNER_UNSUPPORTED_MSG == t for t in self._sent_texts()))
 
     # 7. "Видали все" during an active transform preview is blocked by the
-    # preview — never opens the destructive guard.
+    # preview — never opens the destructive guard, even though Preview Edit
+    # Planner V2's Gemini fallback is now tried (and correctly declines,
+    # mocked "unsupported" here — see the module's own examples).
     def test_destructive_command_blocked_by_active_preview(self):
         chat_id = 772107
         self._seed(chat_id)
-        with patch.object(bot, "call_gemini") as mock_gemini:
+        unsupported_json = '{"version": 1, "action": "unsupported", "arguments": {}, "clarification_question": null}'
+        with patch.object(bot, "call_gemini", return_value=unsupported_json) as mock_gemini:
             _call_webhook(_make_update(772107001, chat_id, "Видали все"))
-        mock_gemini.assert_not_called()
+        mock_gemini.assert_called_once()
         self.assertNotIn(chat_id, pending_destructive_guard)
         self.assertIn(chat_id, pending_inventory_transform)
-        self.assertTrue(any(preview_editing.UNPARSEABLE_EDIT_MSG == t for t in self._sent_texts()))
+        self.assertTrue(any(preview_editing.PREVIEW_EDIT_PLANNER_UNSUPPORTED_MSG == t for t in self._sent_texts()))
 
     # 8. Another action command ("перейменуй ser на сир") during an active
-    # transform preview is blocked, no new cleanup-admin preview starts.
+    # transform preview is blocked, no new cleanup-admin preview starts —
+    # Preview Edit Planner V2's Gemini fallback declines it too (mocked
+    # "unsupported": it names a DIFFERENT product, not this plan's target).
     def test_other_action_command_blocked_by_active_preview(self):
         chat_id = 772108
         self._seed(chat_id)
-        _call_webhook(_make_update(772108001, chat_id, "перейменуй ser на сир"))
+        unsupported_json = '{"version": 1, "action": "unsupported", "arguments": {}, "clarification_question": null}'
+        with patch.object(bot, "call_gemini", return_value=unsupported_json) as mock_gemini:
+            _call_webhook(_make_update(772108001, chat_id, "перейменуй ser на сир"))
+        mock_gemini.assert_called_once()
         self.assertNotIn(chat_id, pending_cleanup_admin)
         self.assertNotIn(chat_id, pending_cleanup_admin_disambiguation)
         self.assertIn(chat_id, pending_inventory_transform)
-        self.assertTrue(any(preview_editing.UNPARSEABLE_EDIT_MSG == t for t in self._sent_texts()))
+        self.assertTrue(any(preview_editing.PREVIEW_EDIT_PLANNER_UNSUPPORTED_MSG == t for t in self._sent_texts()))
 
 
 class TestPreviewEditV1ConfirmCancelUndo(InventoryTransformWebhookTestCase):

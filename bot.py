@@ -3501,14 +3501,31 @@ def _apply_inventory_transform_confirm(chat_id):
 
 
 # =========================
-# PREVIEW EDIT V1 — safe text edits to an ACTIVE pending_inventory_transform
-# preview (see preview_editing.py's own module docstring for the parser/
-# patch catalog). Called from message_dispatcher.py's pending-routes slice
-# (Dispatcher V2A) BEFORE any command/context route, general AI fallback or
-# destructive guard is ever reached for a chat with an active preview — see
-# message_dispatcher._dispatch_pending_routes. Only mutates the SAME
-# pending_inventory_transform[chat_id] dict in place; never touches the
-# database, never pops it (confirm/cancel still own that, unchanged).
+# PREVIEW EDIT V1 + PREVIEW EDIT PLANNER V2 — safe text/voice edits to an
+# ACTIVE pending_inventory_transform preview (see preview_editing.py's own
+# module docstrings for the deterministic parser/patch catalog and the
+# Gemini-assisted fallback). Called from message_dispatcher.py's pending-
+# routes slice (Dispatcher V2A) BEFORE any command/context route (including
+# action_planner.py/mini_action_planner.py/the Global Household Router/
+# saved_list_router), general AI fallback or destructive guard is ever
+# reached for a chat with an active preview — see message_dispatcher.
+# _dispatch_pending_routes. Only mutates the SAME pending_inventory_
+# transform[chat_id] dict in place; never touches the database, never pops
+# it (confirm/cancel still own that, unchanged).
+#
+# Fast path first, always: parse_inventory_transform_edit (deterministic,
+# zero Gemini calls) gets the first look at every message. Only when it
+# returns None (text doesn't match any of V1's known shapes) does this
+# function try the Gemini-assisted Preview Edit Planner V2 fallback — ONE
+# call, only if looks_like_transform_preview_edit_attempt's own cheap
+# pre-gate agrees the text is plausibly a short edit instruction at all
+# (never burned on a pasted paragraph or blank text). A "clarify" result is
+# sent as-is, never turned into a patch; any other unresolved result
+# (Gemini genuinely said "unsupported", or classify_inventory_transform_
+# preview_edit itself already collapsed a timeout/invalid-JSON/unknown-
+# action failure to that same value) gets the specific PREVIEW_EDIT_
+# PLANNER_UNSUPPORTED_MSG — never the generic "unfinished plan" message,
+# since by this point the user has already demonstrably tried to edit it.
 # =========================
 def _handle_inventory_transform_edit_text(chat_id, text):
     data = pending_inventory_transform.get(chat_id)
@@ -3516,8 +3533,17 @@ def _handle_inventory_transform_edit_text(chat_id, text):
         return
     patch = preview_editing.parse_inventory_transform_edit(text)
     if patch is None:
-        send_message(chat_id, preview_editing.UNPARSEABLE_EDIT_MSG)
-        return
+        if not preview_editing.looks_like_transform_preview_edit_attempt(text):
+            send_message(chat_id, preview_editing.UNPARSEABLE_EDIT_MSG)
+            return
+        plan = preview_editing.classify_inventory_transform_preview_edit(text, call_gemini)
+        if plan["action"] == "clarify":
+            send_message(chat_id, plan["clarification_question"])
+            return
+        patch = preview_editing.preview_edit_plan_to_patch(plan)
+        if patch is None:
+            send_message(chat_id, preview_editing.PREVIEW_EDIT_PLANNER_UNSUPPORTED_MSG)
+            return
     ok, error = preview_editing.apply_inventory_transform_patch(
         data, patch, canonicalize_name, inventory.capitalize_first,
     )
