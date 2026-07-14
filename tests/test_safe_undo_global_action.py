@@ -616,6 +616,19 @@ class TestExpenseKeyboardOwnedByExpensesModule(unittest.TestCase):
             # would otherwise leave _bot/MAIN_KEYBOARD unset for the rest of
             # the suite.
             reloaded.configure(bot, bot.active_list_context, bot.MAIN_KEYBOARD)
+            # reload() also rebinds expenses.pending_expense/pending_expense_
+            # delete/expense_delete_selection to brand-new dict objects —
+            # bot.py took its own pending_expense/pending_expense_delete/
+            # expense_delete_selection names as a one-time identity alias to
+            # the ORIGINAL objects at import time (bot.py:266-268), so
+            # without also re-pointing those three bot.py names at the
+            # reloaded module's new dicts, any later test in this same
+            # process that writes through expenses.py's internal code (e.g.
+            # a real expense-delete webhook flow) would write into a dict
+            # bot.pending_expense_delete no longer references at all.
+            bot.pending_expense = reloaded.pending_expense
+            bot.pending_expense_delete = reloaded.pending_expense_delete
+            bot.expense_delete_selection = reloaded.expense_delete_selection
 
 
 class TestUndoButtonFromSubmenuTriggersSameFlow(unittest.TestCase):

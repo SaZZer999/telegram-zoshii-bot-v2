@@ -19,6 +19,7 @@
 * `household_router.py` — Global Household Router v1 (змішані побутові команди одним Gemini-викликом).
 * `mini_action_planner.py` — Unified Mini Action Planner V1: окремий, вузький last-resort Gemini-класифікатор (`add_to_shopping`/`add_to_inventory`/`ask_inventory`/`meal_ideas`/`unknown`), спрацьовує останнім у Phase D перед загальним AI-чатом. **Не змінювався** цією задачею.
 * `action_planner.py` — Inventory Action Planner V1 (деталі нижче) — окремий від `mini_action_planner.py` модуль, інша дія, інше місце в routing.
+* `shopping_action_planner.py` — Shopping Action Planner V1 (деталі нижче) — окремий від `action_planner.py`/`mini_action_planner.py` модуль, лише `shopping_delete`/`shopping_mark_bought`, спрацьовує поза shopping mode/saved-list context.
 * `preview_editing.py` — деталі нижче ("Preview Edit").
 * `quantities.py` — парсинг/форматування структурованих кількостей (одна спільна реалізація для `bot.py`/`database.py`).
 * `voice_input.py` — голосовий ввід (Groq Whisper).
@@ -102,6 +103,18 @@
 * Позиція `expense_delete_command_route` у `message_dispatcher.py`/`bot.py` не змінена — жодного routing-рефакторингу.
 * **Знахідка (не регресія цієї задачі):** `database.delete_expense` не пише в `household_action_journal`, тому видалення витрати через цей flow (`🗑️ Видалити витрату` / глобальна команда) сьогодні **не підтримує** «↩️ Скасувати останню дію» — на відміну від `execute_inventory_delete`/`execute_inventory_transform`. Це попередньо існуючий стан, не змінений і не введений цією задачею.
 * **Не підтверджено наживо в Telegram** — перед оголошенням live-milestone потрібна ручна перевірка нових формулювань з реальними витратами.
+
+## Shopping Action Planner V1 — не перевірено наживо (2026-07-14)
+
+* Новий окремий модуль **`shopping_action_planner.py`** — global natural-language routing для видалення позиції зі списку покупок (`shopping_delete`) і позначення купленою (`shopping_mark_bought`), коли НЕ активні ні `shopping_mode`, ні збережений shopping-list context. **Це не `action_planner.py`** (Inventory Action Planner V1 — інша дія, інший домен) і **не** `mini_action_planner.py` — окремий модуль, окремий dispatcher-слот, власні тести.
+* Action allowlist (V1): `shopping_delete`, `shopping_mark_bought`, `clarify`, `unsupported`. Свідомо НЕ включає shopping add/edit-quantity/clear-all, inventory- чи expense-дії, navigation, general chat — ці вже мають власні робочі маршрути.
+* Pre-gate `looks_like_global_shopping_admin` — compositional, без hard-coded речень: (дієслово видалення `викресли`/`прибери`/`видали`/`забери` + посилання на список `спис...`) АБО (уже/вже + купи.../взял.../взяв) АБО (не треба/не потрібно + купува...). Кожна гілка вимагає ОБИДВІ частини — саме тому «Прибери молоко із запасів» (inventory), «Купив молоко за 10 zł» (нова покупка) і «Видали витрату за молоко» (expense) не проходять.
+* Позиція в routing: **після** `global_expense_command`, **перед** трьома детермінованими inventory-гейтами й Inventory Action Planner V1. Явно **не спрацьовує**, коли `saved_list_context == "shopping_saved"` активний — у цьому випадку пріоритет лишається за вже існуючим `saved_list_router` (його власний, багатший Gemini-намір з підтримкою «купив»/«купили» в минулому часі, «все крім X» тощо) — новий planner існує лише для випадків ПОЗА mode/context, як і вимагала задача.
+* Candidate resolution — Python, без другого Gemini-виклику: `resolve_shopping_candidates` повторно використовує `preview_editing._name_token_matches` (той самий declension-tolerant matcher, що вже застосовується для редагування `pending_global_household` add-прев'ю), звіряючи `item_name` з живим `get_active_shopping_items()`. 0 збігів → контрольоване повідомлення (не знайдено); 2+ збіги → нумерований список і прохання уточнити (без вгадування, без окремого нового pending-стану — наступне повідомлення просто повторно заходить у той самий planner).
+* Existing executors повторно використані без змін: `legacy_shopping_flow._show_delete_preview`/`_show_mark_preview` → `pending_delete_batch`/`pending_mark_batch` → confirm-кнопки (`✅ Так, видалити` / `✅ Куплено + додати в запаси` / `✅ Куплено, без запасів`) → `database.delete_items_batch`/`mark_items_batch`, той самий stale-snapshot захист (`_verify_targets_in_tx`), той самий `✏️ Змінити вибір` fallback у mode.
+* **Знахідка (не регресія цієї задачі):** `database.mark_items_batch`/`delete_items_batch` не пишуть у `household_action_journal` — так само, як і `database.delete_expense` (див. вище), цей legacy batch-шлях сьогодні не підтримує «↩️ Скасувати останню дію», для жодного з викликів (ні через mode-based flow, ні через новий global route). Попередньо існуючий стан, не введений цією задачею.
+* Побічний фікс: під час підготовки тестів виявлено й виправлено попередній test-isolation gap у `tests/test_safe_undo_global_action.py` — `importlib.reload(expenses)` перепризначав `pending_expense`/`pending_expense_delete`/`expense_delete_selection` на нові об'єкти словників, а відновлювався лише `_bot`/`active_list_context`/`MAIN_KEYBOARD`; тепер відновлюються й ці три dict-посилання на `bot.*`, як і решта.
+* **Не підтверджено наживо в Telegram** — перед оголошенням live-milestone потрібна ручна перевірка `shopping_delete`/`shopping_mark_bought` поза shopping mode/списком з реальними покупками.
 
 ## Безпека — важливо
 

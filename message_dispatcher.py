@@ -267,6 +267,21 @@ class CommandRouteDeps:
     global_alias_command: Callable
     active_expenses_context: Callable
     global_expense_command: Callable
+    # Shopping Action Planner V1 — optional (default None), same reasoning as
+    # every other Optional field below. A separate, narrow Gemini classifier
+    # (shopping_delete/shopping_mark_bought/clarify/unsupported) for GLOBAL
+    # natural-language shopping-list admin phrasing ("Викресли молоко зі
+    # списку", "Молоко вже купили") that works even when neither shopping_
+    # mode nor a saved shopping-list context is active. Checked right after
+    # global_expense_command and right BEFORE the three deterministic
+    # inventory gates and the Inventory Action Planner V1 — shopping-only,
+    # never touches inventory/expense domains, never a second Gemini call
+    # for the common add-shopping case (that already has its own earlier
+    # routes: ambiguous_add_route/explicit_global_add/bare_global_add/
+    # global_household_router). See shopping_action_planner.py's own module
+    # docstring for why this is a separate module from action_planner.py
+    # (Inventory Action Planner V1) and mini_action_planner.py.
+    shopping_action_planner_route: Callable = None
     # Inventory Cleanup / Merge v1 — optional (default None) so
     # DispatcherDeps/CommandRouteDeps built before this existed keep working
     # unchanged, same reasoning as every Optional field elsewhere in this
@@ -731,6 +746,21 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # Global expense command gate — fires from anywhere but never
         # overrides an active preview/confirm from ANY other flow, aliases
         # included (aliases has priority over a new expense command).
+        return RouteOutcome.HANDLED
+
+    if routes.shopping_action_planner_route is not None and routes.shopping_action_planner_route(chat_id, user_id, display_name, text):
+        # Shopping Action Planner V1 — one closed-vocabulary Gemini
+        # classifier (shopping_delete/shopping_mark_bought/clarify/
+        # unsupported) for GLOBAL shopping-list admin phrasing none of the
+        # existing shopping_mode/saved_list_router routes recognized because
+        # neither is currently active for this chat. Checked AFTER every
+        # add-shopping route and the expense routes above (so those keep
+        # winning unchanged, zero extra Gemini calls for the common case),
+        # and BEFORE the three deterministic inventory gates and the
+        # Inventory Action Planner V1 below — shopping-only, never competes
+        # with inventory/expense domains for the same message. NOT the same
+        # route/module as action_planner.py's own inventory-only planner
+        # (see shopping_action_planner.py's own module docstring).
         return RouteOutcome.HANDLED
 
     if routes.inventory_transform_route is not None and routes.inventory_transform_route(chat_id, user_id, display_name, text):

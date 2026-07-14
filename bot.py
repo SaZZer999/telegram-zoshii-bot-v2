@@ -97,6 +97,7 @@ import voice_transcript_normalizer
 import photo_receipts
 import mini_action_planner
 import action_planner
+import shopping_action_planner
 import preview_edit_planner
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
@@ -3476,6 +3477,115 @@ def _try_action_planner(chat_id, user_id, display_name, text):
     return True
 
 
+# =========================
+# SHOPPING ACTION PLANNER V1 — shopping_action_planner.py owns a single
+# closed-vocabulary Gemini classifier (shopping_delete/shopping_mark_bought/
+# clarify/unsupported) for GLOBAL natural-language shopping-list admin
+# phrasing ("Викресли молоко зі списку", "Молоко вже купили") that works
+# even when neither shopping_mode nor a saved shopping-list context is
+# active. NOT the same module/route as action_planner.py (Inventory Action
+# Planner V1) or mini_action_planner.py — see shopping_action_planner.py's
+# own module docstring for why these stay three separate modules with three
+# separate dispatcher slots. Every branch below dispatches to the SAME
+# legacy_shopping_flow._show_delete_preview/_show_mark_preview entry points
+# the shopping-mode "deleting"/"marking" flows already use — no new DB
+# write path, no new pending-state shape, no duplicated candidate-
+# resolution logic (reuses preview_editing._name_token_matches via
+# shopping_action_planner.resolve_shopping_candidates). Wired as message_
+# dispatcher.py's CommandRouteDeps.shopping_action_planner_route, checked
+# right after global_expense_command and right before the three
+# deterministic inventory gates.
+# =========================
+def _try_shopping_action_planner(chat_id, user_id, display_name, text):
+    """Returns True if the message was fully handled (a preview was
+    started, an ambiguous-candidates/clarification question was sent, or a
+    controlled "not found"/"not supported" message was sent) — the caller
+    must not fall through to the inventory gates/saved_list_router/general
+    AI-chat in that case. Returns False when the cheap pre-gate rejects the
+    message outright — routing continues exactly as before this planner
+    existed (never invokes Gemini in that case). Calls shopping_action_
+    planner.classify() at most once per message, and never writes to the
+    database directly — every action only ever builds a pending preview
+    through the SAME legacy_shopping_flow entry points shopping_mode
+    already uses."""
+    if not shopping_action_planner.looks_like_global_shopping_admin(text):
+        return False
+
+    if saved_list_context.get(chat_id) == "shopping_saved":
+        # A saved shopping-list context is already open — saved_list_router
+        # (its own richer, context-aware Gemini prompt: numbered-list
+        # selection, "все крім X", consume/reconciliation, ...) already
+        # correctly handles delete/mark-bought phrasing there today,
+        # including past-tense "купив"/"купили" as a mark-bought trigger.
+        # This global route exists ONLY for when neither shopping_mode nor
+        # a saved list context is active (see this module's own docstring)
+        # — deferring here instead of preempting it keeps 100% of that
+        # existing, richer behavior unchanged, and saved_list_router is
+        # still reached next (this function returning False here is exactly
+        # what lets message_dispatcher's _dispatch_command_routes try it).
+        return False
+
+    if _has_blocking_pending_state_for_reports(chat_id):
+        # Another flow's preview/clarification is already open — never
+        # silently start a second one: legacy_shopping_flow's own
+        # _show_delete_preview/_show_mark_preview have no such guard baked
+        # into themselves (shopping_mode's own callers never need it, since
+        # entering "deleting"/"marking" mode already implies no other
+        # preview was active), so this global route must check it
+        # explicitly, same as action_planner.py's own wrapper does for
+        # _start_inventory_cleanup. Same guard message every other route-
+        # starting function in this file already uses for the same
+        # situation.
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return True
+
+    plan = shopping_action_planner.classify(text)
+    action = plan["action"]
+    arguments = plan["arguments"]
+
+    if action == "clarify":
+        send_message(chat_id, plan["clarification_question"], reply_markup=SHOPPING_KEYBOARD)
+        return True
+
+    if action in ("shopping_delete", "shopping_mark_bought"):
+        try:
+            household_id, user_db_id = get_household_and_user(user_id, display_name)
+            items = get_active_shopping_items(household_id)
+        except Exception:
+            send_message(chat_id, DB_ERROR_MSG)
+            return True
+
+        candidates = shopping_action_planner.resolve_shopping_candidates(arguments["item_name"], items)
+        if not candidates:
+            send_message(chat_id, shopping_action_planner.NOT_FOUND_MSG, reply_markup=SHOPPING_KEYBOARD)
+            return True
+        if len(candidates) > 1:
+            # Never guess which of several matching items the user meant —
+            # no dedicated disambiguation pending-state, same posture as the
+            # "clarify" action above: the next message simply re-enters this
+            # same planner (or falls through unchanged if it no longer
+            # matches the pre-gate).
+            send_message(
+                chat_id, shopping_action_planner.format_shopping_admin_ambiguous_message(candidates),
+                reply_markup=SHOPPING_KEYBOARD,
+            )
+            return True
+
+        if action == "shopping_delete":
+            legacy_shopping_flow._show_delete_preview(_shopping_deps, chat_id, candidates, household_id, user_db_id)
+        else:
+            legacy_shopping_flow._show_mark_preview(_shopping_deps, chat_id, candidates, household_id, user_db_id)
+        return True
+
+    # action == "unsupported" — either Gemini genuinely classified it that
+    # way, or classify() itself already collapsed a timeout/invalid-JSON/
+    # unknown-action/missing-field failure to this same value. Either way: a
+    # single controlled message, never general AI-chat, never a guess, never
+    # a DB write.
+    send_message(chat_id, shopping_action_planner.UNSUPPORTED_MSG, reply_markup=SHOPPING_KEYBOARD)
+    return True
+
+
 def _apply_inventory_transform_confirm(chat_id):
     """"✅ Так, застосувати" button for a pending_inventory_transform preview.
     Pops the pending action BEFORE the database call, same duplicate-press
@@ -6084,6 +6194,7 @@ _command_route_deps = message_dispatcher.CommandRouteDeps(
     global_alias_command=lambda *a, **kw: _route_global_alias_command(*a, **kw),
     active_expenses_context=lambda *a, **kw: _route_active_expenses_context(*a, **kw),
     global_expense_command=lambda *a, **kw: _route_global_expense_command(*a, **kw),
+    shopping_action_planner_route=lambda *a, **kw: _try_shopping_action_planner(*a, **kw),
     inventory_cleanup_route=lambda *a, **kw: _route_inventory_cleanup(*a, **kw),
     inventory_admin_route=lambda *a, **kw: _route_inventory_admin(*a, **kw),
     inventory_transform_route=lambda *a, **kw: _route_inventory_transform(*a, **kw),
@@ -6851,6 +6962,13 @@ mini_action_planner.configure(sys.modules[__name__])
 # from mini_action_planner.py above — see action_planner.py's own docstring
 # for why these stay two independent planners.
 action_planner.configure(sys.modules[__name__])
+
+# Wire shopping_action_planner.py's dependency (only call_gemini) the same
+# way — it never imports bot.py either (see its module docstring). A
+# separate module from both action_planner.py (inventory-only) and mini_
+# action_planner.py above — see shopping_action_planner.py's own docstring
+# for why these stay three independent planners.
+shopping_action_planner.configure(sys.modules[__name__])
 
 # Wire voice_transcript_normalizer.py's dependency (only call_gemini) the
 # same way — it never imports bot.py either (see its module docstring).
