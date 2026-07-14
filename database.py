@@ -696,10 +696,30 @@ def delete_household_aliases_batch(household_id, targets):
 
 def add_expense(household_id, user_db_id, amount, currency, category, description, expense_date):
     """Insert one expense row for a household — a single DB operation, called
-    exactly once per confirmed preview. `amount` must already be a validated
-    Decimal > 0 and `category` already validated against the fixed category
-    list; this function trusts its caller (bot.py) for those business rules
-    and only performs the parameterized SQL insert. Never touches
+    exactly once per confirmed STANDALONE expense-add preview (the dedicated
+    expenses submenu / global "Запиши ... zł" command — see expenses.py's
+    handle_add_confirm, the only production caller of this function; every
+    OTHER expense-add path — Global Household Router compound previews,
+    photo receipts — goes through apply_global_household_operations
+    instead, which already records its own journal row, so this function
+    never risks a duplicate).
+
+    Also records an Action History journal row for it in the SAME
+    transaction (Action History + Safe Undo v1) — same 'global_household'
+    operation_type and before/post-snapshot shape
+    apply_global_household_operations already uses for its own add_expense
+    op (empty inventory/shopping buckets, one expense_adds entry), so
+    get_latest_undoable_action/apply_undo_action/format_undo_preview all
+    handle a standalone expense add identically without any change to that
+    already-generic machinery. This is what fixes the live bug where
+    confirming a standalone expense left the PREVIOUS (inventory) journal
+    row as still "latest", since nothing new was ever journaled for the
+    expense itself.
+
+    `amount` must already be a validated Decimal > 0 and `category` already
+    validated against the fixed category list; this function trusts its
+    caller (bot.py/expenses.py) for those business rules and only performs
+    the parameterized SQL insert + journal write. Never touches
     shopping_items/inventory_items. Returns the new row id.
     """
     with get_connection() as conn:
@@ -713,9 +733,44 @@ def add_expense(household_id, user_db_id, amount, currency, category, descriptio
                 """,
                 (household_id, amount, currency, category, description or None, expense_date, user_db_id)
             )
-            row = cur.fetchone()
+            expense_id = cur.fetchone()[0]
+
+            expense_added = {
+                "id": expense_id, "household_id": household_id, "amount": str(amount),
+                "currency": currency, "category": category, "description": description or None,
+                "expense_date": expense_date.isoformat(), "created_by_user_id": user_db_id,
+            }
+            before_snapshot = {"inventory_buckets": {}, "shopping_buckets": {}, "expense_delete": None}
+            post_action_snapshot = {
+                "inventory_buckets": {}, "shopping_buckets": {}, "expense_adds": [expense_added],
+            }
+            forward_payload = action_history.json_safe({
+                "add_shopping_items": [], "add_inventory_items": [], "consume_updates": [],
+                "consume_delete_ids": [],
+                "new_expenses": [{
+                    "amount": str(amount), "currency": currency, "category": category,
+                    "description": description or None, "expense_date": expense_date.isoformat(),
+                }],
+                "delete_expense_id": None,
+            })
+            inverse_payload = {
+                "restore_inventory_canonical_names": [], "restore_shopping_canonical_names": [],
+                "delete_expense_ids": [expense_id], "restore_expense": None,
+            }
+            summary = action_history.build_operation_summary(before_snapshot, post_action_snapshot)
+
+            cur.execute(
+                """
+                INSERT INTO household_action_journal
+                    (household_id, actor_user_id, operation_type, forward_payload, inverse_payload,
+                     before_snapshot, post_action_snapshot, summary, status, created_at)
+                VALUES (%s, %s, 'global_household', %s, %s, %s, %s, %s, 'active', NOW())
+                """,
+                (household_id, user_db_id, Jsonb(forward_payload), Jsonb(inverse_payload),
+                 Jsonb(before_snapshot), Jsonb(post_action_snapshot), Jsonb(summary))
+            )
         conn.commit()
-    return row[0]
+    return expense_id
 
 
 def get_recent_expenses(household_id, limit=10):

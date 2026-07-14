@@ -135,21 +135,19 @@ class TestJournalNotWrittenOnFailure(unittest.TestCase):
 
 
 class TestJournalNotWrittenForLegacyFlows(unittest.TestCase):
-    """#4: legacy shopping/inventory/expense entry points never touch
-    household_action_journal — only apply_global_household_operations does."""
+    """#4: legacy shopping/expense entry points that remain unfixed in this
+    task (shopping batch add, expense delete — expense delete is explicitly
+    out of scope for the standalone-expense-add undo fix) still never touch
+    household_action_journal. add_expense is NOT one of these anymore — see
+    TestJournalWrittenForStandaloneExpenseAdd below, which fixes the live
+    bug where confirming a standalone expense left an older journal row as
+    still "latest" because nothing new was ever journaled for it."""
 
     def test_add_shopping_items_batch_writes_no_journal(self):
         cursor = FakeCursor(fetchall_results=[[]])
         conn = FakeConnection(cursor)
         with patch.object(real_database, "get_connection", return_value=conn):
             real_database.add_shopping_items_batch(1, 10, [_new_item("Хліб", "Хліб і випічка")])
-        self.assertEqual(_journal_inserts(cursor), [])
-
-    def test_add_expense_writes_no_journal(self):
-        cursor = FakeCursor(fetchone_results=[(1,)])
-        conn = FakeConnection(cursor)
-        with patch.object(real_database, "get_connection", return_value=conn):
-            real_database.add_expense(1, 10, Decimal("5.00"), "PLN", "Продукти", "Хліб", date(2026, 7, 5))
         self.assertEqual(_journal_inserts(cursor), [])
 
     def test_delete_expense_writes_no_journal(self):
@@ -160,6 +158,94 @@ class TestJournalNotWrittenForLegacyFlows(unittest.TestCase):
         with patch.object(real_database, "get_connection", return_value=conn):
             real_database.delete_expense(1, 99, snapshot)
         self.assertEqual(_journal_inserts(cursor), [])
+
+
+class TestJournalWrittenForStandaloneExpenseAdd(unittest.TestCase):
+    """Fix for the live undo bug: a standalone confirmed expense add
+    (expenses.py's handle_add_confirm — the dedicated expenses submenu /
+    global "Запиши ... zł" command, the only production caller of
+    database.add_expense) now writes exactly one active journal record in
+    the SAME transaction as the expense insert, mirroring the shape
+    apply_global_household_operations already uses for its own add_expense
+    op. This is what makes get_latest_undoable_action immediately return
+    this expense add instead of leaving a stale older journal row (e.g. a
+    previous inventory action) as "latest"."""
+
+    def test_writes_exactly_one_active_global_household_journal_entry(self):
+        cursor = FakeCursor(fetchone_results=[(555,)])
+        conn = FakeConnection(cursor)
+        with patch.object(real_database, "get_connection", return_value=conn):
+            expense_id = real_database.add_expense(
+                1, 10, Decimal("51.23"), "PLN", "Кафе / ресторани", "тестова кава", date(2026, 7, 14)
+            )
+        self.assertEqual(expense_id, 555)
+        self.assertTrue(conn.committed)
+        inserts = _journal_inserts(cursor)
+        self.assertEqual(len(inserts), 1)
+        sql, params = inserts[0]
+        self.assertIn("'active'", sql)
+        self.assertIn("'global_household'", sql)
+        self.assertEqual(params[0], 1)
+        self.assertEqual(params[1], 10)
+
+    def test_expense_insert_happens_before_journal_insert_same_transaction(self):
+        """Both writes must happen inside the same get_connection()/cursor()
+        block, before the single conn.commit() — never two separate
+        transactions, so there's no window with an added-but-not-journaled
+        expense."""
+        cursor = FakeCursor(fetchone_results=[(555,)])
+        conn = FakeConnection(cursor)
+        with patch.object(real_database, "get_connection", return_value=conn):
+            real_database.add_expense(
+                1, 10, Decimal("51.23"), "PLN", "Кафе / ресторани", "тестова кава", date(2026, 7, 14)
+            )
+        expense_idx = next(i for i, (s, _) in enumerate(cursor.queries) if "INSERT INTO expenses" in s)
+        journal_idx = next(i for i, (s, _) in enumerate(cursor.queries) if "INSERT INTO household_action_journal" in s)
+        self.assertLess(expense_idx, journal_idx)
+        self.assertEqual(conn.committed, True)
+        # only one commit() call ever happens for the whole operation —
+        # FakeConnection.commit() just flips a bool, so we confirm there is
+        # exactly one cursor() context used (no second get_connection() call)
+        self.assertEqual(cursor.queries[expense_idx][0].count("INSERT INTO expenses"), 1)
+
+    def test_post_snapshot_records_the_added_expense_by_id(self):
+        cursor = FakeCursor(fetchone_results=[(555,)])
+        conn = FakeConnection(cursor)
+        with patch.object(real_database, "get_connection", return_value=conn):
+            real_database.add_expense(
+                1, 10, Decimal("51.23"), "PLN", "Кафе / ресторани", "тестова кава", date(2026, 7, 14)
+            )
+        _, params = _journal_inserts(cursor)[0]
+        before_snapshot = params[4].obj
+        post_snapshot = params[5].obj
+        self.assertEqual(before_snapshot["inventory_buckets"], {})
+        self.assertEqual(before_snapshot["shopping_buckets"], {})
+        self.assertEqual(post_snapshot["inventory_buckets"], {})
+        self.assertEqual(post_snapshot["shopping_buckets"], {})
+        expense_adds = post_snapshot["expense_adds"]
+        self.assertEqual(len(expense_adds), 1)
+        self.assertEqual(expense_adds[0]["id"], 555)
+        self.assertEqual(expense_adds[0]["amount"], "51.23")
+        self.assertEqual(expense_adds[0]["currency"], "PLN")
+        self.assertEqual(expense_adds[0]["category"], "Кафе / ресторани")
+        self.assertEqual(expense_adds[0]["description"], "тестова кава")
+        self.assertEqual(expense_adds[0]["expense_date"], "2026-07-14")
+
+    def test_summary_produces_expenses_added_entry_for_undo_preview_formatting(self):
+        """format_undo_preview relies on summary["expenses_added"] being
+        populated — confirms build_operation_summary is actually invoked
+        with the real snapshots, not skipped."""
+        cursor = FakeCursor(fetchone_results=[(555,)])
+        conn = FakeConnection(cursor)
+        with patch.object(real_database, "get_connection", return_value=conn):
+            real_database.add_expense(
+                1, 10, Decimal("51.23"), "PLN", "Кафе / ресторани", "тестова кава", date(2026, 7, 14)
+            )
+        _, params = _journal_inserts(cursor)[0]
+        summary = params[6].obj
+        self.assertEqual(len(summary.get("expenses_added", [])), 1)
+        self.assertEqual(summary["inventory"], [])
+        self.assertEqual(summary["shopping"], [])
 
 
 class TestGetLatestUndoableAction(unittest.TestCase):

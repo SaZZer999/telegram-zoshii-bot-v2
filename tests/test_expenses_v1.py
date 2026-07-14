@@ -715,7 +715,10 @@ class TestAddExpenseHouseholdIsolation(unittest.TestCase):
                 category="Продукти", description="Тест", expense_date=date(2026, 7, 1),
             )
         self.assertEqual(new_id, 101)
-        sql, params = cursor.queries[-1]
+        # add_expense now also journals the confirmed add (Action History +
+        # Safe Undo v1 fix) in the same transaction, so the expense INSERT
+        # is queries[0] (it runs first), not necessarily the only query.
+        sql, params = cursor.queries[0]
         self.assertIn("INSERT INTO expenses", sql)
         self.assertIn("%s", sql)
         self.assertEqual(params[0], 7)  # household_id is the first bound parameter
