@@ -289,6 +289,25 @@ class CommandRouteDeps:
     # AI edit-parser, even while a saved shopping/inventory list context is
     # open, but never overrides any higher-priority write route above it.
     inventory_transform_route: Callable = None
+    # Inventory Action Planner V1 — optional (default None), same reasoning
+    # as every other Optional field above. NOT mini_action_planner.py (see
+    # DispatcherDeps.mini_action_planner's own docstring) — a separate,
+    # narrower Gemini classifier (inventory_transform/inventory_merge_
+    # duplicates/inventory_rename/inventory_delete/clarify/unsupported) for
+    # inventory-restructuring phrasing none of inventory_transform_route/
+    # inventory_cleanup_route/inventory_admin_route recognized. Checked
+    # right AFTER those three deterministic gates (so every already-free,
+    # already-tested exact-phrase match keeps costing zero Gemini calls,
+    # unchanged) and right BEFORE saved_list_router (so this narrower,
+    # purpose-built classifier always wins over that router's own broad
+    # "edit quantity/name/category of an existing item" AI edit-parser for a
+    # message actually describing a transform/merge/rename/delete intent,
+    # even while a saved shopping/inventory list context is open).
+    # Deliberately NOT positioned ahead of the Global Household Router or
+    # the three deterministic inventory gates above — see action_planner.py's
+    # own module docstring: never a second Gemini call for the common
+    # add/consume/expense case those already own.
+    action_planner_route: Callable = None
     # Destructive Bulk Household Request Guard v1 — optional (default None),
     # same reasoning as every other Optional field above. Checked FIRST in
     # this slice: a bare "Видали все"/"Очисти запаси" names no specific
@@ -397,7 +416,12 @@ def _dispatch_navigation(deps, chat_id, text):
         deps.send_message(chat_id, deps.help_text)
         return True
 
-    if text == "⬅️ Головне меню":
+    # Bare "Назад"/"назад" (stripped, case-insensitive) — a natural-language
+    # alias for the exact "⬅️ Головне меню" button, checked here so it's
+    # always deterministic (never sent to Gemini) and never opens a new
+    # pending-state: same clear_interaction_state + main-menu action as the
+    # button itself, nothing else.
+    if text == "⬅️ Головне меню" or (isinstance(text, str) and text.strip().lower() == "назад"):
         deps.clear_interaction_state(chat_id)
         deps.send_message(chat_id, "Ось головне меню:", reply_markup=deps.main_keyboard)
         return True
@@ -738,6 +762,27 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # before it — see inventory_admin_route's own docstring) and still
         # ahead of saved_list_router for the same reason that route already
         # wins over the AI edit-parser.
+        return RouteOutcome.HANDLED
+
+    if routes.action_planner_route is not None and routes.action_planner_route(chat_id, user_id, display_name, text):
+        # Inventory Action Planner V1 — one closed-vocabulary Gemini
+        # classifier (inventory_transform/inventory_merge_duplicates/
+        # inventory_rename/inventory_delete/clarify/unsupported) for
+        # inventory-restructuring phrasing none of the three deterministic
+        # gates above recognized (arrow/plus notation, "і запиши як X"
+        # target clauses, paraphrased rename/delete verbs, ...). Checked
+        # AFTER inventory_transform_route/inventory_cleanup_route/
+        # inventory_admin_route, so every already-free, already-tested
+        # deterministic match keeps costing zero Gemini calls, unchanged —
+        # and BEFORE saved_list_router, so this narrower, purpose-built
+        # classifier always wins over that router's own broad "edit
+        # quantity/name/category of an existing item" AI edit-parser for a
+        # message actually describing a transform/merge/rename/delete
+        # intent, even while a saved shopping/inventory list is open. Its
+        # own cheap pre-gate (action_planner.looks_like_inventory_admin_or_
+        # transform) means an unrelated message never reaches Gemini here.
+        # NOT the same route/module as mini_action_planner.py's own Phase D
+        # slot (see CommandRouteDeps.action_planner_route's own docstring).
         return RouteOutcome.HANDLED
 
     if routes.saved_list_router(chat_id, user_id, display_name, text):

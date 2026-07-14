@@ -761,6 +761,52 @@ _CLEANUP_FOLLOWUP_PHRASES = {
     "ці дублікати", "цей дублікат", "дублікати",
 }
 
+# Inventory Cleanup Merge vs Transform Guard v1 — a message whose remainder
+# (the text parse_inventory_cleanup_request is about to treat as ONE
+# product-name search) itself carries an Inventory Transform V1 shape —
+# multiple DIFFERENT source items collapsed into a NEW named record, not a
+# duplicate-merge of ONE product — must never be silently claimed here.
+# _CLEANUP_TRIGGER_RE matches the bare word "об'єднай" anywhere in the
+# message (unanchored, unlike parse_inventory_transform_request's own
+# `^об'єднай ... в/у/на ...` grammar), so a transform-shaped phrase whose
+# trigger verb isn't at the very start of the message (e.g. "В запасах
+# об'єднай X і Y і запиши як Z") or whose target clause isn't the exact
+# "в/у/на" preposition parse_inventory_transform_request requires (e.g.
+# "...і запиши як Z") would otherwise still match THIS trigger and swallow
+# the whole tail as a single, never-found product name. This guard only
+# ever says "this isn't a single-product cleanup search, let it fall
+# through" — it never itself parses a transform plan (that stays
+# parse_inventory_transform_request's job for the phrasing it already
+# understands, and the Inventory Action Planner V1's job for everything
+# else, see action_planner.py). Deliberately a small, explicit signal list
+# (arrow/plus notation, an explicit "call the result X" target clause, or a
+# generic "combine into one position" phrase) — never a broad NLP guess, and
+# never triggered by a bare preposition ("в"/"у"/"на") alone, so an ordinary
+# product name that happens to contain one (e.g. "Об'єднай дублікати молока
+# в запасах", already location-stripped above) is never affected.
+_CLEANUP_TRANSFORM_SHAPE_ARROW_RE = re.compile(r"→|->")
+_CLEANUP_TRANSFORM_SHAPE_PLUS_RE = re.compile(r"\S\s*\+\s*\S")
+_CLEANUP_TRANSFORM_SHAPE_TARGET_CLAUSE_RE = re.compile(
+    r"запиши(?:те)?\s+як|назви(?:те)?\s+як|назви(?:те)?\s+це|зроби\s+з\b|"
+    r"(?:в|у)\s+одну\s+позиц\w*|перетвор\w*\s+.+\s+(?:в|у|на)\s+\S",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_transform_shape(remainder):
+    """True if `remainder` actually describes an Inventory Transform V1
+    request (see this module's own comment above) instead of a single-
+    product duplicate-merge search. Never itself a transform parser — the
+    caller's only job when this returns True is to stop claiming the
+    message, never to build a transform plan here."""
+    if not remainder:
+        return False
+    return bool(
+        _CLEANUP_TRANSFORM_SHAPE_ARROW_RE.search(remainder)
+        or _CLEANUP_TRANSFORM_SHAPE_PLUS_RE.search(remainder)
+        or _CLEANUP_TRANSFORM_SHAPE_TARGET_CLAUSE_RE.search(remainder)
+    )
+
 
 def parse_inventory_cleanup_request(text):
     """Classify free text as an Inventory Cleanup / Merge v1 request.
@@ -779,6 +825,14 @@ def parse_inventory_cleanup_request(text):
     explicit-quantity removal ("прибери «сосисок — пару»") don't match this
     gate at all and fall through to whatever route already handles that
     text today — documented V1 limitation, not a silent misfire.
+
+    Also returns (None, None) — same as "not a cleanup phrase at all" — when
+    the remainder itself looks like an Inventory Transform V1 request
+    instead of a single-product duplicate search (see
+    _looks_like_transform_shape's own comment above): the caller must let
+    the message fall through to inventory_transform_route / the Inventory
+    Action Planner V1, never claim it here as a (doomed to fail) product-name
+    search.
     """
     stripped = (text or "").strip()
     if not stripped:
@@ -796,6 +850,8 @@ def parse_inventory_cleanup_request(text):
 
     if not remainder or remainder in _CLEANUP_FOLLOWUP_PHRASES:
         return True, None
+    if _looks_like_transform_shape(remainder):
+        return None, None
     return False, remainder
 
 
@@ -1255,6 +1311,50 @@ def _normalize_numeric_quantity_hint(text):
     if value is None:
         return text
     return format_quantity_display(value, unit)
+
+
+# Standalone quantity-hint normalizer for a caller that already has a hint
+# string in ISOLATION (not embedded in a full "видали X <qty>" phrase) — the
+# Inventory Action Planner V1's own inventory_delete action extracts
+# item_name/quantity_hint as two separate fields, so its quantity_hint must
+# go through the SAME natural-language normalization parse_inventory_delete_
+# request's own trailing-quantity parsing already applies to a phrase it
+# parsed itself, so "Видали молоко одна штука" (deterministic parser) and a
+# planner-routed item_name="молоко"/quantity_hint="одна штука" resolve to
+# the exact same "1 шт." candidate-matching hint — see this module's live
+# fix for the natural-quantity inventory-delete bug. Handles the spelled-out
+# "one" shapes _normalize_numeric_quantity_hint alone can't (no digit to
+# trigger on): the exact two-word "одна штука"/"одну штуку" phrase, and a
+# bare "одне"/"одна"/"один" — then falls back to _normalize_numeric_
+# quantity_hint for everything else (numeric hints re-rendered to canonical
+# form, "пара"/"пару" returned unchanged, anything unparseable returned
+# unchanged so the caller's own exact-match narrowing simply finds no
+# candidate and falls back to the full list, per resolve_inventory_admin_
+# candidates' own contract, rather than crashing).
+_BARE_ONE_WORD_RE = re.compile(r"^(?:одне|одна|один)$", re.IGNORECASE)
+
+
+def normalize_delete_quantity_hint(text):
+    """Normalize a standalone delete quantity_hint string the same way
+    parse_inventory_delete_request already normalizes a trailing quantity
+    fragment parsed out of a full phrase. Returns None for missing/blank
+    input (no hint at all — the caller's candidate search then relies on
+    name alone, same as today)."""
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    words = stripped.split()
+    if (
+        len(words) == 2
+        and words[0].lower() in _ONE_PIECE_COUNT_WORDS
+        and words[1].lower() in _PIECE_NOUN_WORDS
+    ):
+        return "1 шт."
+    if _BARE_ONE_WORD_RE.match(stripped):
+        return "1 шт."
+    return _normalize_numeric_quantity_hint(stripped)
 
 
 # =========================

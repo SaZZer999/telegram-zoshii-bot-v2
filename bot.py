@@ -96,6 +96,7 @@ import voice_input
 import voice_transcript_normalizer
 import photo_receipts
 import mini_action_planner
+import action_planner
 import preview_edit_planner
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
@@ -3396,6 +3397,85 @@ def _route_inventory_transform(chat_id, user_id, display_name, text):
     return True
 
 
+# =========================
+# INVENTORY ACTION PLANNER V1 — action_planner.py owns a single closed-
+# vocabulary Gemini classifier (inventory_transform/inventory_merge_
+# duplicates/inventory_rename/inventory_delete/clarify/unsupported) for
+# inventory-restructuring phrasing none of inventory_transform_route/
+# inventory_cleanup_route/inventory_admin_route's own deterministic regex
+# parsers recognized. NOT the same module/route as mini_action_planner.py
+# ("Unified Mini Action Planner V1" — add_to_shopping/add_to_inventory/
+# ask_inventory/meal_ideas/unknown, Phase D last-resort before general
+# AI-chat) — see action_planner.py's own module docstring for why these
+# stay two separate modules with two separate dispatcher slots. Every
+# branch below dispatches to the SAME _start_inventory_*/pending_* entry
+# points the deterministic routes already use — no new DB write path, no
+# new pending-state shape, no duplicated candidate-resolution/unit-
+# compatibility/disambiguation logic. Wired as message_dispatcher.py's
+# CommandRouteDeps.action_planner_route, checked right after
+# inventory_admin_route and right before saved_list_router.
+# =========================
+def _try_action_planner(chat_id, user_id, display_name, text):
+    """Returns True if the message was fully handled (a preview was
+    started, a clarification question was sent, or a controlled "not
+    supported" message was sent) — the caller must not fall through to
+    saved_list_router/general AI-chat in that case. Returns False when the
+    cheap pre-gate rejects the message outright — routing continues exactly
+    as before this planner existed (never invokes Gemini in that case).
+    Calls action_planner.classify() at most once per message, and never
+    writes to the database directly — every action only ever builds a
+    pending preview through the same _start_inventory_* entry points
+    inventory_transform_route/inventory_cleanup_route/inventory_admin_route
+    already use."""
+    if not action_planner.looks_like_inventory_admin_or_transform(text):
+        return False
+
+    if _has_blocking_pending_state_for_reports(chat_id):
+        # Another flow's preview/clarification is already open — never
+        # silently start a second one (in particular, _start_inventory_
+        # cleanup has no such guard baked into itself — its own caller,
+        # _route_inventory_cleanup, checks this first, so this wrapper must
+        # too). Same guard message every other route-starting function in
+        # this file already uses for the same situation.
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return True
+
+    plan = action_planner.classify(text)
+    action = plan["action"]
+    arguments = plan["arguments"]
+
+    if action == "inventory_transform":
+        _start_inventory_transform(
+            chat_id, user_id, display_name, arguments["source_names"], arguments["target_name"],
+        )
+        return True
+
+    if action == "inventory_merge_duplicates":
+        _start_inventory_cleanup(chat_id, user_id, display_name, arguments["product_name"])
+        return True
+
+    if action == "inventory_rename":
+        _start_inventory_rename(chat_id, user_id, display_name, arguments["old_name"], arguments["new_name"])
+        return True
+
+    if action == "inventory_delete":
+        quantity_hint = inventory.normalize_delete_quantity_hint(arguments.get("quantity_hint"))
+        _start_inventory_delete(chat_id, user_id, display_name, arguments["item_name"], quantity_hint)
+        return True
+
+    if action == "clarify":
+        send_message(chat_id, plan["clarification_question"], reply_markup=INVENTORY_KEYBOARD)
+        return True
+
+    # action == "unsupported" — either Gemini genuinely classified it that
+    # way, or classify() itself already collapsed a timeout/invalid-JSON/
+    # unknown-action/missing-field failure to this same value. Either way: a
+    # single controlled message, never general AI-chat, never a guess, never
+    # a DB write.
+    send_message(chat_id, action_planner.UNSUPPORTED_MSG, reply_markup=INVENTORY_KEYBOARD)
+    return True
+
+
 def _apply_inventory_transform_confirm(chat_id):
     """"✅ Так, застосувати" button for a pending_inventory_transform preview.
     Pops the pending action BEFORE the database call, same duplicate-press
@@ -5981,6 +6061,7 @@ _command_route_deps = message_dispatcher.CommandRouteDeps(
     inventory_cleanup_route=lambda *a, **kw: _route_inventory_cleanup(*a, **kw),
     inventory_admin_route=lambda *a, **kw: _route_inventory_admin(*a, **kw),
     inventory_transform_route=lambda *a, **kw: _route_inventory_transform(*a, **kw),
+    action_planner_route=lambda *a, **kw: _try_action_planner(*a, **kw),
     destructive_bulk_guard=lambda *a, **kw: _route_destructive_bulk_guard(*a, **kw),
     saved_list_router=lambda *a, **kw: _route_saved_list_router(*a, **kw),
     general_ai_fallback=lambda *a, **kw: _run_general_ai_fallback(*a, **kw),
@@ -6738,6 +6819,12 @@ household_router.configure(
 # Wire mini_action_planner.py's dependency (only call_gemini) the same way —
 # it never imports bot.py either (see its module docstring).
 mini_action_planner.configure(sys.modules[__name__])
+
+# Wire action_planner.py's dependency (only call_gemini) the same way — it
+# never imports bot.py either (see its module docstring). A separate module
+# from mini_action_planner.py above — see action_planner.py's own docstring
+# for why these stay two independent planners.
+action_planner.configure(sys.modules[__name__])
 
 # Wire voice_transcript_normalizer.py's dependency (only call_gemini) the
 # same way — it never imports bot.py either (see its module docstring).
