@@ -32,6 +32,7 @@ os.environ.setdefault('GEMINI_API_KEY', 'test_gemini_key')
 os.environ.setdefault('ALLOWED_USER_IDS', '')
 
 import bot
+import expenses
 from bot import _expense_delete_command_gate
 
 
@@ -197,6 +198,68 @@ class TestExpenseDeleteCommandGate(unittest.TestCase):
     def test_empty_text_does_not_match(self):
         self.assertFalse(_expense_delete_command_gate(""))
         self.assertFalse(_expense_delete_command_gate("   "))
+
+
+class TestNaturalExpenseDeleteGateWidening(unittest.TestCase):
+    """Focused tests for the widened _expense_delete_command_gate: a
+    delete/cancel verb ("видали"/"видалити"/"скасуй"/"скасувати"/"прибери"/
+    "прибрати") combined with a financial-reference stem (покупк/плат/
+    транзакц/чек/списанн) now also reaches the existing expense-delete
+    router, without requiring the literal word "витрата". The gate itself
+    is the only thing that changed — candidate resolution, preview,
+    confirm/cancel, stale protection and undo all stay in the existing
+    expense-delete flow untouched (see TestNaturalExpenseDeletionRouting
+    below for webhook-level proof of that)."""
+
+    # 1.
+    def test_skasuy_tu_pokupku_matches(self):
+        self.assertTrue(_expense_delete_command_gate("Скасуй ту покупку на 50 zł"))
+
+    # 2.
+    def test_prybery_ostanniy_platizh_matches(self):
+        self.assertTrue(_expense_delete_command_gate("Прибери останній платіж"))
+
+    # 3.
+    def test_vydaly_ostannyu_oplatu_matches(self):
+        self.assertTrue(_expense_delete_command_gate("Видали останню оплату за інтернет"))
+
+    # 4. Existing "витрата" form must not regress.
+    def test_vydaly_ostannyu_vytratu_still_matches(self):
+        self.assertTrue(_expense_delete_command_gate("Видали останню витрату"))
+
+    # Existing forms explicitly called out as must-not-break.
+    def test_skasuy_vytratu_na_summu_still_matches(self):
+        self.assertTrue(_expense_delete_command_gate("Скасуй витрату на 50 zł"))
+
+    def test_prybery_vytratu_za_internet_matches(self):
+        # "прибери" was not previously a recognized delete verb at all — now
+        # covered by the widened verb set, alongside "видали"/"скасуй".
+        self.assertTrue(_expense_delete_command_gate("Прибери витрату за інтернет"))
+
+    # 5.
+    def test_skasuy_zustrich_does_not_match(self):
+        self.assertFalse(_expense_delete_command_gate("Скасуй зустріч"))
+
+    def test_skasuy_zamovlennya_does_not_match(self):
+        self.assertFalse(_expense_delete_command_gate("Скасуй замовлення в магазині"))
+
+    # 6.
+    def test_prybery_moloko_zi_spysku_pokupok_does_not_match(self):
+        self.assertFalse(_expense_delete_command_gate("Прибери молоко зі списку покупок"))
+
+    # 7.
+    def test_zapyshy_pokupku_stays_add_expense_shape(self):
+        self.assertFalse(_expense_delete_command_gate("Запиши покупку на 50 zł"))
+
+    # 8.
+    def test_ya_oplatyv_internet_does_not_become_delete(self):
+        self.assertFalse(_expense_delete_command_gate("Я оплатив інтернет 120 zł"))
+
+    # A bare zł amount alone (no financial-reference word) must stay just as
+    # ambiguous as before the widening — same existing guarantee as
+    # "Видали булочку 4 zł" above, now re-verified against the new verb set.
+    def test_bare_amount_with_no_financial_word_still_does_not_match(self):
+        self.assertFalse(_expense_delete_command_gate("Прибери булочку 4 zł"))
 
 
 # =========================
@@ -396,6 +459,178 @@ class TestExpenseDeleteWebhookFlow(unittest.TestCase):
             mock_router.assert_not_called()
         self.assertIn(chat_id, bot.pending_delete_batch)
         self.assertNotIn(chat_id, bot.pending_expense_delete)
+
+
+# =========================
+# Natural-language expense-deletion routing — webhook-level proof that the
+# WIDENED gate only decides whether to hand text to the EXISTING expense-
+# delete router; every downstream guarantee (single Gemini call, no DB
+# write before confirm, cancel writes nothing, confirm deletes exactly one
+# row, multi-candidate clarification, stale protection, pending-preview
+# priority, no leak to general AI-chat) is exercised through the new
+# phrasing exactly the same way tests/test_expense_delete.py's own
+# TestExpenseDeleteWebhookFlow already proves it for "Видали витрату ...".
+# =========================
+class TestNaturalExpenseDeletionRouting(unittest.TestCase):
+    def setUp(self):
+        patcher_get_user = patch.object(bot, "get_household_and_user", return_value=(1, 10))
+        self.mock_get_user = patcher_get_user.start()
+        self.addCleanup(patcher_get_user.stop)
+
+        patcher_send = patch.object(bot, "send_message")
+        self.mock_send = patcher_send.start()
+        self.addCleanup(patcher_send.stop)
+
+        patcher_gemini_chat = patch.object(bot, "call_gemini")
+        self.mock_call_gemini = patcher_gemini_chat.start()
+        self.addCleanup(patcher_gemini_chat.stop)
+
+        patcher_saved_router = patch.object(bot, "_ask_gemini_saved_list_router")
+        self.mock_saved_router = patcher_saved_router.start()
+        self.addCleanup(patcher_saved_router.stop)
+
+    def tearDown(self):
+        for d in (bot.pending_expense_delete, bot.expense_delete_selection,
+                  bot.pending_expense, bot.pending_delete_batch, bot.pending_alias_action,
+                  bot.active_list_context, bot.saved_list_context):
+            d.clear()
+
+    def _sent_texts(self):
+        return [call.args[1] for call in self.mock_send.call_args_list]
+
+    # 9. New phrase calls the existing expense-router at most once.
+    def test_new_phrase_calls_existing_router_at_most_once(self):
+        chat_id = 965001
+        expenses = [_expense_dict(201, Decimal("50.00"), description="Покупка")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1])) as mock_router:
+                _call_webhook(_make_update(965000001, chat_id, "Скасуй ту покупку на 50 zł"))
+        self.assertEqual(mock_router.call_count, 1)
+
+    # 10. No DB write before confirm.
+    def test_no_db_write_before_confirm(self):
+        chat_id = 965002
+        expenses = [_expense_dict(202, Decimal("50.00"))]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1])):
+                with patch.object(bot, "delete_expense") as mock_delete:
+                    _call_webhook(_make_update(965000002, chat_id, "Прибери останній платіж"))
+                    mock_delete.assert_not_called()
+        self.assertIn(chat_id, bot.pending_expense_delete)
+        self.assertEqual(bot.pending_expense_delete[chat_id]["expense_id"], 202)
+
+    # 11. Cancel deletes nothing.
+    def test_cancel_deletes_nothing(self):
+        chat_id = 965003
+        expenses = [_expense_dict(203, Decimal("40.00"), description="Інтернет")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1])):
+                _call_webhook(_make_update(965000003, chat_id, "Видали останню оплату за інтернет"))
+        with patch.object(bot, "delete_expense") as mock_delete:
+            _call_webhook(_make_update(965000004, chat_id, "❌ Скасувати"))
+            mock_delete.assert_not_called()
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+
+    # 12. Confirm deletes only the selected expense.
+    def test_confirm_deletes_only_selected_expense(self):
+        chat_id = 965004
+        expenses = [_expense_dict(204, Decimal("50.00"), description="Покупка")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1])):
+                _call_webhook(_make_update(965000005, chat_id, "Скасуй ту покупку на 50 zł"))
+        with patch.object(bot, "delete_expense") as mock_delete:
+            _call_webhook(_make_update(965000006, chat_id, "✅ Так, видалити"))
+        mock_delete.assert_called_once_with(1, 204, expenses[0] and {
+            "amount": Decimal("50.00"), "category": "Продукти",
+            "expense_date": date(2026, 7, 3), "description": "Покупка",
+        })
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+
+    # 13. Multiple candidates use the existing clarification/selection flow.
+    def test_multiple_candidates_use_existing_clarification(self):
+        chat_id = 965005
+        expenses = [
+            _expense_dict(205, Decimal("50.00"), description="Покупка А"),
+            _expense_dict(206, Decimal("50.00"), description="Покупка Б"),
+        ]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1, 2])):
+                with patch.object(bot, "delete_expense") as mock_delete:
+                    _call_webhook(_make_update(965000007, chat_id, "Прибери останній платіж"))
+                    mock_delete.assert_not_called()
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+        self.assertIn(chat_id, bot.expense_delete_selection)
+        self.assertTrue(any("Яку витрату видалити?" in t for t in self._sent_texts()))
+
+    # 14. A stale expense preview is never applied.
+    def test_stale_preview_is_not_applied(self):
+        chat_id = 965006
+        # expenses.py does `from database import StaleSnapshotError` itself
+        # (never through the injected _bot) — its own except clause checks
+        # against expenses.StaleSnapshotError, not bot.StaleSnapshotError.
+        original_stale_error = expenses.StaleSnapshotError
+        expenses.StaleSnapshotError = real_database.StaleSnapshotError
+        try:
+            recent = [_expense_dict(207, Decimal("50.00"), description="Покупка")]
+            with patch.object(bot, "get_recent_expenses_for_deletion", return_value=recent):
+                with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1])):
+                    _call_webhook(_make_update(965000008, chat_id, "Скасуй ту покупку на 50 zł"))
+            with patch.object(bot, "delete_expense", side_effect=expenses.StaleSnapshotError()):
+                _call_webhook(_make_update(965000009, chat_id, "✅ Так, видалити"))
+        finally:
+            expenses.StaleSnapshotError = original_stale_error
+        self.assertTrue(any("Список змінився з іншого пристрою" in t for t in self._sent_texts()))
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+
+    # 15. Confirming via the new phrasing goes through the exact same
+    # handle_delete_confirm()/delete_expense() call as the existing
+    # "Видали витрату ..." phrasing — so whatever undo support this flow
+    # has today is identically inherited, unaffected by the gate widening.
+    # NOTE (finding, not a regression from this change): database.
+    # delete_expense() does not itself write a household_action_journal
+    # row — unlike execute_inventory_delete/execute_inventory_transform,
+    # this dedicated expense-delete path has no "↩️ Скасувати останню дію"
+    # integration today. Pre-existing, out of this focused fix's scope
+    # (only add_expense/delete_expense issued THROUGH the Global Household
+    # Router's own compound-op path get journaled) — not changed here.
+    def test_confirm_uses_same_executor_as_existing_vytrata_phrasing(self):
+        chat_id = 965007
+        expenses = [_expense_dict(208, Decimal("50.00"), description="Покупка")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1])):
+                _call_webhook(_make_update(965000010, chat_id, "Скасуй ту покупку на 50 zł"))
+        with patch.object(bot, "delete_expense", return_value=None) as mock_delete:
+            _call_webhook(_make_update(965000011, chat_id, "✅ Так, видалити"))
+        mock_delete.assert_called_once()
+        args, _ = mock_delete.call_args
+        self.assertEqual(args[0], 1)
+        self.assertEqual(args[1], 208)
+
+    # 16. Active pending preview has priority — the new gate is never even
+    # consulted.
+    def test_active_pending_preview_wins_new_gate_never_called(self):
+        chat_id = 965008
+        bot.pending_expense[chat_id] = {
+            "household_id": 1, "user_db_id": 10, "amount": Decimal("10.00"),
+            "currency": "PLN", "category": "Продукти", "description": "Хліб",
+            "expense_date": date(2026, 7, 3), "origin": "global",
+        }
+        with patch.object(bot, "_ask_gemini_expense_router") as mock_router:
+            _call_webhook(_make_update(965000012, chat_id, "Скасуй ту покупку на 50 zł"))
+            mock_router.assert_not_called()
+        self.assertIn(chat_id, bot.pending_expense)
+        self.assertTrue(any("незавершена дія з витратами" in t for t in self._sent_texts()))
+
+    # 17. general AI fallback never receives an operational expense-delete
+    # command the widened gate accepted.
+    def test_general_ai_never_receives_accepted_delete_command(self):
+        chat_id = 965009
+        expenses = [_expense_dict(209, Decimal("40.00"), description="Інтернет")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1])):
+                _call_webhook(_make_update(965000013, chat_id, "Видали останню оплату за інтернет"))
+        self.mock_call_gemini.assert_not_called()
+        self.mock_saved_router.assert_not_called()
 
 
 if __name__ == "__main__":

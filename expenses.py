@@ -263,17 +263,56 @@ def _expense_report_gate(text):
     return None
 
 
-_EXPENSE_DELETE_VERBS = ("видали", "видалити", "скасуй", "скасувати")
+_EXPENSE_DELETE_VERBS = ("видали", "видалити", "скасуй", "скасувати", "прибери", "прибрати")
+
+# Financial-reference stems — a delete/cancel verb ALONE never triggers this
+# gate (see _expense_delete_command_gate's own docstring: "Скасуй зустріч"
+# must never match) — only when paired with one of these words naming a
+# past financial operation is a delete/cancel verb treated as an expense-
+# deletion command instead of, say, a shopping-list removal ("Прибери молоко
+# зі списку покупок"). Deliberately a compact set of STEMS, never a list of
+# full phrases: "плат" alone covers both "платіж"/"платежу" and
+# "оплата"/"оплату" (no separate entry needed for each), and Ukrainian's own
+# genitive-plural "покупок" ("of purchases") happens to NOT contain the
+# "покупк" stem (по-куп-ок vs по-купк-...), so "зі списку покупок" is never
+# mistaken for "ту покупку" — a real grammatical distinction, not a manually
+# tuned exception. A short stem like "чек" can in principle collide with an
+# unrelated word (e.g. "чекаю") — same accepted, low-severity tradeoff every
+# other cheap pre-gate in this codebase already makes (see action_planner.
+# py's own module docstring): a false positive here only costs one extra
+# call to the EXISTING expense-delete Gemini router, which itself never
+# guesses/deletes without an unambiguous match.
+_EXPENSE_FINANCIAL_REFERENCE_STEMS = ("покупк", "плат", "транзакц", "чек", "списанн")
 
 
 def _expense_delete_command_gate(text):
     """Narrow, local gate for explicit expense-deletion commands — usable
     both as the dedicated "🗑️ Видалити витрату" button and as free text from
-    anywhere. Requires an explicit mention of "витрат(у/и)" together with a
-    delete/cancel verb, so a bare "Видали булочку" (no mention of an expense
-    at all) never matches — that's plausibly about the shopping list instead,
-    not something this gate should silently swallow. Never decides WHICH
-    expense itself; that stays entirely the job of the Gemini expense router.
+    anywhere. GATE BOUNDARY: this function only decides whether to hand the
+    text to the EXISTING expense-delete Gemini router — it never itself
+    identifies which expense, never returns a DB id, never deletes anything,
+    never bypasses preview, and never touches pending state directly; all of
+    that stays exactly where it already lives (_ask_gemini_expense_router,
+    _resolve_expense_delete_selection, pending_expense_delete/
+    expense_delete_selection, the existing preview/confirm/undo flow).
+
+    Two independent trigger shapes both require a delete/cancel verb — a
+    bare "Видали булочку" (no financial signal at all) never matches, since
+    that's plausibly about the shopping list instead. A bare zł-tagged
+    amount alone is deliberately NOT a trigger either — "Видали булочку
+    4 zł" must stay just as ambiguous as "Видали булочку" (a priced shopping
+    item, not obviously an expense); a real financial-reference word is
+    required, exactly like the original "витрат" shape:
+      1. (original) delete/cancel verb + the literal word "витрат(а/и/у)"
+         anywhere in the text.
+      2. (new) the SAME delete/cancel verb + a financial-reference stem
+         (see _EXPENSE_FINANCIAL_REFERENCE_STEMS) — covers "Скасуй ту
+         покупку на 50 zł", "Прибери останній платіж", "Видали останню
+         оплату за інтернет" without requiring the word "витрата" at all.
+         The verb is still REQUIRED in this shape too: a bare financial
+         word alone ("Я оплатив інтернет 120 zł", "Запиши покупку на
+         50 zł") never matches — those are add-expense phrasings, not
+         delete ones, and stay on their own existing routes unaffected.
     """
     if not isinstance(text, str):
         return False
@@ -283,9 +322,11 @@ def _expense_delete_command_gate(text):
     if stripped == "🗑️ Видалити витрату":
         return True
     lowered = stripped.lower()
-    if "витрат" not in lowered:
+    if not any(verb in lowered for verb in _EXPENSE_DELETE_VERBS):
         return False
-    return any(verb in lowered for verb in _EXPENSE_DELETE_VERBS)
+    if "витрат" in lowered:
+        return True
+    return any(stem in lowered for stem in _EXPENSE_FINANCIAL_REFERENCE_STEMS)
 
 
 # =========================
