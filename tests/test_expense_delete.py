@@ -262,6 +262,52 @@ class TestNaturalExpenseDeleteGateWidening(unittest.TestCase):
         self.assertFalse(_expense_delete_command_gate("Прибери булочку 4 zł"))
 
 
+class TestActiveContextDeleteGateAndShoppingBoundary(unittest.TestCase):
+    """Pure-function coverage for the two new gates added by this fix (see
+    expenses.py): the looser, context-scoped delete gate used ONLY while the
+    active expenses submenu is open, and the shopping-list domain-boundary
+    check that keeps it from ever swallowing an explicit shopping command."""
+
+    def test_exact_live_phrase_matches_active_context_gate(self):
+        self.assertTrue(expenses._expense_delete_active_context_gate("Викресли тестова кава зі списку"))
+        self.assertTrue(expenses._expense_delete_active_context_gate("Викресли тестову каву зі списку"))
+
+    def test_button_text_matches_active_context_gate(self):
+        self.assertTrue(expenses._expense_delete_active_context_gate("🗑️ Видалити витрату"))
+
+    def test_bare_verb_with_no_financial_word_matches_in_context(self):
+        # Unlike the GLOBAL _expense_delete_command_gate, no "витрат"/
+        # financial-reference word is required here — the active submenu
+        # context itself already establishes this is about an expense.
+        self.assertTrue(expenses._expense_delete_active_context_gate("Видали булочку"))
+        self.assertTrue(expenses._expense_delete_active_context_gate("Прибери тестова кава"))
+
+    def test_no_delete_verb_does_not_match(self):
+        self.assertFalse(expenses._expense_delete_active_context_gate("Кава 14 zł"))
+        self.assertFalse(expenses._expense_delete_active_context_gate(""))
+        self.assertFalse(expenses._expense_delete_active_context_gate("   "))
+
+    def test_explicit_shopping_list_reference_detected(self):
+        self.assertTrue(expenses._looks_like_shopping_list_reference("Викресли хліб зі списку покупок"))
+        self.assertTrue(expenses._looks_like_shopping_list_reference("Прибери молоко зі списку покупок"))
+
+    def test_bare_expenses_list_reference_is_not_a_shopping_reference(self):
+        # "зі списку" alone (no "покуп..." word) — inside the active
+        # expenses context this means THIS (expenses) list, not shopping.
+        self.assertFalse(expenses._looks_like_shopping_list_reference("Викресли тестова кава зі списку"))
+        self.assertFalse(expenses._looks_like_shopping_list_reference(""))
+
+    def test_strip_delete_command_wrapper_isolates_bare_description(self):
+        self.assertEqual(
+            expenses._strip_delete_command_wrapper("Викресли тестова кава зі списку"), "тестова кава",
+        )
+        self.assertEqual(
+            expenses._strip_delete_command_wrapper("Видали витрату Biedronka зі списку"), "Biedronka",
+        )
+        # No recognized wrapper at all — text passes through unchanged.
+        self.assertEqual(expenses._strip_delete_command_wrapper("тестова кава"), "тестова кава")
+
+
 # =========================
 # Webhook-level flow
 # =========================
@@ -631,6 +677,309 @@ class TestNaturalExpenseDeletionRouting(unittest.TestCase):
                 _call_webhook(_make_update(965000013, chat_id, "Видали останню оплату за інтернет"))
         self.mock_call_gemini.assert_not_called()
         self.mock_saved_router.assert_not_called()
+
+
+# =========================
+# Live bug fix: natural-language expense deletion INSIDE the active
+# expenses submenu context ("💸 Витрати" -> active_list_context[chat_id] ==
+# "expenses"). Root cause: bot.py's _route_active_expenses_context handed
+# ANY text straight to _handle_expense_command (the ADD-oriented router,
+# which never passes the household's recent-expenses list to Gemini) —
+# so "Викресли тестова кава зі списку" could never resolve to a delete
+# target and surfaced Gemini's own "не надано список" explanation as if it
+# were a real parsing failure. Fix reuses the existing free-text delete
+# handler (_handle_expense_delete_global_command ->
+# _resolve_expense_delete_selection) with the live DB candidate list,
+# gated by a context-scoped, verb-only delete check plus an explicit
+# shopping-list domain-boundary guard — see bot.py's
+# _route_active_expenses_context and expenses.py's
+# _expense_delete_active_context_gate/_looks_like_shopping_list_reference/
+# _strip_delete_command_wrapper for the full reasoning.
+# =========================
+class TestActiveExpensesContextDeleteFix(unittest.TestCase):
+    def setUp(self):
+        patcher_get_user = patch.object(bot, "get_household_and_user", return_value=(1, 10))
+        self.mock_get_user = patcher_get_user.start()
+        self.addCleanup(patcher_get_user.stop)
+
+        patcher_send = patch.object(bot, "send_message")
+        self.mock_send = patcher_send.start()
+        self.addCleanup(patcher_send.stop)
+
+        patcher_gemini_chat = patch.object(bot, "call_gemini")
+        self.mock_call_gemini = patcher_gemini_chat.start()
+        self.addCleanup(patcher_gemini_chat.stop)
+
+        patcher_saved_router = patch.object(bot, "_ask_gemini_saved_list_router")
+        self.mock_saved_router = patcher_saved_router.start()
+        self.addCleanup(patcher_saved_router.stop)
+
+    def tearDown(self):
+        for d in (bot.pending_expense_delete, bot.expense_delete_selection,
+                  bot.pending_expense, bot.pending_delete_batch, bot.pending_alias_action,
+                  bot.active_list_context, bot.saved_list_context):
+            d.clear()
+
+    def _sent_texts(self):
+        return [call.args[1] for call in self.mock_send.call_args_list]
+
+    def _enter_expenses_context(self, chat_id):
+        bot.active_list_context[chat_id] = "expenses"
+
+    # 1/2/4/7/9/10 — exact live phrase: local exact-match fast path, no
+    # Gemini call, correct preview.
+    def test_exact_live_phrase_creates_preview_via_local_fast_path(self):
+        chat_id = 9765001
+        self._enter_expenses_context(chat_id)
+        expenses_list = [
+            _expense_dict(301, Decimal("51.23"), category="Кафе / ресторани", description="тестова кава"),
+            _expense_dict(302, Decimal("60.00"), description="Подарунок доньці"),
+        ]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list) as mock_get_recent:
+            with patch.object(bot, "_ask_gemini_expense_router") as mock_router:
+                _call_webhook(_make_update(9765000001, chat_id, "Викресли тестова кава зі списку"))
+                mock_router.assert_not_called()
+        mock_get_recent.assert_called_once()
+        self.assertIn(chat_id, bot.pending_expense_delete)
+        self.assertEqual(bot.pending_expense_delete[chat_id]["expense_id"], 301)
+        sent = self._sent_texts()
+        self.assertTrue(any("Видалити витрату?" in t for t in sent))
+        self.assertTrue(any("тестова кава" in t and "51,23 zł" in t for t in sent))
+        # The old bug's internal-error text must never appear.
+        self.assertFalse(any("Не надано список останніх витрат" in t for t in sent))
+
+    # 3 — the declined ("тестову каву") form still resolves, via the
+    # existing Gemini router now correctly given the live candidate list.
+    def test_declined_form_resolves_via_router_with_live_candidates(self):
+        chat_id = 9765002
+        self._enter_expenses_context(chat_id)
+        expenses_list = [_expense_dict(303, Decimal("51.23"), category="Кафе / ресторани", description="тестова кава")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1])) as mock_router:
+                _call_webhook(_make_update(9765000002, chat_id, "Викресли тестову каву зі списку"))
+                mock_router.assert_called_once()
+                # The exact fix: recent_expenses is now passed as candidates.
+                _, kwargs = mock_router.call_args
+                call_args = mock_router.call_args.args
+                passed_recent = kwargs.get("recent_expenses") if "recent_expenses" in kwargs else (
+                    call_args[1] if len(call_args) > 1 else None
+                )
+                self.assertEqual(passed_recent, expenses_list)
+        self.assertIn(chat_id, bot.pending_expense_delete)
+        self.assertEqual(bot.pending_expense_delete[chat_id]["expense_id"], 303)
+
+    # 5 — no DB write before confirm.
+    def test_no_db_write_before_confirm(self):
+        chat_id = 9765003
+        self._enter_expenses_context(chat_id)
+        expenses_list = [_expense_dict(304, Decimal("51.23"), description="тестова кава")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            with patch.object(bot, "delete_expense") as mock_delete:
+                _call_webhook(_make_update(9765000003, chat_id, "Викресли тестова кава зі списку"))
+                mock_delete.assert_not_called()
+
+    # 6 — cancel leaves the expense untouched.
+    def test_cancel_leaves_expense_untouched(self):
+        chat_id = 9765004
+        self._enter_expenses_context(chat_id)
+        expenses_list = [_expense_dict(305, Decimal("51.23"), description="тестова кава")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            _call_webhook(_make_update(9765000004, chat_id, "Викресли тестова кава зі списку"))
+        with patch.object(bot, "delete_expense") as mock_delete:
+            _call_webhook(_make_update(9765000005, chat_id, "❌ Скасувати"))
+            mock_delete.assert_not_called()
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+
+    # 7 — confirm deletes only the selected expense, others untouched.
+    def test_confirm_deletes_only_selected_expense(self):
+        chat_id = 9765005
+        self._enter_expenses_context(chat_id)
+        expenses_list = [
+            _expense_dict(306, Decimal("51.23"), description="тестова кава"),
+            _expense_dict(307, Decimal("60.00"), description="Подарунок доньці"),
+            _expense_dict(308, Decimal("527.00"), description="Комод"),
+        ]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            _call_webhook(_make_update(9765000006, chat_id, "Викресли тестова кава зі списку"))
+        with patch.object(bot, "delete_expense", return_value=None) as mock_delete:
+            _call_webhook(_make_update(9765000007, chat_id, "✅ Так, видалити"))
+        mock_delete.assert_called_once()
+        args, _ = mock_delete.call_args
+        self.assertEqual(args[0], 1)
+        self.assertEqual(args[1], 306)
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+
+    # 8/9 — the active-context resolver fetches LIVE expenses from the DB
+    # (never text saved from the earlier menu render) and never surfaces the
+    # old internal Gemini explanation to the user.
+    def test_resolver_uses_live_db_candidates_not_stale_menu_text(self):
+        chat_id = 9765006
+        self._enter_expenses_context(chat_id)
+        expenses_list = [_expense_dict(309, Decimal("51.23"), description="тестова кава")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list) as mock_get_recent:
+            _call_webhook(_make_update(9765000008, chat_id, "Викресли тестова кава зі списку"))
+        mock_get_recent.assert_called_once_with(1, limit=10)
+        self.assertFalse(any("Не надано список останніх витрат" in t for t in self._sent_texts()))
+
+    # 11 — multiple expenses with the identical description fall back to
+    # the existing disambiguation/selection flow (never guesses).
+    def test_multiple_same_description_uses_existing_disambiguation(self):
+        chat_id = 9765007
+        self._enter_expenses_context(chat_id)
+        expenses_list = [
+            _expense_dict(310, Decimal("51.23"), description="тестова кава"),
+            _expense_dict(311, Decimal("14.00"), description="тестова кава"),
+        ]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1, 2])):
+                with patch.object(bot, "delete_expense") as mock_delete:
+                    _call_webhook(_make_update(9765000009, chat_id, "Викресли тестова кава зі списку"))
+                    mock_delete.assert_not_called()
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+        self.assertIn(chat_id, bot.expense_delete_selection)
+        self.assertTrue(any("Яку витрату видалити?" in t for t in self._sent_texts()))
+
+    # 12 — identical description, different amounts: the router (given the
+    # live amount-annotated candidate list) picks the right one, never
+    # confused by the shared description alone.
+    def test_same_description_different_amounts_not_confused(self):
+        chat_id = 9765008
+        self._enter_expenses_context(chat_id)
+        expenses_list = [
+            _expense_dict(312, Decimal("51.23"), description="тестова кава"),
+            _expense_dict(313, Decimal("14.00"), description="тестова кава"),
+        ]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([2])):
+                _call_webhook(_make_update(9765000010, chat_id, "Викресли тестова кава за 14 zł зі списку"))
+        self.assertIn(chat_id, bot.pending_expense_delete)
+        self.assertEqual(bot.pending_expense_delete[chat_id]["expense_id"], 313)
+
+    # 13 — no matching candidate at all: controlled message, no guess.
+    def test_no_matching_candidate_returns_controlled_message(self):
+        chat_id = 9765009
+        self._enter_expenses_context(chat_id)
+        expenses_list = [_expense_dict(314, Decimal("60.00"), description="Подарунок доньці")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([])):
+                with patch.object(bot, "delete_expense") as mock_delete:
+                    _call_webhook(_make_update(9765000011, chat_id, "Викресли неіснуючу витрату зі списку"))
+                    mock_delete.assert_not_called()
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+        sent = self._sent_texts()
+        self.assertFalse(any("Не надано список останніх витрат" in t for t in sent))
+        self.assertTrue(any("Яку витрату видалити?" in t for t in sent))
+
+    # 14 — empty expense list: controlled message, no crash.
+    def test_empty_expense_list_returns_controlled_message(self):
+        chat_id = 9765010
+        self._enter_expenses_context(chat_id)
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=[]):
+            with patch.object(bot, "delete_expense") as mock_delete:
+                _call_webhook(_make_update(9765000012, chat_id, "Викресли тестова кава зі списку"))
+                mock_delete.assert_not_called()
+        self.assertTrue(any("Витрат поки немає." in t for t in self._sent_texts()))
+
+    # 15 — a stale candidate (already gone by confirm time) blocks the
+    # delete; existing stale-snapshot protection unchanged.
+    def test_stale_candidate_after_preview_is_not_deleted(self):
+        chat_id = 9765011
+        self._enter_expenses_context(chat_id)
+        expenses_list = [_expense_dict(315, Decimal("51.23"), description="тестова кава")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            _call_webhook(_make_update(9765000013, chat_id, "Викресли тестова кава зі списку"))
+        original_stale_error = expenses.StaleSnapshotError
+        expenses.StaleSnapshotError = real_database.StaleSnapshotError
+        try:
+            with patch.object(bot, "delete_expense", side_effect=expenses.StaleSnapshotError()):
+                _call_webhook(_make_update(9765000014, chat_id, "✅ Так, видалити"))
+        finally:
+            expenses.StaleSnapshotError = original_stale_error
+        self.assertTrue(any("Список змінився з іншого пристрою" in t for t in self._sent_texts()))
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+
+    # 16 — the active-context delete flow itself has priority over general
+    # AI-chat: a genuine delete-in-context message is fully handled by the
+    # expense-delete resolver and never falls through to general_ai_
+    # fallback's own call_gemini chat call (a plain unrelated "none"-intent
+    # message inside this context falling through to general AI-chat is
+    # separate, pre-existing, unchanged behavior — see _handle_expense_
+    # command's own docstring on why "none" + origin=="expenses_menu" is the
+    # one case allowed to fall through; not what this fix touches).
+    def test_active_context_delete_flow_never_reaches_general_ai_chat(self):
+        chat_id = 9765012
+        self._enter_expenses_context(chat_id)
+        expenses_list = [_expense_dict(318, Decimal("51.23"), description="тестова кава")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            _call_webhook(_make_update(9765000015, chat_id, "Викресли тестова кава зі списку"))
+        self.mock_call_gemini.assert_not_called()
+        self.assertIn(chat_id, bot.pending_expense_delete)
+
+    # 17 — global command outside expenses context still uses fix dbdd0f7,
+    # unaffected by this change (no active expenses context set at all).
+    def test_global_command_outside_context_still_uses_existing_fix(self):
+        chat_id = 9765013
+        expenses_list = [_expense_dict(316, Decimal("51.23"), description="тестова кава")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1])):
+                _call_webhook(_make_update(9765000016, chat_id, "Скасуй ту покупку на 51,23 zł"))
+        self.assertIn(chat_id, bot.pending_expense_delete)
+        self.assertEqual(bot.pending_expense_delete[chat_id]["expense_id"], 316)
+
+    # 18 — an add-expense command inside active context is unaffected (still
+    # add, never delete).
+    def test_add_expense_command_in_active_context_is_unaffected(self):
+        chat_id = 9765014
+        self._enter_expenses_context(chat_id)
+        router_result = {
+            "intent": "create_expense", "amount": "50.00", "currency": "PLN", "category": "Продукти",
+            "description": "Покупка", "expense_date": "2026-07-14", "selected_numbers": [], "unresolved_fragments": [],
+        }
+        with patch.object(bot, "_ask_gemini_expense_router", return_value=router_result) as mock_router:
+            _call_webhook(_make_update(9765000017, chat_id, "Запиши покупку на 50 zł"))
+        mock_router.assert_called_once()
+        self.assertIn(chat_id, bot.pending_expense)
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+
+    # 19 — an explicit shopping-list command in active expenses context
+    # never creates an expense-delete preview (domain-boundary guard).
+    def test_explicit_shopping_list_command_does_not_create_expense_delete(self):
+        chat_id = 9765015
+        self._enter_expenses_context(chat_id)
+        with patch.object(bot, "get_recent_expenses_for_deletion") as mock_get_recent:
+            with patch.object(bot, "_try_shopping_action_planner", return_value=True) as mock_shopping_planner:
+                _call_webhook(_make_update(9765000018, chat_id, "Викресли хліб зі списку покупок"))
+                mock_shopping_planner.assert_called_once()
+            mock_get_recent.assert_not_called()
+        self.assertNotIn(chat_id, bot.pending_expense_delete)
+        self.assertNotIn(chat_id, bot.expense_delete_selection)
+
+    # 20 — confirm/cancel buttons keep priority over the active expenses
+    # context (an open OTHER preview is never reinterpreted as a new
+    # delete command).
+    def test_confirm_cancel_has_priority_over_active_expenses_context(self):
+        chat_id = 9765016
+        self._enter_expenses_context(chat_id)
+        bot.pending_expense[chat_id] = {
+            "household_id": 1, "user_db_id": 10, "amount": Decimal("10.00"),
+            "currency": "PLN", "category": "Продукти", "description": "Хліб",
+            "expense_date": date(2026, 7, 3), "origin": "expenses_menu",
+        }
+        with patch.object(bot, "add_expense", return_value=999) as mock_add:
+            _call_webhook(_make_update(9765000019, chat_id, "✅ Так, додати"))
+        mock_add.assert_called_once()
+        self.assertNotIn(chat_id, bot.pending_expense)
+
+    # 21 — the router/planner is invoked at most once per update for the
+    # active-context delete path (declined-form case actually calls Gemini).
+    def test_router_called_at_most_once_per_update(self):
+        chat_id = 9765017
+        self._enter_expenses_context(chat_id)
+        expenses_list = [_expense_dict(317, Decimal("51.23"), description="тестова кава")]
+        with patch.object(bot, "get_recent_expenses_for_deletion", return_value=expenses_list):
+            with patch.object(bot, "_ask_gemini_expense_router", return_value=_delete_router_result([1])) as mock_router:
+                _call_webhook(_make_update(9765000020, chat_id, "Викресли тестову каву зі списку"))
+        self.assertEqual(mock_router.call_count, 1)
 
 
 if __name__ == "__main__":

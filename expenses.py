@@ -263,7 +263,18 @@ def _expense_report_gate(text):
     return None
 
 
-_EXPENSE_DELETE_VERBS = ("видали", "видалити", "скасуй", "скасувати", "прибери", "прибрати")
+# "викресли"/"викреслити" — an additional delete/cancel verb synonym, same
+# semantic slot as "видали"/"прибери" (shopping_action_planner.py's own
+# pre-gate already treats it as a "remove from a list" verb for the
+# shopping domain — see its _LIST_REMOVAL_VERB_ROOTS); added here too so the
+# SAME verb is recognized for expense deletion, not just shopping. Safe to
+# add to the GLOBAL gate below: it still only fires combined with "витрат"
+# or a _EXPENSE_FINANCIAL_REFERENCE_STEMS stem, and "покупок" deliberately
+# doesn't contain the "покупк" stem (see that constant's own comment), so
+# "Викресли хліб зі списку покупок" still never matches the global gate.
+_EXPENSE_DELETE_VERBS = (
+    "видали", "видалити", "скасуй", "скасувати", "прибери", "прибрати", "викресли", "викреслити",
+)
 
 # Financial-reference stems — a delete/cancel verb ALONE never triggers this
 # gate (see _expense_delete_command_gate's own docstring: "Скасуй зустріч"
@@ -327,6 +338,88 @@ def _expense_delete_command_gate(text):
     if "витрат" in lowered:
         return True
     return any(stem in lowered for stem in _EXPENSE_FINANCIAL_REFERENCE_STEMS)
+
+
+# Explicit shopping-list marker ("покупки"/"покупку"/"покупок" all share this
+# stem) — deliberately a DIFFERENT, broader stem than _EXPENSE_FINANCIAL_
+# REFERENCE_STEMS's "покупк" above, which exists for the opposite purpose
+# (recognizing "ту покупку" as a financial reference while NOT matching
+# "список покупок" — see that constant's own comment on the genitive-plural
+# quirk). This one is used only to detect when a message names the shopping
+# list BY NAME, so it can never be misread as an expense action even while
+# the active expenses submenu context is open (see
+# _looks_like_shopping_list_reference below).
+_EXPLICIT_SHOPPING_LIST_STEM = "покуп"
+
+
+def _looks_like_shopping_list_reference(text):
+    """True if `text` explicitly names the shopping list/purchases (e.g. "зі
+    списку покупок"), as opposed to just "the list" in general (e.g. "зі
+    списку", which — while the active expenses submenu context is open —
+    unambiguously means THIS, the expenses list currently on screen). Used
+    ONLY as a narrow domain-boundary guard by bot.py's active-expenses-
+    context route: a delete-like phrase that ALSO matches this must never be
+    read as an expense deletion, so that route falls through instead,
+    leaving room for the Shopping Action Planner (or any other later route)
+    to handle it. Never touches the database, never calls Gemini."""
+    if not isinstance(text, str):
+        return False
+    return _EXPLICIT_SHOPPING_LIST_STEM in text.strip().lower()
+
+
+def _expense_delete_active_context_gate(text):
+    """Looser delete-intent gate for use ONLY while the active expenses
+    submenu context is already open (active_list_context[chat_id] ==
+    "expenses") — see bot.py's _route_active_expenses_context, which checks
+    _looks_like_shopping_list_reference first. Unlike
+    _expense_delete_command_gate (which additionally requires the word
+    "витрат" or a financial-reference stem, since THAT gate fires from
+    anywhere and must stay unambiguous on its own), a bare delete/cancel
+    verb is enough here: being inside the expenses submenu already
+    establishes "this message is about an expense", exactly the same
+    reasoning _route_active_aliases_context's shared alias router already
+    relies on (no "alias" keyword required there either). Still never
+    itself identifies WHICH expense, never returns a DB id, never deletes
+    anything, never bypasses preview — same GATE BOUNDARY as
+    _expense_delete_command_gate.
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped == "🗑️ Видалити витрату":
+        return True
+    lowered = stripped.lower()
+    return any(verb in lowered for verb in _EXPENSE_DELETE_VERBS)
+
+
+_EXPENSE_DELETE_LEADING_VERB_RE = re.compile(
+    r"^(?:" + "|".join(_EXPENSE_DELETE_VERBS) + r")\s+(?:витрат[ауи]\s+)?", re.IGNORECASE,
+)
+_EXPENSE_DELETE_TRAILING_LIST_RE = re.compile(
+    r"\s+(?:з|зі|із)\s+списк[ау](?:\s+витрат)?\s*$", re.IGNORECASE,
+)
+
+
+def _strip_delete_command_wrapper(text):
+    """Strip a recognized leading delete/cancel verb and a trailing "зі
+    списку"/"із списку(...витрат)" phrase, if present — used ONLY to widen
+    _find_exact_expense_match's existing local (no-Gemini) exact-name fast
+    path, so a full sentence like "Викресли тестова кава зі списку" can
+    still exactly match the bare description "тестова кава" it's already
+    comparing against, without loosening that comparison itself (still exact
+    equality, never fuzzy). Same plain-regex-strip technique
+    _clean_expense_description already uses for the opposite (add-expense)
+    direction — not a parser, not a second matcher. Never applied on the
+    Gemini fallback path, which already handles full sentences (and
+    declined forms like "тестову каву") on its own.
+    """
+    if not isinstance(text, str):
+        return text
+    stripped = _EXPENSE_DELETE_LEADING_VERB_RE.sub("", text.strip())
+    stripped = _EXPENSE_DELETE_TRAILING_LIST_RE.sub("", stripped)
+    return stripped.strip()
 
 
 # =========================
@@ -799,17 +892,25 @@ def _normalize_expense_match_text(s):
 def _find_exact_expense_match(text, recent_expenses):
     """Local (no-Gemini) exact-name match against the SAME label already
     shown on screen by _format_expense_delete_list (description, falling
-    back to category). Returns the single matching expense dict, or None if
-    there is no match or more than one — deliberately never fuzzy, so a
-    phrase like "Видали Biedronka 86,40 zł" (which never equals a bare
-    label exactly) still falls through to the Gemini-based resolution below.
+    back to category). Tries both the raw text AND the same text with a
+    recognized delete-verb/"зі списку" wrapper stripped (see
+    _strip_delete_command_wrapper) — so a bare "тестова кава" (numbered-
+    selection mode) AND a full sentence like "Викресли тестова кава зі
+    списку" (active expenses-context free text) both get a fast, no-Gemini
+    match against the exact same label. Returns the single matching expense
+    dict, or None if there is no match or more than one — deliberately
+    never fuzzy: a declined phrase like "Видали Biedronka 86,40 zł" or
+    "Викресли тестову каву зі списку" (which never equals a bare label
+    exactly, wrapper stripped or not) still falls through to the Gemini-
+    based resolution below.
     """
-    target = _normalize_expense_match_text(text)
-    if not target:
+    candidates = {_normalize_expense_match_text(text), _normalize_expense_match_text(_strip_delete_command_wrapper(text))}
+    candidates.discard("")
+    if not candidates:
         return None
     matches = [
         exp for exp in recent_expenses
-        if _normalize_expense_match_text(exp.get("description") or exp.get("category") or "") == target
+        if _normalize_expense_match_text(exp.get("description") or exp.get("category") or "") in candidates
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -888,10 +989,21 @@ def _handle_expense_delete_button(chat_id, user_id, display_name):
 
 
 def _handle_expense_delete_global_command(chat_id, user_id, display_name, text):
-    """Global expense-delete gate handler — fetches a fresh recent-expenses
+    """Free-text expense-delete handler — fetches a fresh recent-expenses
     list (there is no pre-shown numbered list yet) and resolves it via the
-    expense router. Falls back to showing the list and entering selection
-    mode if ambiguous, exactly like the dedicated button does."""
+    expense router, given that live list as candidates. Falls back to
+    showing the list and entering selection mode if ambiguous, exactly like
+    the dedicated button does.
+
+    Two callers: bot.py's global expense-delete gate route
+    (_expense_delete_command_gate matched, chat anywhere) AND bot.py's
+    active-expenses-context route (_expense_delete_active_context_gate
+    matched, active_list_context[chat_id]=="expenses") — both need the
+    exact same "fetch live candidates, resolve, preview" behavior, so the
+    active-context route reuses this function directly instead of
+    duplicating it. _current_expense_origin(chat_id) below already resolves
+    correctly for either caller.
+    """
     origin = _current_expense_origin(chat_id)
     keyboard = _expense_origin_keyboard(origin)
     try:

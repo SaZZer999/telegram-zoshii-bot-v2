@@ -1451,6 +1451,9 @@ def _alias_command_gate(text):
 _expense_command_gate = expenses._expense_command_gate
 _expense_report_gate = expenses._expense_report_gate
 _expense_delete_command_gate = expenses._expense_delete_command_gate
+# Active-expenses-context delete fix — re-exported here, same pattern.
+_expense_delete_active_context_gate = expenses._expense_delete_active_context_gate
+_looks_like_shopping_list_reference = expenses._looks_like_shopping_list_reference
 
 
 def _handle_alias_command(chat_id, user_id, display_name, text):
@@ -5077,9 +5080,46 @@ def _route_global_alias_command(chat_id, user_id, display_name, text):
 
 
 def _route_active_expenses_context(chat_id, user_id, display_name, text):
-    """Same None/True/False contract as _route_active_aliases_context."""
+    """Same None/True/False contract as _route_active_aliases_context.
+
+    Fixes a live bug: inside the active expenses submenu, a natural-language
+    delete request ("Викресли тестова кава зі списку") used to be handed
+    straight to _handle_expense_command — the ADD-oriented router, which
+    calls the Gemini expense router WITHOUT the household's recent-expenses
+    list. Gemini then couldn't resolve which expense was meant and returned
+    an unresolved_fragment describing exactly that ("Не надано список
+    останніх витрат..."), which _handle_expense_command surfaced verbatim as
+    if it were a real parsing failure.
+
+    Two additions, both reusing existing expense-domain building blocks
+    (see expenses.py, no new parser/executor):
+    1. _looks_like_shopping_list_reference(text) — a narrow domain-boundary
+       check. If the message explicitly names the SHOPPING list ("зі списку
+       покупок"), this route returns None (falls through) instead of ever
+       treating it as an expense action — even though this context is
+       active — leaving global_expense_command and then the Shopping Action
+       Planner a chance to claim it.
+    2. _expense_delete_active_context_gate(text) — a looser, context-scoped
+       version of _expense_delete_command_gate (no "витрат"/financial-
+       reference word required, since being inside the expenses submenu
+       already establishes that). A match delegates to
+       _handle_expense_delete_global_command, the SAME free-text expense-
+       delete handler the global gate already uses — which fetches the
+       household's LIVE recent-expenses list and resolves it through the
+       existing _resolve_expense_delete_selection (local exact-match first,
+       then the Gemini router WITH that list as candidates) — producing the
+       existing expense-delete preview instead of the add-oriented router's
+       generic "не зрозумів" message.
+    Anything else (no delete verb, no shopping-list reference) is unchanged:
+    handed to _handle_expense_command exactly as before.
+    """
     if active_list_context.get(chat_id) != "expenses":
         return None
+    if _looks_like_shopping_list_reference(text):
+        return None
+    if _expense_delete_active_context_gate(text):
+        _handle_expense_delete_global_command(chat_id, user_id, display_name, text)
+        return True
     return _handle_expense_command(chat_id, user_id, display_name, text)
 
 
