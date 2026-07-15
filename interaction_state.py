@@ -48,6 +48,10 @@ class InteractionStateDeps:
     pending_expense: dict
     pending_expense_delete: dict
     expense_delete_selection: dict
+    # expenses.py-owned — Expense Batch Delete V1 (2+ resolved delete targets
+    # awaiting confirm/cancel; a single resolved target still uses
+    # pending_expense_delete above, unchanged)
+    pending_expense_batch_delete: dict
     # bot.py-owned cross-cutting pending states
     pending_merge: dict
     pending_saved_edit: dict
@@ -147,9 +151,12 @@ def _expense_gate_blocking_states(deps):
     must never override an alias preview or a deletion in progress: per
     spec, those have priority over a new "add expense" command.
     pending_expense's own state is deliberately excluded, same reasoning as
-    the alias gate excluding its own."""
+    the alias gate excluding its own. Includes pending_expense_batch_delete
+    (Expense Batch Delete V1) — an in-progress batch deletion blocks a new
+    "add expense" command exactly like a single-target deletion already does."""
     return _alias_gate_blocking_states(deps) + (
         deps.pending_alias_action, deps.pending_expense_delete, deps.expense_delete_selection,
+        deps.pending_expense_batch_delete,
     )
 
 
@@ -176,12 +183,14 @@ def _expense_delete_gate_blocking_states(deps):
 
 
 def _active_expense_preview_states(deps):
-    """The two states an unconfirmed expense preview can be in —
-    deliberately excludes expense_delete_selection (the earlier "pick a
-    number" stage, which already has its own correct handling: any text
-    there resolves against the shown list, and that behavior is unchanged
-    by this guard)."""
-    return (deps.pending_expense, deps.pending_expense_delete)
+    """The states an unconfirmed expense preview can be in — deliberately
+    excludes expense_delete_selection (the earlier "pick a number" stage,
+    which already has its own correct handling: any text there resolves
+    against the shown list, and that behavior is unchanged by this guard).
+    Includes pending_expense_batch_delete (Expense Batch Delete V1) — an
+    unconfirmed batch-delete preview blocks new plain text exactly like a
+    single add/delete preview already does."""
+    return (deps.pending_expense, deps.pending_expense_delete, deps.pending_expense_batch_delete)
 
 
 def has_blocking_pending_state(deps, chat_id):

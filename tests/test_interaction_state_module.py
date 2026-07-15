@@ -49,6 +49,7 @@ def _make_fake_deps(**overrides):
         pending_expense={},
         pending_expense_delete={},
         expense_delete_selection={},
+        pending_expense_batch_delete={},
         pending_merge={},
         pending_saved_edit={},
         pending_quick_purchase={},

@@ -856,6 +856,15 @@ class TestActiveExpensesContextDeleteFix(unittest.TestCase):
         self.assertEqual(bot.pending_expense_delete[chat_id]["expense_id"], 313)
 
     # 13 — no matching candidate at all: controlled message, no guess.
+    # Expense Batch Delete V1: the ambiguous-fallback candidate list is now
+    # relevance-filtered (see expenses._filter_relevant_expense_candidates)
+    # instead of always showing the full, unfiltered recent-expenses list —
+    # "неіснуючу" shares no token with "Подарунок доньці" and carries no
+    # amount, so zero candidates are relevant and the controlled "не
+    # знайшов" message is shown instead of a numbered list of unrelated
+    # expenses (this replaces the pre-V1 assertion, which asserted the old
+    # unfiltered-list behavior as correct — same pattern as cc50495's own
+    # test replacement).
     def test_no_matching_candidate_returns_controlled_message(self):
         chat_id = 9765009
         self._enter_expenses_context(chat_id)
@@ -866,9 +875,11 @@ class TestActiveExpensesContextDeleteFix(unittest.TestCase):
                     _call_webhook(_make_update(9765000011, chat_id, "Викресли неіснуючу витрату зі списку"))
                     mock_delete.assert_not_called()
         self.assertNotIn(chat_id, bot.pending_expense_delete)
+        self.assertNotIn(chat_id, bot.expense_delete_selection)
         sent = self._sent_texts()
         self.assertFalse(any("Не надано список останніх витрат" in t for t in sent))
-        self.assertTrue(any("Яку витрату видалити?" in t for t in sent))
+        self.assertFalse(any("Подарунок доньці" in t for t in sent))
+        self.assertTrue(any("Не знайшов витрати, схожої на" in t for t in sent))
 
     # 14 — empty expense list: controlled message, no crash.
     def test_empty_expense_list_returns_controlled_message(self):

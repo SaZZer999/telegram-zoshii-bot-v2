@@ -52,6 +52,7 @@ from database import (
     get_expense_day_total,
     get_recent_expenses_for_deletion,
     delete_expense,
+    delete_expenses_batch,
     apply_global_household_operations,
     get_latest_undoable_action,
     apply_undo_action,
@@ -266,6 +267,7 @@ pending_destructive_guard = {}  # chat_id -> {"origin": origin}
 pending_expense = expenses.pending_expense
 pending_expense_delete = expenses.pending_expense_delete
 expense_delete_selection = expenses.expense_delete_selection
+pending_expense_batch_delete = expenses.pending_expense_batch_delete
 # Global Household Router v1 — pending state lives in bot.py (household_router.py
 # owns no Telegram/pending state of its own, see its module docstring).
 pending_global_household = {}  # chat_id -> {add_shopping_items, add_inventory_items,
@@ -4929,6 +4931,7 @@ _interaction_state_deps = interaction_state.InteractionStateDeps(
     pending_expense=pending_expense,
     pending_expense_delete=pending_expense_delete,
     expense_delete_selection=expense_delete_selection,
+    pending_expense_batch_delete=pending_expense_batch_delete,
     pending_merge=pending_merge,
     pending_saved_edit=pending_saved_edit,
     pending_quick_purchase=pending_quick_purchase,
@@ -5851,7 +5854,10 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
             alias_data = pending_alias_action.pop(chat_id, None)
             origin = (alias_data or {}).get("origin", "global")
             send_message(chat_id, "Дію з домашніми назвами скасовано.", reply_markup=_alias_origin_keyboard(origin))
-        elif chat_id in pending_expense or chat_id in pending_expense_delete or chat_id in expense_delete_selection:
+        elif (
+            chat_id in pending_expense or chat_id in pending_expense_delete
+            or chat_id in expense_delete_selection or chat_id in pending_expense_batch_delete
+        ):
             expenses.handle_cancel(chat_id)
         elif chat_id in pending_global_household:
             data = pending_global_household.pop(chat_id, None)
@@ -5978,6 +5984,8 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
                 send_message(chat_id, "Ця дія вже не актуальна. Спробуй ще раз.", reply_markup=_alias_origin_keyboard(origin))
         elif chat_id in pending_expense_delete:
             expenses.handle_delete_confirm(chat_id)
+        elif chat_id in pending_expense_batch_delete:
+            expenses.handle_batch_delete_confirm(chat_id)
         else:
             send_message(chat_id, "Немає активної дії для підтвердження.")
         return True

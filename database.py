@@ -915,6 +915,59 @@ def delete_expense(household_id, expense_id, snapshot):
         conn.commit()
 
 
+def _verify_expense_targets_in_tx(cur, household_id, snapshots):
+    """Re-read each target expense row inside the caller's open transaction
+    and lock it (FOR UPDATE) so no concurrent write can slip in before this
+    transaction commits. Raises StaleSnapshotError if any target row is
+    missing or its amount/category/expense_date/description no longer match
+    the snapshot captured when the batch-delete preview was built — same
+    per-row field comparison delete_expense's own single-row version already
+    uses, generalized to N rows in one round trip. Aborting here rolls back
+    the WHOLE batch (delete_expenses_batch never deletes anything before
+    calling this), never a partial delete. No-ops for an empty snapshot
+    list. snapshots: list of {id, amount, category, expense_date, description}.
+    """
+    if not snapshots:
+        return
+    ids = [s["id"] for s in snapshots]
+    placeholders = ",".join(["%s"] * len(ids))
+    cur.execute(
+        f"SELECT id, amount, category, expense_date, description FROM expenses "
+        f"WHERE id IN ({placeholders}) AND household_id=%s FOR UPDATE",
+        list(ids) + [household_id],
+    )
+    current = {row[0]: (row[1], row[2], row[3], (row[4] or None)) for row in cur.fetchall()}
+    for s in snapshots:
+        seen = current.get(s["id"])
+        if seen is None or seen != (s["amount"], s["category"], s["expense_date"], (s.get("description") or None)):
+            raise StaleSnapshotError()
+
+
+def delete_expenses_batch(household_id, expense_ids, snapshots):
+    """Delete multiple expense rows in ONE transaction (Expense Batch Delete
+    V1): every target row is re-verified (locked FOR UPDATE, snapshot-
+    matched via _verify_expense_targets_in_tx) before anything is deleted —
+    one stale/changed/missing row aborts the WHOLE batch, nothing deleted at
+    all, same all-or-nothing contract delete_expense's single-row version
+    already has. Returns the count of deleted rows. A second call with the
+    same already-deleted ids raises StaleSnapshotError (the rows are simply
+    gone), so a repeated confirm can never delete twice.
+    """
+    if not expense_ids:
+        return 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            _verify_expense_targets_in_tx(cur, household_id, snapshots)
+            placeholders = ",".join(["%s"] * len(expense_ids))
+            cur.execute(
+                f"DELETE FROM expenses WHERE id IN ({placeholders}) AND household_id = %s",
+                list(expense_ids) + [household_id]
+            )
+            count = cur.rowcount
+        conn.commit()
+    return count
+
+
 def add_shopping_item(household_id, name, quantity_text, created_by_user_id):
     with get_connection() as conn:
         with conn.cursor() as cur:

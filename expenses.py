@@ -53,12 +53,21 @@ def configure(bot_module, active_list_context_dict, main_keyboard):
 pending_expense = {}          # chat_id -> {household_id, user_db_id, amount, currency, category, description, expense_date, origin}
 pending_expense_delete = {}   # chat_id -> {expense_id, household_id, snapshot: {amount, category, expense_date, description}, origin}
 expense_delete_selection = {}  # chat_id -> {household_id, user_db_id, expenses: [snapshot list from get_recent_expenses_for_deletion], origin}
+# Expense Batch Delete V1 — chat_id -> {household_id, expense_ids: [id,...],
+# snapshots: [{id, amount, category, expense_date, description}, ...] (same
+# per-row shape delete_expense's own `snapshot` uses, one per target),
+# total: Decimal, origin}. Used ONLY when 2+ targets resolve unambiguously
+# in the same command (see _resolve_expense_targets/_build_batch_delete_
+# preview below) — a single resolved target still goes through the existing
+# pending_expense_delete/_build_delete_preview_from_match path unchanged.
+pending_expense_batch_delete = {}
 
 
 def clear_expense_state(chat_id):
     pending_expense.pop(chat_id, None)
     pending_expense_delete.pop(chat_id, None)
     expense_delete_selection.pop(chat_id, None)
+    pending_expense_batch_delete.pop(chat_id, None)
 
 
 # =========================
@@ -119,8 +128,8 @@ EXPENSE_ROUTER_PROMPT = (
     "нумерований список останніх записаних витрат (номер, дата, опис, сума, категорія).\n"
     "Визнач намір (intent):\n"
     "- «create_expense» — повідомлення описує одну НОВУ конкретну витрату з сумою в злотих\n"
-    "- «delete_expense» — користувач хоче видалити/скасувати ОДНУ вже записану витрату зі списку останніх "
-    "витрат, наданого нижче (напр. «Видали витрату за булочку 4 zł», «Скасуй витрату Biedronka», «2»)\n"
+    "- «delete_expense» — користувач хоче видалити/скасувати ОДНУ або КІЛЬКА вже записаних витрат "
+    "(напр. «Видали витрату за булочку 4 zł», «Скасуй витрату Biedronka», «2», «Видали каву і булочку»)\n"
     "- «none» — повідомлення не описує ні нову витрату, ні видалення існуючої\n\n"
     "Для create_expense поверни:\n"
     "- amount — сума як рядок з крапкою або комою (наприклад «86.40» або «86,40»); ніколи не округлюй "
@@ -131,25 +140,44 @@ EXPENSE_ROUTER_PROMPT = (
     "- description — короткий опис (назва магазину/товару/послуги), без суми й категорії всередині тексту\n"
     "- expense_date — дата у форматі YYYY-MM-DD; якщо в тексті не вказано дату явно — використовуй сьогоднішню "
     "дату з наданого контексту; ніколи не вигадуй дату в майбутньому\n\n"
-    "Для delete_expense поверни selected_numbers — масив номерів позицій з наданого списку останніх витрат, "
-    "які відповідають описаній витраті: якщо підходить рівно одна позиція — один номер; якщо запит "
-    "неоднозначний (може підходити кілька позицій) або жодна позиція явно не підходить — залиш "
-    "selected_numbers порожнім масивом і опиши це в unresolved_fragments. Ніколи не вигадуй номер, якого "
-    "немає у наданому списку, і ніколи не повертай більше одного номера.\n\n"
+    "Для delete_expense поверни ОБИДВА поля:\n"
+    "- targets — масив від 1 до 10 об'єктів, по одному на КОЖНУ витрату, яку користувач хоче видалити, "
+    "ВИТЯГНУТИЙ БЕЗПОСЕРЕДНЬО З ТЕКСТУ ПОВІДОМЛЕННЯ (не з наданого нумерованого списку — той призначений лише "
+    "для selected_numbers нижче): кожен об'єкт — {\"description\": короткий опис/назва з тексту (без суми), "
+    "\"amount\": сума як рядок з крапкою або комою, якщо явно вказана для цієї конкретної позиції, інакше null, "
+    "\"date_hint\": дата у форматі YYYY-MM-DD лише якщо явно вказана в тексті для цієї позиції, інакше null}. "
+    "Кома, «і», «та», «а також» між назвами означають ОКРЕМІ елементи масиву (напр. «Видали тест чай, тест "
+    "каву і тест еспресо» -> 3 елементи, «Видали каву за 14 zł та булочку» -> 2 елементи). Якщо повідомлення "
+    "— це просто номер чи порядкове посилання на позицію з наданого списку («2», «другу», «останню в списку») "
+    "— залиш targets порожнім масивом.\n"
+    "- selected_numbers — масив номерів позицій з наданого нумерованого списку останніх витрат, лише коли "
+    "повідомлення явно посилається на номер/порядкову позицію зі списку, а НЕ називає витрату(и) описом; "
+    "інакше залиш порожнім масивом. Ніколи не вигадуй номер, якого немає у наданому списку.\n"
+    "Якщо жодного опису чи номера видалити неможливо виділити — залиш і targets, і selected_numbers порожніми "
+    "масивами й опиши причину в unresolved_fragments.\n\n"
     "Якщо в повідомленні немає жодної явної суми в злотих і воно явно не про видалення існуючої витрати — "
     "поверни «none». Якщо щось важливе неоднозначне чи суперечливе — додай короткий опис незрозумілого "
     "фрагмента в unresolved_fragments (масив рядків) замість того, щоб вгадувати.\n"
     "Відповідай ТІЛЬКИ валідним JSON, без Markdown і без тексту поза JSON:\n"
     "{\"intent\": \"create_expense\", \"amount\": \"86.40\", \"currency\": \"PLN\", \"category\": \"Продукти\", "
-    "\"description\": \"Biedronka\", \"expense_date\": \"2026-07-03\", \"selected_numbers\": [], "
+    "\"description\": \"Biedronka\", \"expense_date\": \"2026-07-03\", \"targets\": [], \"selected_numbers\": [], "
     "\"unresolved_fragments\": []}\n"
-    "Приклад delete_expense (зі списком «1. 03.07 — Булочка — 4,00 zł [Продукти]», "
-    "«2. 03.07 — Biedronka — 86,40 zł [Продукти]» і повідомленням «Видали булочку 4 zł»):\n"
+    "Приклад delete_expense за номером (зі списком «1. 03.07 — Булочка — 4,00 zł [Продукти]», "
+    "«2. 03.07 — Biedronka — 86,40 zł [Продукти]» і повідомленням «2»):\n"
     "{\"intent\": \"delete_expense\", \"amount\": null, \"currency\": null, \"category\": null, "
-    "\"description\": null, \"expense_date\": null, \"selected_numbers\": [1], \"unresolved_fragments\": []}\n"
+    "\"description\": null, \"expense_date\": null, \"targets\": [], \"selected_numbers\": [2], "
+    "\"unresolved_fragments\": []}\n"
+    "Приклад delete_expense за описом, кілька позицій одним повідомленням («Видали тест чай batch, тест кава "
+    "batch і тест еспресо batch»):\n"
+    "{\"intent\": \"delete_expense\", \"amount\": null, \"currency\": null, \"category\": null, "
+    "\"description\": null, \"expense_date\": null, \"targets\": ["
+    "{\"description\": \"тест чай batch\", \"amount\": null, \"date_hint\": null}, "
+    "{\"description\": \"тест кава batch\", \"amount\": null, \"date_hint\": null}, "
+    "{\"description\": \"тест еспресо batch\", \"amount\": null, \"date_hint\": null}], "
+    "\"selected_numbers\": [], \"unresolved_fragments\": []}\n"
     "Приклад none:\n"
     "{\"intent\": \"none\", \"amount\": null, \"currency\": null, \"category\": null, \"description\": null, "
-    "\"expense_date\": null, \"selected_numbers\": [], \"unresolved_fragments\": []}"
+    "\"expense_date\": null, \"targets\": [], \"selected_numbers\": [], \"unresolved_fragments\": []}"
 )
 
 # =========================
@@ -430,7 +458,7 @@ def _strip_delete_command_wrapper(text):
 # =========================
 _EXPENSE_ROUTER_FALLBACK = {
     "intent": "none", "amount": None, "currency": None, "category": None,
-    "description": None, "expense_date": None, "selected_numbers": [], "unresolved_fragments": [],
+    "description": None, "expense_date": None, "targets": [], "selected_numbers": [], "unresolved_fragments": [],
 }
 
 
@@ -471,6 +499,7 @@ def _ask_gemini_expense_router(user_text, recent_expenses=None):
             "category": data.get("category"),
             "description": data.get("description"),
             "expense_date": data.get("expense_date"),
+            "targets": data.get("targets") if isinstance(data.get("targets"), list) else [],
             "selected_numbers": data.get("selected_numbers") if isinstance(data.get("selected_numbers"), list) else [],
             "unresolved_fragments": data.get("unresolved_fragments") if isinstance(data.get("unresolved_fragments"), list) else [],
         }
@@ -586,11 +615,54 @@ def _clean_expense_description(raw_description):
     return cleaned[:EXPENSE_DESCRIPTION_MAX_LEN]
 
 
+# Expense Batch Delete V1 — allowlist of fields Python trusts per target;
+# any other key on a target object (a DB id, SQL, an executor name, ...)
+# makes the WHOLE targets array rejected (falls back to selected_numbers,
+# see _validate_expense_router_result) rather than silently dropped, same
+# "unknown field -> whole thing unsupported" discipline Preview Edit
+# Planner V2 already uses for its own Gemini-sourced patch objects.
+_EXPENSE_TARGET_ALLOWED_KEYS = {"description", "amount", "date_hint"}
+
+
+def _validate_expense_delete_targets(raw_targets):
+    """Validate the router's raw `targets` array for a delete_expense
+    intent. Returns a list of 1-10 {"description": str, "amount":
+    Decimal|None, "date_hint": date|None} dicts, or None if the shape is
+    unusable (missing/not a list/empty/>10 entries/any entry with an
+    unknown field or with neither a usable description nor amount) — never
+    partially accepts a malformed batch. Gemini never supplies a DB id here
+    (see EXPENSE_ROUTER_PROMPT) — every target is resolved against LIVE
+    expenses in Python (_resolve_expense_targets), never trusted directly.
+    """
+    if not isinstance(raw_targets, list) or not (1 <= len(raw_targets) <= 10):
+        return None
+    validated = []
+    for raw in raw_targets:
+        if not isinstance(raw, dict) or not set(raw.keys()) <= _EXPENSE_TARGET_ALLOWED_KEYS:
+            return None
+        raw_description = raw.get("description")
+        description = raw_description.strip()[:EXPENSE_DESCRIPTION_MAX_LEN] if isinstance(raw_description, str) else ""
+        raw_amount = raw.get("amount")
+        amount = _parse_expense_amount(raw_amount) if raw_amount is not None else None
+        raw_date_hint = raw.get("date_hint")
+        date_hint = _validate_expense_date(raw_date_hint) if isinstance(raw_date_hint, str) and raw_date_hint.strip() else None
+        if not description and amount is None:
+            return None
+        validated.append({"description": description, "amount": amount, "date_hint": date_hint})
+    return validated
+
+
 def _validate_expense_router_result(router_result, now=None):
     """Pure decision logic for the expense router's JSON. Returns one of:
       ("unresolved", [fragment,...])  -- blocks preview regardless of intent
       ("ok", payload)                 -- payload: amount/currency/category/
                                           category_was_defaulted/description/expense_date
+      ("delete_targets", [target,...]) -- delete_expense intent with a usable
+                                          `targets` array (Expense Batch Delete
+                                          V1) — still to be resolved against
+                                          live expenses by the caller
+                                          (_resolve_expense_targets), never a
+                                          DB id from Gemini
       ("delete", [number,...])        -- delete_expense intent; raw selected_numbers,
                                           still to be matched against the shown list by the caller
       ("invalid", None)               -- create_expense/delete_expense with unusable fields
@@ -603,6 +675,9 @@ def _validate_expense_router_result(router_result, now=None):
             return "unresolved", cleaned
     intent = router_result.get("intent")
     if intent == "delete_expense":
+        targets = _validate_expense_delete_targets(router_result.get("targets"))
+        if targets is not None:
+            return "delete_targets", targets
         numbers = router_result.get("selected_numbers")
         return ("delete", numbers) if isinstance(numbers, list) else ("invalid", None)
     if intent != "create_expense":
@@ -920,8 +995,10 @@ def _find_exact_expense_match(text, recent_expenses):
 
 def _build_delete_preview_from_match(chat_id, household_id, origin, expense):
     """Shared final step once exactly one expense has been identified for
-    deletion, whether by the local exact-name match or by the Gemini router —
-    builds the pending_expense_delete preview and exits selection mode."""
+    deletion, whether by the local exact-name match, the Gemini router's
+    selected_numbers, or a single resolved Expense Batch Delete V1 target —
+    builds the pending_expense_delete preview and exits selection mode /
+    clears any stale batch-delete preview for this chat."""
     pending_expense_delete[chat_id] = {
         "expense_id": expense["id"], "household_id": household_id,
         "snapshot": {
@@ -931,19 +1008,245 @@ def _build_delete_preview_from_match(chat_id, household_id, origin, expense):
         "origin": origin,
     }
     expense_delete_selection.pop(chat_id, None)
+    pending_expense_batch_delete.pop(chat_id, None)
     _bot.send_message(chat_id, _format_expense_delete_preview(expense), reply_markup=EXPENSE_DELETE_PREVIEW_KEYBOARD)
 
 
+# =========================
+# EXPENSE BATCH DELETE V1 — RELEVANCE FILTERING + TARGET RESOLUTION
+# =========================
+# Generic filler that names the ACT of deleting a financial record (verb,
+# "витрату"/"витрати", prepositions, "the last one"/"that one" demonstratives)
+# rather than describing WHICH record — stripped before token-overlap
+# matching so a message like "Прибери останній платіж" (no product name at
+# all) is correctly treated as "no description signal" (falls back to
+# amount/date alone, or — with neither — every live candidate stays
+# relevant, same as today) instead of matching nothing at all.
+_EXPENSE_QUERY_STOPWORDS = frozenset(_EXPENSE_DELETE_VERBS) | frozenset({
+    "видали", "витрату", "витрати", "витрата", "витрат",
+    "за", "на", "зі", "із", "з", "списку", "список",
+    "останній", "останню", "останнє", "останні", "остання",
+    "ту", "той", "ті", "цю", "цей", "ці", "саму", "самого",
+})
+
+
+def _expense_query_tokens(text):
+    """Tokenize free text for relevance matching against expense
+    descriptions: strip amount+currency spans (reuses
+    _EXPENSE_DESCRIPTION_AMOUNT_SPAN_RE), normalize punctuation, then drop
+    _EXPENSE_QUERY_STOPWORDS and any word starting with a
+    _EXPENSE_FINANCIAL_REFERENCE_STEMS stem (declined forms of
+    "покупку"/"платіж"/"транзакцію"/"чек"/"списання" — generic names for
+    "a financial operation", never a specific one). What's left is the
+    actual product/description signal, if any — an empty result means "no
+    description signal at all", so callers fall back to amount/date alone
+    (see _expense_candidate_relevant)."""
+    if not isinstance(text, str):
+        return set()
+    stripped = _EXPENSE_DESCRIPTION_AMOUNT_SPAN_RE.sub(" ", text)
+    normalized = _normalize_expense_match_text(stripped)
+    tokens = set()
+    for word in normalized.split():
+        if word in _EXPENSE_QUERY_STOPWORDS:
+            continue
+        if any(word.startswith(stem) for stem in _EXPENSE_FINANCIAL_REFERENCE_STEMS):
+            continue
+        tokens.add(word)
+    return tokens
+
+
+def _expense_label_tokens(expense):
+    label = expense.get("description") or expense.get("category") or ""
+    return set(_normalize_expense_match_text(label).split())
+
+
+def _expense_candidate_relevant(query_tokens, query_amount, query_date, candidate):
+    """A candidate is relevant if it agrees with every EXPLICIT signal the
+    query provides (amount, date) and — when the query has actual
+    description tokens (product/description words, not just filler) — its
+    normalized description/category shares them (subset match, either
+    direction, tolerating a shorter label or a slightly longer query). A
+    query with NO description tokens defers entirely to amount/date (or, if
+    neither was given either, matches everything — nothing left to
+    disagree with, same as showing the plain recent list today)."""
+    if query_amount is not None and candidate.get("amount") != query_amount:
+        return False
+    if query_date is not None and candidate.get("expense_date") != query_date:
+        return False
+    if not query_tokens:
+        return True
+    label_tokens = _expense_label_tokens(candidate)
+    if not label_tokens:
+        return False
+    return query_tokens <= label_tokens or label_tokens <= query_tokens
+
+
+def _filter_relevant_expense_candidates(text, candidates, amount=None, date_hint=None):
+    """Deterministic relevance filter (Expense Batch Delete V1) — the fuzzy
+    fallback tier used once an exact canonical-description match has
+    already failed. Never shows a candidate with no plausible connection to
+    `text`/`amount`/`date_hint` just because it happened to be recent."""
+    query_tokens = _expense_query_tokens(text)
+    return [exp for exp in candidates if _expense_candidate_relevant(query_tokens, amount, date_hint, exp)]
+
+
+def _resolve_single_target(description, amount, date_hint, pool):
+    """Resolve one Expense Batch Delete V1 target against `pool` (live
+    candidates not yet claimed by an earlier target in the same batch).
+    Tier 1: exact canonical-description match (same normalization as
+    _find_exact_expense_match), narrowed by amount/date if given — always
+    wins over the fuzzy tier when it uniquely resolves. Tier 2: relevance-
+    filtered token-overlap match. Returns (status, result): ("found", expense)
+    / ("ambiguous", [expense,...]) / ("missing", [])."""
+    normalized_target = _normalize_expense_match_text(description)
+    exact = [
+        exp for exp in pool
+        if _normalize_expense_match_text(exp.get("description") or exp.get("category") or "") == normalized_target
+        and (amount is None or exp.get("amount") == amount)
+        and (date_hint is None or exp.get("expense_date") == date_hint)
+    ] if normalized_target else []
+    if len(exact) == 1:
+        return "found", exact[0]
+    if len(exact) > 1:
+        return "ambiguous", exact
+    relevant = _filter_relevant_expense_candidates(description, pool, amount=amount, date_hint=date_hint)
+    if len(relevant) == 1:
+        return "found", relevant[0]
+    if len(relevant) > 1:
+        return "ambiguous", relevant
+    return "missing", []
+
+
+def _resolve_expense_targets(targets, candidates):
+    """Resolve every Expense Batch Delete V1 target against live
+    `candidates`, in order — a candidate row resolved by an earlier target
+    is removed from the pool before the next target is resolved, so the
+    same expense can never be selected twice in one batch. Returns
+    {"resolved": [expense,...] in target order, "missing": [citation,...],
+    "ambiguous": [(citation, [expense,...]), ...]} — never itself decides
+    all-or-nothing (see _handle_resolved_targets)."""
+    pool = list(candidates)
+    resolved, missing, ambiguous = [], [], []
+    for t in targets:
+        citation = t["description"] or _format_expense_amount(t["amount"])
+        status, result = _resolve_single_target(t["description"], t.get("amount"), t.get("date_hint"), pool)
+        if status == "found":
+            resolved.append(result)
+            pool = [exp for exp in pool if exp["id"] != result["id"]]
+        elif status == "ambiguous":
+            ambiguous.append((citation, result))
+        else:
+            missing.append(citation)
+    return {"resolved": resolved, "missing": missing, "ambiguous": ambiguous}
+
+
+def _format_batch_delete_preview(expenses_list, total):
+    lines = ["💸 Видалити витрати?", ""]
+    for exp in expenses_list:
+        label = exp["description"] or exp["category"]
+        lines.append(f"• {label} — {_format_expense_amount(exp['amount'])}")
+    lines.append("")
+    lines.append(f"Разом: {_format_expense_amount(total)}")
+    return "\n".join(lines)
+
+
+def _format_batch_delete_missing_message(missing_citations, resolved_expenses):
+    lines = ["Не вдалося підготувати видалення всіх витрат.", "", "Не знайдено:"]
+    lines.extend(f"• {citation}" for citation in missing_citations)
+    if resolved_expenses:
+        lines.append("")
+        lines.append("Знайдено, але нічого не буде видалено до повного уточнення:")
+        for exp in resolved_expenses:
+            label = exp["description"] or exp["category"]
+            lines.append(f"• {label} — {_format_expense_amount(exp['amount'])}")
+    return "\n".join(lines)
+
+
+def _format_ambiguous_targets_message(ambiguous):
+    blocks = []
+    for citation, candidates in ambiguous:
+        lines = [f"Потрібно уточнити «{citation}»:", ""]
+        for i, exp in enumerate(candidates, start=1):
+            label = exp["description"] or exp["category"]
+            lines.append(f"{i}. {label} — {_format_expense_amount(exp['amount'])}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _format_no_relevant_candidate_message(text):
+    citation = _strip_delete_command_wrapper(text).strip() or (text or "").strip()
+    return f"Не знайшов витрати, схожої на «{citation}»."
+
+
+def _build_batch_delete_preview(chat_id, household_id, origin, expenses_list):
+    """All-or-nothing batch preview (Expense Batch Delete V1) — used ONLY
+    once every target in a multi-target command has resolved to exactly one
+    live expense (see _handle_resolved_targets); a single resolved target
+    still goes through _build_delete_preview_from_match unchanged."""
+    total = sum((exp["amount"] for exp in expenses_list), Decimal("0"))
+    pending_expense_batch_delete[chat_id] = {
+        "household_id": household_id,
+        "expense_ids": [exp["id"] for exp in expenses_list],
+        "snapshots": [
+            {
+                "id": exp["id"], "amount": exp["amount"], "category": exp["category"],
+                "expense_date": exp["expense_date"], "description": exp["description"],
+            }
+            for exp in expenses_list
+        ],
+        "total": total,
+        "origin": origin,
+    }
+    expense_delete_selection.pop(chat_id, None)
+    pending_expense_delete.pop(chat_id, None)
+    _bot.send_message(chat_id, _format_batch_delete_preview(expenses_list, total), reply_markup=EXPENSE_DELETE_PREVIEW_KEYBOARD)
+
+
+def _handle_resolved_targets(chat_id, household_id, origin, keyboard, targets, candidates):
+    """All-or-nothing decision for a validated `targets` array (Expense
+    Batch Delete V1): any missing target blocks the WHOLE batch (nothing
+    previewed, nothing deleted, even for the targets that DID resolve);
+    otherwise any ambiguous target blocks it too, showing ONLY that
+    target's relevance-filtered candidates — never the unrelated ones.
+    Exactly one resolved target reuses the existing single-expense preview
+    unchanged; 2+ build the new batch preview."""
+    result = _resolve_expense_targets(targets, candidates)
+    if result["missing"]:
+        expense_delete_selection.pop(chat_id, None)
+        _bot.send_message(
+            chat_id,
+            _format_batch_delete_missing_message(result["missing"], result["resolved"]),
+            reply_markup=keyboard,
+        )
+        return
+    if result["ambiguous"]:
+        expense_delete_selection.pop(chat_id, None)
+        _bot.send_message(chat_id, _format_ambiguous_targets_message(result["ambiguous"]), reply_markup=keyboard)
+        return
+    resolved = result["resolved"]
+    if len(resolved) == 1:
+        _build_delete_preview_from_match(chat_id, household_id, origin, resolved[0])
+    else:
+        _build_batch_delete_preview(chat_id, household_id, origin, resolved)
+
+
 def _resolve_expense_delete_selection(chat_id, household_id, user_db_id, origin, keyboard, text, recent_expenses):
-    """Shared resolution step for both the global expense-delete gate and the
-    dedicated selection mode (chat_id in expense_delete_selection). First
-    tries a local exact-name match (no Gemini call) against the numbered
-    list already shown; only if that doesn't resolve to exactly one match
-    does it call the expense router with `recent_expenses` as context and
-    either build the delete preview (exactly one match) or re-show the
-    numbered list and stay in selection mode (zero matches, more than one
-    match, or an unresolved/invalid/none router result — never guesses).
-    Always fully handles the message; never falls through to AI-chat.
+    """Shared resolution step for the global expense-delete gate, the
+    active-expenses-context route, AND the dedicated selection mode
+    (chat_id in expense_delete_selection). First tries a local exact-name
+    match (no Gemini call) against the numbered list already shown; only if
+    that doesn't resolve to exactly one match does it call the expense
+    router with `recent_expenses` as context. Expense Batch Delete V1: a
+    "delete_targets" router result (1+ targets extracted from the message
+    itself) is resolved all-or-nothing via _handle_resolved_targets —
+    covers both a single description-based target (folds into the existing
+    single-expense preview) and 2+ targets (new batch preview) with ONE
+    Gemini call, same as before. Falls back to the original selected_numbers
+    path for a bare numbered reply. Zero matches / more than one match /
+    an unresolved/invalid/none router result now shows ONLY relevance-
+    filtered candidates (never the full unfiltered recent list) — or a
+    controlled "not found" message when nothing is relevant at all. Always
+    fully handles the message; never falls through to AI-chat.
     """
     local_match = _find_exact_expense_match(text, recent_expenses)
     if local_match is not None:
@@ -952,20 +1255,37 @@ def _resolve_expense_delete_selection(chat_id, household_id, user_db_id, origin,
 
     router_result = _bot._ask_gemini_expense_router(text, recent_expenses=recent_expenses)
     kind, payload = _validate_expense_router_result(router_result)
+
+    if kind == "delete_targets":
+        _handle_resolved_targets(chat_id, household_id, origin, keyboard, payload, recent_expenses)
+        return
+
     matched = _bot._validate_selected_numbers(payload, recent_expenses) if kind == "delete" else None
     if matched is not None and len(matched) == 1:
         _build_delete_preview_from_match(chat_id, household_id, origin, matched[0])
         return
-    # Zero matches, more than one match, or the router didn't produce a
-    # usable delete selection (unresolved/invalid/none) — never guess; stay
-    # in selection mode and ask the user to pick a number from the list.
+    if matched is not None and len(matched) > 1:
+        # The router already narrowed it itself — show exactly its own
+        # selection, never a broader independently-filtered set.
+        candidates_to_show = matched
+    else:
+        # Zero matches, or the router didn't produce a usable delete
+        # selection (unresolved/invalid/none) — never guess. Relevance-
+        # filtered fallback (Expense Batch Delete V1): only candidates
+        # plausibly related to `text` are ever shown/entered into
+        # selection mode.
+        candidates_to_show = _filter_relevant_expense_candidates(text, recent_expenses)
+        if not candidates_to_show:
+            expense_delete_selection.pop(chat_id, None)
+            _bot.send_message(chat_id, _format_no_relevant_candidate_message(text), reply_markup=keyboard)
+            return
     expense_delete_selection[chat_id] = {
         "household_id": household_id, "user_db_id": user_db_id,
-        "expenses": recent_expenses, "origin": origin,
+        "expenses": candidates_to_show, "origin": origin,
     }
     _bot.send_message(
         chat_id,
-        "Не зміг однозначно визначити витрату.\n\n" + _format_expense_delete_list(recent_expenses),
+        "Не зміг однозначно визначити витрату.\n\n" + _format_expense_delete_list(candidates_to_show),
         reply_markup=keyboard,
     )
 
@@ -1075,11 +1395,34 @@ def handle_delete_confirm(chat_id):
         _bot.send_message(chat_id, "Не вдалося видалити витрату. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
 
 
+def handle_batch_delete_confirm(chat_id):
+    """"✅ Так, видалити" button, Expense Batch Delete V1 branch. Caller
+    (bot.py) only invokes this when chat_id is already known to be in
+    pending_expense_batch_delete — pops the pending batch preview before the
+    DB check-and-delete transaction, so a duplicate/late button press can
+    never delete twice. ONE atomic transaction for the whole batch
+    (database.delete_expenses_batch): every target row is re-verified
+    (locked, snapshot-matched) before anything is deleted — a single stale/
+    changed/missing row rolls back the WHOLE batch, nothing partially
+    deleted, same all-or-nothing contract the preview itself already made."""
+    data = pending_expense_batch_delete.pop(chat_id)
+    origin = data.get("origin", "global")
+    keyboard = _expense_origin_keyboard(origin)
+    try:
+        count = _bot.delete_expenses_batch(data["household_id"], data["expense_ids"], data["snapshots"])
+        _bot.send_message(chat_id, f"✅ Видалено витрат: {count}", reply_markup=keyboard)
+    except StaleSnapshotError:
+        _bot.send_message(chat_id, STALE_PREVIEW_MSG, reply_markup=keyboard)
+    except Exception:
+        _bot.send_message(chat_id, "Не вдалося видалити витрати. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+
+
 def handle_cancel(chat_id):
     """"❌ Скасувати" button. Caller (bot.py) only invokes this when chat_id
     is already known to be in one of pending_expense/pending_expense_delete/
-    expense_delete_selection; replicates the exact original 3-way check order
-    (add preview, delete preview, delete-selection mode)."""
+    expense_delete_selection/pending_expense_batch_delete; replicates the
+    exact original check order (add preview, delete preview, delete-
+    selection mode, batch-delete preview)."""
     if chat_id in pending_expense:
         expense_data = pending_expense.pop(chat_id, None)
         origin = (expense_data or {}).get("origin", "global")
@@ -1092,3 +1435,7 @@ def handle_cancel(chat_id):
         selection_data = expense_delete_selection.pop(chat_id, None)
         origin = (selection_data or {}).get("origin", "global")
         _bot.send_message(chat_id, "Видалення витрати скасовано.", reply_markup=_expense_origin_keyboard(origin))
+    elif chat_id in pending_expense_batch_delete:
+        batch_data = pending_expense_batch_delete.pop(chat_id, None)
+        origin = (batch_data or {}).get("origin", "global")
+        _bot.send_message(chat_id, "Видалення витрат скасовано.", reply_markup=_expense_origin_keyboard(origin))
