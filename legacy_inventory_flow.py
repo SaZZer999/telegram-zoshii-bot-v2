@@ -23,6 +23,8 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
+import quantities
+
 
 # =========================
 # STATE (module-owned)
@@ -246,6 +248,24 @@ def handle_start_inventory_remove(deps, chat_id, user_id, display_name):
         deps.send_message(chat_id, deps.inventory_error_msg)
 
 
+# Context Intent Safety V1 — same purchase-verb exclusion as legacy_shopping_
+# flow._PURCHASE_VERB_RE (see its own docstring for the full rationale: a
+# "Купив X за Y zł" compound phrasing stays inside active mode, unchanged).
+_PURCHASE_VERB_RE = re.compile(r"купив|купила|купили|придбав|придбала", re.IGNORECASE)
+
+# Context Intent Safety V1 — same controlled refusal as legacy_shopping_
+# flow.py's own _MONEY_AND_QUANTITY_CLARIFY_MSG, duplicated on purpose (same
+# reasoning as every other small pure text/helper already duplicated across
+# this codebase — see this module's own docstring) rather than importing
+# from a sibling flow module.
+_MONEY_AND_QUANTITY_CLARIFY_MSG = (
+    "Бачу в повідомленні і кількість товару, і суму в злотих — щоб не "
+    "помилитися, напиши окремо:\n"
+    "• товар з кількістю (напр. «Молоко 1 л»)\n"
+    "• або витрату (напр. «Молоко 4,99 zł»)"
+)
+
+
 # =========================
 # INVENTORY MODE TEXT DISPATCH
 # =========================
@@ -256,6 +276,14 @@ def handle_inventory_mode_text(deps, chat_id, user_id, display_name, text):
     inv_mode = inventory_mode.pop(chat_id, None)
 
     if inv_mode == "adding":
+        # Context Intent Safety V1 — see legacy_shopping_flow.handle_
+        # shopping_mode_text's identical guard for the full rationale (same
+        # live bug, same fix shape, mirrored here for inventory add mode).
+        if quantities.looks_like_money_amount(text) and not _PURCHASE_VERB_RE.search(text):
+            if quantities.looks_like_explicit_item_quantity(text):
+                deps.send_message(chat_id, _MONEY_AND_QUANTITY_CLARIFY_MSG)
+                return True
+            return False
         try:
             household_id, user_db_id = deps.get_household_and_user(user_id, display_name)
             alias_map = deps.get_household_alias_map(household_id)

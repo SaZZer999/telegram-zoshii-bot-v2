@@ -214,8 +214,11 @@ def _expense_origin_keyboard(origin):
 # an amount+currency pair while still accepting "10 z"/"10,50 z" at the end
 # of a message. The other markers (zł/zl/pln) already can't false-positive
 # on a longer word like "zebra"/"zloty" thanks to their own \b, so they keep
-# their original (shared, implicit) boundary behavior unchanged.
-_EXPENSE_AMOUNT_RE = re.compile(r"\d[\d\s.,]*\s*(zł\b|zl\b|pln\b|z\b(?!\s*\d))")
+# their original (shared, implicit) boundary behavior unchanged. "злот\w*"/
+# "зл\b" (Context Intent Safety V1) cover the Cyrillic spellings ("14
+# злотих", "10 зл") the Latin-only markers above never matched — same \b
+# boundary discipline, so "золото" or "зліва" never false-positive.
+_EXPENSE_AMOUNT_RE = re.compile(r"\d[\d\s.,]*\s*(zł\b|zl\b|pln\b|злот\w*|зл\b|z\b(?!\s*\d))", re.IGNORECASE)
 
 
 def _expense_command_gate(text):

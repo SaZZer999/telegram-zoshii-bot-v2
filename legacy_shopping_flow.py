@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
+import quantities
+
 
 # =========================
 # STATE (module-owned)
@@ -206,6 +208,32 @@ def handle_start_delete(deps, chat_id, user_id, display_name):
         deps.send_message(chat_id, deps.db_error_msg)
 
 
+# Context Intent Safety V1 — a "Купив X за Y zł"-style compound purchase
+# phrasing is deliberately EXCLUDED from the money-vs-quantity gate below.
+# Same verb list as household_router._BOUGHT_RE, duplicated on purpose (same
+# reasoning as every other small pure helper already duplicated across this
+# codebase — see this module's own docstring) rather than importing
+# household_router.py here. This is the Global Household Router's own
+# combined buy+expense domain; active shopping/inventory mode already has
+# documented priority over it (see test_global_household_operations.py's
+# "active_selection_mode_has_priority") and this fix must not change that —
+# it only targets a plain "item name + price" statement with no purchase
+# verb, never this compound shape.
+_PURCHASE_VERB_RE = re.compile(r"купив|купила|купили|придбав|придбала", re.IGNORECASE)
+
+# Context Intent Safety V1 — controlled refusal for an ambiguous "item
+# quantity + price in one message" shape (e.g. "Молоко 1 л 4,99 zł"): V1
+# deliberately doesn't add a new 3-way pending-state/keyboard for this (see
+# docs/PROJECT_STATE.md) — just asks for the two separate, already-supported
+# phrasings instead. No item, no expense, no DB write either way.
+_MONEY_AND_QUANTITY_CLARIFY_MSG = (
+    "Бачу в повідомленні і кількість товару, і суму в злотих — щоб не "
+    "помилитися, напиши окремо:\n"
+    "• товар з кількістю (напр. «Молоко 1 л»)\n"
+    "• або витрату (напр. «Молоко 4,99 zł»)"
+)
+
+
 # =========================
 # SHOPPING MODE TEXT DISPATCH
 # =========================
@@ -216,6 +244,23 @@ def handle_shopping_mode_text(deps, chat_id, user_id, display_name, text):
     mode = shopping_mode.pop(chat_id, None)
 
     if mode == "adding":
+        # Context Intent Safety V1 — a money amount ("52,37 zł") can never
+        # become an item quantity ("52,37 шт."), checked on the RAW text
+        # before the Gemini shopping-item parser ever sees it (Gemini itself
+        # is what produced the live bug: it stripped "zł" off "Тест чай
+        # batch 52,37 zł" and handed back a bare "52,37" quantity_text,
+        # which parse_structured_quantity then read as a 52,37-count item).
+        # "adding" mode is already popped above either way, so a stronger-
+        # intent hit here safely clears it without a second pending state.
+        if quantities.looks_like_money_amount(text) and not _PURCHASE_VERB_RE.search(text):
+            if quantities.looks_like_explicit_item_quantity(text):
+                deps.send_message(chat_id, _MONEY_AND_QUANTITY_CLARIFY_MSG)
+                return True
+            # Pure expense, no item quantity — let it fall through to the
+            # existing global expense route (message_dispatcher.py checks
+            # that right after shopping/inventory mode); no shopping item,
+            # no DB write happens here.
+            return False
         try:
             household_id, user_db_id = deps.get_household_and_user(user_id, display_name)
             alias_map = deps.get_household_alias_map(household_id)

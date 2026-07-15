@@ -60,6 +60,50 @@ _WORD_NUMBER_QUANTITIES = {
 }
 
 
+# Context Intent Safety V1 — a money amount ("52,37 zł") must never be
+# silently read as an item quantity ("52,37 шт."). These two detectors work
+# on the RAW user text (before any Gemini call, while the original money
+# marker is still attached to the number) — see legacy_shopping_flow.py's/
+# legacy_inventory_flow.py's "adding" mode handlers, the only callers: a
+# quantity_text field a parser hands back later (e.g. Gemini's own "52,37",
+# with the currency marker already stripped) can no longer be told apart
+# from a genuine bare count, which is exactly why this check has to happen
+# before that split ever occurs.
+_MONEY_MARKER_RE = re.compile(
+    r"\d[\d\s.,]*\s*(?:zł|zl\b|pln\b|злот\w*|зл\b)", re.IGNORECASE,
+)
+
+# Every known structured-unit word (шт/л/мл/г/кг and their aliases, dot
+# stripped) reused from _UNIT_ALIASES above — never a second hand-maintained
+# list — so a number tagged with an explicit quantity unit ("1 л", "500 г")
+# is recognized the same way parse_structured_quantity itself would.
+_QUANTITY_UNIT_STEMS = sorted({alias.rstrip(".") for alias in _UNIT_ALIASES}, key=len, reverse=True)
+_QUANTITY_UNIT_RE = re.compile(
+    r"\d[\d\s.,]*\s*(?:" + "|".join(re.escape(stem) for stem in _QUANTITY_UNIT_STEMS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_money_amount(text):
+    """True if `text` contains a number tagged with a money marker (zł/zl/
+    PLN/злотий/злотих/зл, case/punctuation-insensitive) anywhere. Pure/
+    local, never calls Gemini."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_MONEY_MARKER_RE.search(text))
+
+
+def looks_like_explicit_item_quantity(text):
+    """True if `text` contains a number tagged with a known structured
+    quantity unit (шт/л/мл/г/кг or an alias) anywhere — used together with
+    looks_like_money_amount to tell a pure expense ("Кава 14 zł", no
+    quantity) apart from an ambiguous item+price message ("Молоко 1 л
+    4,99 zł"). Pure/local, never calls Gemini."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_QUANTITY_UNIT_RE.search(text))
+
+
 def _to_decimal(value):
     """Coerce a str/int/float/Decimal into an exact Decimal — always via
     Decimal(str(value)), never Decimal(float) directly, to avoid binary-
