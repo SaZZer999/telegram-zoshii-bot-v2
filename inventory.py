@@ -1516,6 +1516,65 @@ def format_inventory_transform_preview(source_rows, effective_quantity, target_n
     return "\n".join(lines)
 
 
+# =========================
+# ACTIVE LIST CONTEXT ROUTING STABILIZATION V1 — declension-tolerant PHRASE
+# matching for the active-inventory-list-context local delete/consume route
+# (bot.py's _try_active_inventory_context_local_action). Genitive/dative
+# Ukrainian forms of a multi-word product name ("сира Гауда"/"сиру Гауда" for
+# nominative "Сир Гауда") shift EVERY character after the declined word, so
+# preview_editing._name_token_matches's whole-string "shorter is a prefix of
+# the longer, within 2 trailing characters" comparison (already used for
+# single-WORD shopping-item matching) breaks the moment a MULTI-word name's
+# FIRST word is declined. _declension_tolerant_word_match below is the exact
+# same tolerance rule, just factored out to apply per-word instead of to a
+# whole multi-word string at once; duplicated here rather than imported from
+# preview_editing.py, same "small pure helper duplicated across modules"
+# convention this codebase already uses (see legacy_shopping_flow.py's/
+# legacy_inventory_flow.py's own duplicated _PURCHASE_VERB_RE).
+# =========================
+def _declension_tolerant_word_match(word_a, word_b):
+    """True if two single (already-lowercased) words are the SAME product-
+    name word, tolerating a short Ukrainian declension suffix difference
+    (e.g. "сир"/"сира"/"сиру"). Never fuzzy beyond a strict prefix + at most
+    2 trailing characters differing."""
+    if not word_a or not word_b:
+        return False
+    if word_a == word_b:
+        return True
+    shorter_len = min(len(word_a), len(word_b))
+    longer_len = max(len(word_a), len(word_b))
+    if shorter_len < 3:
+        return False
+    common = 0
+    for a, b in zip(word_a, word_b):
+        if a != b:
+            break
+        common += 1
+    if len(word_a) == len(word_b):
+        return common >= shorter_len - 2
+    return common == shorter_len and (longer_len - shorter_len) <= 2
+
+
+def phrase_declension_matches(phrase, candidate_name):
+    """True if free-text `phrase` (possibly declined — genitive/dative, e.g.
+    "сира Гауда"/"сиру Гауда") refers to the SAME product as `candidate_name`
+    (an inventory row's stored display name, nominative, e.g. "Сир Гауда") —
+    a word-by-word declension-tolerant compare (see
+    _declension_tolerant_word_match). Requires the SAME number of words on
+    both sides — never guesses across a different word count, and is
+    deliberately deterministic (no Gemini call) so the common active-
+    inventory-context case never costs a network round-trip just to
+    normalize a declined product name to nominative case the way action_
+    planner.py's own item_name extraction relies on Gemini to do."""
+    phrase_words = (phrase or "").strip().lower().split()
+    candidate_words = (candidate_name or "").strip().lower().split()
+    if not phrase_words or len(phrase_words) != len(candidate_words):
+        return False
+    return all(
+        _declension_tolerant_word_match(pw, cw) for pw, cw in zip(phrase_words, candidate_words)
+    )
+
+
 def find_inventory_admin_exact_name_matches(inventory_items, name_phrase, name_normalizer):
     """Every existing inventory row whose OWN visible name (item['name'] —
     NOT canonical_name) is exactly the same product as `name_phrase`, once

@@ -36,7 +36,15 @@ _UNIT_ALIASES = {
     "л": "л", "літр": "л", "літри": "л", "літра": "л", "l": "л",
     "мл": "мл", "мілілітр": "мл", "мілілітри": "мл", "мілілітрів": "мл", "ml": "мл",
     "г": "г", "грам": "г", "грами": "г", "грама": "г", "грамів": "г", "g": "г", "gram": "г", "grams": "г",
+    # Active List Context Routing Stabilization V1 — Russian/mixed-language
+    # spellings ("грамм"/"граммов" with a doubled "м", "килограмм"/
+    # "килограмов" with "и" instead of "і") that real household voice
+    # transcripts also produce, same tolerance this codebase already applies
+    # elsewhere for mixed Ukrainian/Russian speech (see inventory.py's own
+    # "з"/"із"/"из" preposition handling).
+    "грамм": "г", "граммов": "г",
     "кг": "кг", "кілограм": "кг", "кілограми": "кг", "кілограмів": "кг", "kg": "кг",
+    "килограмм": "кг", "килограмов": "кг",
 }
 
 # Cross-unit merge groups: units within the same group ("mass"/"volume") are

@@ -3591,6 +3591,302 @@ def _try_shopping_action_planner(chat_id, user_id, display_name, text):
     return True
 
 
+# =========================
+# ACTIVE LIST CONTEXT ROUTING STABILIZATION V1 — a narrow, deterministic
+# command route for the small set of shapes that should be interpreted
+# WITHIN the currently open saved shopping/inventory list context
+# (saved_list_context[chat_id] == "shopping_saved"/"inventory_saved")
+# instead of falling into the domain-blind inventory_admin_route/
+# action_planner_route/global_expense_command below it. Fixes three live
+# bugs:
+#
+#   1. A bare "Видали тестовий чай" while a shopping list is open used to be
+#      claimed by inventory_admin_route (inventory.parse_inventory_delete_
+#      request has no domain awareness at all — "видали"/"прибери" trigger
+#      it regardless of which list is open), so it searched INVENTORY and
+#      answered "Не знайшов такого запису в запасах." even though the item
+#      was sitting right there in the open shopping list. saved_list_router
+#      (the existing, context-aware router) already builds the correct
+#      shopping-delete preview once reached — it just never WAS reached,
+#      since it sits dead last in message_dispatcher.py's command-route
+#      order, after every domain-blind inventory route.
+#   2. "Видали половину сира Гауда 130 грамм" while an inventory list is
+#      open hit the same domain-blind inventory_admin_route, which has no
+#      concept of a PARTIAL removal — it always treated the whole "половину
+#      сира Гауда 130 грамм" as a name_phrase for a FULL delete and never
+#      found a matching row.
+#   3. "Молоко 1 л 4,99 zł" while a shopping/inventory list is open used to
+#      be claimed by global_expense_command (a bare zł-tagged amount is
+#      enough to trigger _expense_command_gate), silently creating an
+#      expense-only preview and discarding the item quantity — the exact
+#      same ambiguity Context Intent Safety V1 (6054fe2) already guards
+#      against for active shopping_mode/inventory_mode "adding" text, just
+#      never extended to the saved-list CONTEXT case (no shopping_mode/
+#      inventory_mode active, just an open list).
+#
+# Checked right after destructive_bulk_guard and BEFORE every add/expense/
+# alias/domain-planner route in message_dispatcher.py's _dispatch_command_
+# routes (CommandRouteDeps.active_list_context_route) — see that field's own
+# docstring for the exact ordering reasoning. Returns False immediately
+# (never touches Gemini, never sends a message) whenever:
+#   - no saved_list_context is active for this chat at all (100% unchanged
+#     behavior for every other route below when no list is open);
+#   - the message itself EXPLICITLY names a different domain (an inventory
+#     "запас..." location while shopping_saved is active, a shopping-list
+#     reference while inventory_saved is active, or any expense/financial
+#     reference word) — the existing domain-specific routes further down
+#     (inventory_admin_route/shopping_action_planner_route/expense_delete_
+#     command_route/global_expense_command/...) already handle those
+#     correctly regardless of which list is open, and must keep doing so;
+#   - the narrow local shape (bare delete/mark-bought for shopping; full
+#     delete without an explicit quantity for inventory) isn't recognized at
+#     all — deliberate: a full inventory delete without a quantity ALREADY
+#     works correctly today via inventory_admin_route (not a reported bug),
+#     so this route only intercepts what it can positively, narrowly
+#     resolve and leaves everything else to the exact same routing chain
+#     that existed before it.
+# Every action below dispatches to the SAME preview/executor entry points
+# shopping_action_planner.py/inventory_admin_route/saved_list_router already
+# use (legacy_shopping_flow._show_delete_preview/_show_mark_preview,
+# pending_inventory_consumption + _validate_consumptions/_format_
+# consumption_preview) — no new DB write path, no new pending-state shape,
+# no new DB executor. Zero Gemini calls of its own.
+# =========================
+
+_ACTIVE_CONTEXT_INVENTORY_LOCATION_MARKER_RE = re.compile(r"(?:із|из|з|в|у)\s+запас\w*", re.IGNORECASE)
+
+
+def _active_list_context_mentions_other_domain(text, ctx):
+    """True if `text` explicitly names a domain OTHER than the currently
+    active `ctx` — see this section's own module comment for the full
+    "явні маркери" list. Reuses expenses.py's own financial-reference
+    stems/shopping-list-reference helper rather than a second, parallel
+    copy."""
+    lowered = text.lower()
+    if "витрат" in lowered or any(stem in lowered for stem in expenses._EXPENSE_FINANCIAL_REFERENCE_STEMS):
+        return True
+    if ctx == "shopping_saved" and _ACTIVE_CONTEXT_INVENTORY_LOCATION_MARKER_RE.search(lowered):
+        return True
+    if ctx == "inventory_saved" and expenses._looks_like_shopping_list_reference(text):
+        return True
+    return False
+
+
+_ACTIVE_SHOPPING_CONTEXT_DELETE_RE = re.compile(
+    r"^(?:видали|видалити|прибери|прибрати|викресли|викреслити|забери|забрати)\s+(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+_ACTIVE_SHOPPING_CONTEXT_DELETE_TRAILING_LIST_RE = re.compile(
+    r"\s*(?:зі|із|з)\s+списк\w*(?:\s+покупок)?\s*\.?\s*$", re.IGNORECASE,
+)
+_ACTIVE_SHOPPING_CONTEXT_MARK_BOUGHT_RE = re.compile(
+    r"^(?P<name>.+?)\s+(?:вже|уже)\s+(?:купил\w*|купив\w*|взял\w*|взяв\w*)\b", re.IGNORECASE,
+)
+
+
+def _resolve_active_shopping_context_action(chat_id, user_id, display_name, item_name, action):
+    if _has_blocking_pending_state_for_reports(chat_id):
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return True
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        items = get_active_shopping_items(household_id)
+    except Exception:
+        send_message(chat_id, DB_ERROR_MSG)
+        return True
+
+    candidates = shopping_action_planner.resolve_shopping_candidates(item_name, items)
+    if not candidates:
+        send_message(chat_id, shopping_action_planner.NOT_FOUND_MSG, reply_markup=SHOPPING_KEYBOARD)
+        return True
+    if len(candidates) > 1:
+        send_message(
+            chat_id, shopping_action_planner.format_shopping_admin_ambiguous_message(candidates),
+            reply_markup=SHOPPING_KEYBOARD,
+        )
+        return True
+
+    if action == "delete":
+        legacy_shopping_flow._show_delete_preview(_shopping_deps, chat_id, candidates, household_id, user_db_id)
+    else:
+        legacy_shopping_flow._show_mark_preview(_shopping_deps, chat_id, candidates, household_id, user_db_id)
+    return True
+
+
+def _try_active_shopping_context_local_action(chat_id, user_id, display_name, text):
+    """Narrow, deterministic shopping-list-context local actions (bare
+    delete/remove, mark bought) — see this section's own module comment.
+    Returns False (never sends a message) when neither shape matches, so the
+    message falls through to the exact same routing chain that existed
+    before this route did."""
+    stripped = text.strip()
+
+    mark_match = _ACTIVE_SHOPPING_CONTEXT_MARK_BOUGHT_RE.match(stripped)
+    if mark_match:
+        item_name = mark_match.group("name").strip()
+        if item_name:
+            return _resolve_active_shopping_context_action(chat_id, user_id, display_name, item_name, "mark")
+
+    delete_match = _ACTIVE_SHOPPING_CONTEXT_DELETE_RE.match(stripped)
+    if delete_match:
+        item_name = _ACTIVE_SHOPPING_CONTEXT_DELETE_TRAILING_LIST_RE.sub("", delete_match.group("rest").strip())
+        item_name = item_name.strip().rstrip(".!?").strip()
+        if item_name:
+            return _resolve_active_shopping_context_action(chat_id, user_id, display_name, item_name, "delete")
+
+    return False
+
+
+_ACTIVE_INVENTORY_CONTEXT_REMOVE_VERB_RE = re.compile(
+    r"^(?:видали|видалити|прибери|прибрати|забери|забрати|спиши|списати)\s+(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+_ACTIVE_INVENTORY_CONTEXT_PARTIAL_WORD_RE = re.compile(r"половин\w*|\bпів\b", re.IGNORECASE)
+_ACTIVE_INVENTORY_CONTEXT_NEED_QUANTITY_MSG = (
+    "Скільки саме списати? Напиши точну кількість, наприклад «130 г» або «0,5 л»."
+)
+
+
+def _resolve_active_inventory_context_candidates(chat_id, household_id, items, name_phrase):
+    """Declension-tolerant word-by-word match first (inventory.phrase_
+    declension_matches — handles "сира Гауда"/"сиру Гауда" against a stored
+    "Сир Гауда" without a Gemini call), falling back to the SAME candidate
+    resolution inventory_admin_route/action_planner.py already use
+    (aliases, canonical names, exact visible-name matches) for anything the
+    declension-tolerant compare doesn't cover."""
+    declension_matches = [it for it in items if inventory.phrase_declension_matches(name_phrase, it.get("name") or "")]
+    if declension_matches:
+        return declension_matches
+    return _resolve_inventory_admin_candidates(chat_id, household_id, items, name_phrase, None)
+
+
+def _resolve_active_inventory_context_consume(chat_id, user_id, display_name, name_phrase, value, unit):
+    if _has_blocking_pending_state_for_reports(chat_id):
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return True
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        items = get_inventory_items(household_id)
+    except Exception:
+        send_message(chat_id, INVENTORY_ERROR_MSG)
+        return True
+
+    candidates = _resolve_active_inventory_context_candidates(chat_id, household_id, items, name_phrase)
+    if not candidates:
+        send_message(chat_id, INVENTORY_ADMIN_NOT_FOUND_MSG, reply_markup=INVENTORY_KEYBOARD)
+        return True
+    if len(candidates) > 1:
+        send_message(
+            chat_id, inventory.format_inventory_admin_ambiguous_message(candidates, _effective_quantity),
+            reply_markup=INVENTORY_KEYBOARD,
+        )
+        return True
+
+    row = candidates[0]
+    item_number = next((i for i, it in enumerate(items, start=1) if it["id"] == row["id"]), None)
+    if item_number is None:
+        send_message(chat_id, INVENTORY_ADMIN_NOT_FOUND_MSG, reply_markup=INVENTORY_KEYBOARD)
+        return True
+
+    kind, payload = _validate_consumptions(
+        [{"item_number": item_number, "quantity_value": float(value), "quantity_unit": unit}], items,
+    )
+    if kind == "ok":
+        pending_inventory_consumption[chat_id] = {
+            "resolved": payload, "household_id": household_id, "user_db_id": user_db_id,
+        }
+        send_message(chat_id, _format_consumption_preview(payload), reply_markup=SAVED_EDIT_PREVIEW_KEYBOARD)
+    elif kind == "missing_quantity":
+        send_message(
+            chat_id,
+            f"Не можу безпечно відняти частину, бо для «{payload}» не вказана точна кількість. "
+            "Спочатку відредагуй кількість товару.",
+            reply_markup=INVENTORY_KEYBOARD,
+        )
+    elif kind == "insufficient":
+        name, available, requested = payload
+        send_message(
+            chat_id, f"У запасах є лише {available}, а ти вказав {requested}. Уточни кількість.",
+            reply_markup=INVENTORY_KEYBOARD,
+        )
+    else:
+        send_message(
+            chat_id, "Не можу безпечно визначити, яку саме кількість потрібно списати. Уточни, будь ласка.",
+            reply_markup=INVENTORY_KEYBOARD,
+        )
+    return True
+
+
+def _try_active_inventory_context_local_action(chat_id, user_id, display_name, text):
+    """Narrow, deterministic inventory-list-context local action: delete/
+    remove verb + an EXPLICIT structured quantity anywhere in the message ->
+    partial consume (reuses pending_inventory_consumption/_validate_
+    consumptions/_format_consumption_preview — the SAME mechanism saved_
+    list_router's own consume_inventory_quantity intent already uses).
+    delete/remove verb + a bare "половину"/"пів" partial-intent word with NO
+    explicit quantity -> a controlled request for the exact amount (V1
+    deliberately never guesses half). delete/remove verb with neither ->
+    returns False, unchanged: an ordinary full-delete request already works
+    correctly via inventory_admin_route below, so this route never
+    duplicates that path."""
+    stripped = text.strip()
+    match = _ACTIVE_INVENTORY_CONTEXT_REMOVE_VERB_RE.match(stripped)
+    if not match:
+        return False
+
+    rest = _ACTIVE_CONTEXT_INVENTORY_LOCATION_MARKER_RE.sub(" ", match.group("rest").strip())
+    rest = re.sub(r"\s+", " ", rest).strip().rstrip(".!?").strip()
+    if not rest:
+        return False
+
+    qty_match = quantities._QUANTITY_UNIT_RE.search(rest)
+    has_partial_word = bool(_ACTIVE_INVENTORY_CONTEXT_PARTIAL_WORD_RE.search(rest))
+
+    if qty_match is None:
+        if has_partial_word:
+            # "Видали половину сира Гауда" with NO explicit numeric quantity
+            # — never silently compute half; ask for the exact amount
+            # instead of guessing or falling back to a full delete.
+            send_message(chat_id, _ACTIVE_INVENTORY_CONTEXT_NEED_QUANTITY_MSG, reply_markup=INVENTORY_KEYBOARD)
+            return True
+        return False
+
+    value, unit = quantities.parse_structured_quantity(qty_match.group(0))
+    name_phrase = rest[:qty_match.start()] + " " + rest[qty_match.end():]
+    name_phrase = _ACTIVE_INVENTORY_CONTEXT_PARTIAL_WORD_RE.sub(" ", name_phrase)
+    name_phrase = re.sub(r"\s+", " ", name_phrase).strip().rstrip(",").strip()
+    if value is None or unit is None or not name_phrase:
+        return False
+
+    return _resolve_active_inventory_context_consume(chat_id, user_id, display_name, name_phrase, value, unit)
+
+
+def _route_active_list_context_command(chat_id, user_id, display_name, text):
+    """Wired as message_dispatcher.py's CommandRouteDeps.active_list_
+    context_route — see this section's own module comment for the full
+    reasoning and exact position in the dispatch chain."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    ctx = saved_list_context.get(chat_id)
+    if ctx not in ("shopping_saved", "inventory_saved"):
+        return False
+    if _active_list_context_mentions_other_domain(text, ctx):
+        return False
+
+    if quantities.looks_like_money_amount(text) and not legacy_shopping_flow._PURCHASE_VERB_RE.search(text):
+        if quantities.looks_like_explicit_item_quantity(text):
+            keyboard = SHOPPING_KEYBOARD if ctx == "shopping_saved" else INVENTORY_KEYBOARD
+            send_message(chat_id, legacy_shopping_flow._MONEY_AND_QUANTITY_CLARIFY_MSG, reply_markup=keyboard)
+            return True
+        # Pure expense, no item quantity — defer to global_expense_command
+        # below, unchanged (see 6054fe2/Context Intent Safety V1).
+        return False
+
+    if ctx == "shopping_saved":
+        return _try_active_shopping_context_local_action(chat_id, user_id, display_name, text)
+    return _try_active_inventory_context_local_action(chat_id, user_id, display_name, text)
+
+
 def _apply_inventory_transform_confirm(chat_id):
     """"✅ Так, застосувати" button for a pending_inventory_transform preview.
     Pops the pending action BEFORE the database call, same duplicate-press
@@ -6232,6 +6528,7 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
 # callback is a lambda-forward to one of the thin wrapper functions above,
 # same patch.object(bot, ...) reasoning as every other callback container.
 _command_route_deps = message_dispatcher.CommandRouteDeps(
+    active_list_context_route=lambda *a, **kw: _route_active_list_context_command(*a, **kw),
     ambiguous_add_route=lambda *a, **kw: _route_ambiguous_add(*a, **kw),
     explicit_global_add=lambda *a, **kw: _route_global_explicit_add(*a, **kw),
     bare_global_add=lambda *a, **kw: _route_global_bare_add(*a, **kw),

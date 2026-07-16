@@ -140,7 +140,17 @@ class TestExistingRoutesWinOverPlanner(ShoppingActionPlannerWebhookTestCase):
         mock_classify.assert_not_called()
 
     # 24. Existing saved-list route has priority when a saved shopping list
-    # context is already open.
+    # context is already open — updated for Active List Context Routing
+    # Stabilization V1: a bare "X вже купили" mark-bought phrase while
+    # shopping_saved is active is now resolved by bot.py's own narrow,
+    # deterministic _try_active_shopping_context_local_action (checked
+    # ahead of BOTH shopping_action_planner_route and saved_list_router —
+    # see message_dispatcher.py's CommandRouteDeps.active_list_context_
+    # route), never by _ask_gemini_saved_list_router — same final outcome
+    # (the existing mark-bought preview), zero Gemini calls instead of one.
+    # Deliberate behavior change, same reasoning as every other "a new
+    # deterministic fast path supersedes an existing Gemini-router call for
+    # the same message" test update already in this codebase.
     def test_saved_list_context_wins_over_planner(self):
         chat_id = 985012
         saved_list_context[chat_id] = "shopping_saved"
@@ -148,7 +158,9 @@ class TestExistingRoutesWinOverPlanner(ShoppingActionPlannerWebhookTestCase):
             with patch.object(shopping_action_planner, "classify") as mock_classify:
                 _call_webhook(_make_update(980012001, chat_id, "Молоко вже купили"))
         mock_classify.assert_not_called()
-        mock_saved_router.assert_called_once()
+        mock_saved_router.assert_not_called()
+        self.assertIn(chat_id, pending_mark_batch)
+        self.assertEqual([it["id"] for it in pending_mark_batch[chat_id]["items"]], [501])
 
     # 25. Existing add-shopping route does not regress.
     def test_add_shopping_route_not_regressed(self):

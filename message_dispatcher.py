@@ -334,6 +334,29 @@ class CommandRouteDeps:
     # for the DIRECT_GENERAL_AI_FALLBACK path) is ever reached. Checking it
     # here, ahead of direct_household_read, is what actually prevents that.
     destructive_bulk_guard: Callable = None
+    # Active List Context Routing Stabilization V1 — optional (default
+    # None), same reasoning as every other Optional field above. Checked
+    # right after destructive_bulk_guard and BEFORE every route below it
+    # (ambiguous_add_route through saved_list_router): a narrow,
+    # deterministic active-shopping/inventory-list-context local command
+    # (bare delete/mark-bought for shopping; full delete without an
+    # explicit quantity falls through unchanged, partial consume WITH an
+    # explicit quantity for inventory; a controlled money+item-quantity
+    # clarification for either) must win over the domain-blind
+    # inventory_transform_route/inventory_cleanup_route/inventory_admin_
+    # route/action_planner_route/global_expense_command further down this
+    # same list — those have no awareness of which saved list is currently
+    # open at all, which is exactly what let them steal a message that
+    # unambiguously belonged to the OTHER, active domain (see bot.py's own
+    # module comment on this route for the three exact live bugs this
+    # fixes). Positioned ahead of the add/expense/alias routes too, since
+    # the money+quantity ambiguity check must preempt global_expense_
+    # command's own bare zł-amount gate. Returns False immediately (no
+    # Gemini call, no message sent) whenever no saved-list context is
+    # active, or the message explicitly names a different domain, or the
+    # narrow shape isn't recognized at all — in every one of those cases
+    # routing continues exactly as it did before this route existed.
+    active_list_context_route: Callable = None
     saved_list_router: Callable = None
     general_ai_fallback: Callable = None
 
@@ -674,6 +697,18 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # "Очисти запаси" is intercepted before any route below, including
         # household_read's own Phase-D Gemini classifier (see this field's
         # own docstring on CommandRouteDeps).
+        return RouteOutcome.HANDLED
+
+    if routes.active_list_context_route is not None and routes.active_list_context_route(chat_id, user_id, display_name, text):
+        # Active List Context Routing Stabilization V1 — see CommandRouteDeps.
+        # active_list_context_route's own docstring for the exact ordering
+        # reasoning. Checked right after destructive_bulk_guard, ahead of
+        # every other route in this slice (ambiguous_add_route through
+        # saved_list_router, including global_household_router/global_
+        # expense_command) so a narrow active-list-context shape always
+        # wins, but only ever claims a message it can positively, narrowly
+        # resolve — everything else falls through to the exact same chain
+        # below, unchanged.
         return RouteOutcome.HANDLED
 
     if routes.ambiguous_add_route(chat_id, user_id, display_name, text):
