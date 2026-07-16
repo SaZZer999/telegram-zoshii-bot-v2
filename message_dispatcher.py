@@ -373,6 +373,36 @@ class CommandRouteDeps:
     # narrow shape isn't recognized at all — in every one of those cases
     # routing continues exactly as it did before this route existed.
     active_list_context_route: Callable = None
+    # Informational Question Guard For Quantity + Price Intent V1 —
+    # optional (default None), same reasoning as every other Optional field
+    # above. Checked right after active_list_context_route and BEFORE
+    # quantity_price_clarification_route: a genuine informational price/
+    # cost question that ALSO carries an explicit quantity OR a money
+    # signal ("Чому 1 л молока коштує 5,00 zł?", post word-number
+    # normalization — live bug: this used to wrongly create pending_
+    # quantity_price_intent; also "Чи дорого 5 zł за літр молока?" —
+    # money only — and "Скільки буде коштувати 2 л молока?" — quantity
+    # only) must never create that clarification NOR fall through into
+    # ambiguous_add_route/explicit_global_add/bare_global_add/global_
+    # household_router/global_expense_command — global_expense_command's
+    # own domain-blind bare zł-amount gate (or global_household_router's
+    # own broad price-story gate) would otherwise misread the same
+    # question as a brand-new expense/purchase command. Returning True here
+    # signals _dispatch_command_routes to report RouteOutcome.DIRECT_
+    # GENERAL_AI_FALLBACK instead of RouteOutcome.HANDLED, so the message
+    # skips every remaining command route below AND Phase D's cooking_mode/
+    # meal_ideas/household_read/mini_action_planner, landing directly (and
+    # exactly once) on the real general AI-chat answer — see bot.py's own
+    # _route_quantity_price_informational_question docstring for the full
+    # reasoning. Returns False immediately (no Gemini call, no message
+    # sent, routing continues exactly as before) whenever NEITHER a
+    # quantity NOR a money signal is present at all, an explicit
+    # operational action verb is present anywhere in the text, or the text
+    # isn't a recognized question construction — a plain informational
+    # question with NO attached quantity/money at all ("Чому молоко коштує
+    # дорожче?") is intentionally never matched here either, keeping its
+    # exact pre-existing routing.
+    quantity_price_informational_route: Callable = None
     # Quantity + Price Intent Clarification V1 — optional (default None),
     # same reasoning as every other Optional field above. Checked right
     # after active_list_context_route and BEFORE ambiguous_add_route/
@@ -777,6 +807,18 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # resolve — everything else falls through to the exact same chain
         # below, unchanged.
         return RouteOutcome.HANDLED
+
+    if (
+        routes.quantity_price_informational_route is not None
+        and routes.quantity_price_informational_route(chat_id, user_id, display_name, text)
+    ):
+        # Informational Question Guard For Quantity + Price Intent V1 — see
+        # CommandRouteDeps.quantity_price_informational_route's own
+        # docstring. DIRECT_GENERAL_AI_FALLBACK (not HANDLED) so the caller
+        # skips every remaining command route AND Phase D's cooking_mode/
+        # meal_ideas/household_read/mini_action_planner, reaching the real
+        # general AI-chat answer directly and exactly once.
+        return RouteOutcome.DIRECT_GENERAL_AI_FALLBACK
 
     if (
         routes.quantity_price_clarification_route is not None

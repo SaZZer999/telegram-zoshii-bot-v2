@@ -4193,6 +4193,115 @@ def _continue_quantity_price_intent(chat_id, text):
 _EXPLICIT_EXPENSE_VERB_RE = re.compile(r"^запиши\w*\b", re.IGNORECASE)
 
 
+# =========================
+# INFORMATIONAL QUESTION GUARD FOR QUANTITY + PRICE INTENT V1 — a narrow,
+# deterministic guard (zero Gemini calls) that stops a genuine
+# informational price/cost question ("Чому один літр молока коштує п'ять
+# злотих?" — normalized by Word-number Quantity + Price V1's own normalize_
+# word_number_measurements to "Чому 1 л молока коштує 5,00 zł?" before this
+# guard ever runs) from being misread as an operational item+quantity+price
+# command and creating pending_quantity_price_intent. Live bug: the message
+# above matched both quantities.looks_like_money_amount/looks_like_explicit_
+# item_quantity and got the four-choice clarification instead of reaching
+# general AI-chat.
+#
+# Compositional, never a sentence allowlist: a question word/construction
+# ("чому"/"скільки"/"яка"/"чи") together with a price/cost verb stem
+# ("кошту"/"цін"/"варт"/"дорог"/"дешев") anywhere in the text — covers
+# "чому ... коштує ...", "скільки коштує ...", "яка ціна ...", "чому така
+# ціна ...", "чи дорого ...", "скільки буде коштувати ...". An explicit
+# operational action verb (додай/запиши.../записати/купи.../придбав/взял.../
+# взяв/видали/скасуй/прибери/викресли — the SAME roots household_router.
+# _BOUGHT_RE/_AMBIGUOUS_ADD_PREFIX_RE/_EXPLICIT_EXPENSE_VERB_RE/expenses.
+# _EXPENSE_DELETE_VERBS already recognize, reused here rather than a new
+# parser) anywhere in the text always wins over question phrasing — e.g.
+# "Можеш записати молоко 1 л за 5 zł?" stays operational even though it
+# ends in "?" and starts with a modal verb, not one of the anchored verb
+# checks above.
+# =========================
+_INFORMATIONAL_QUESTION_WORD_RE = re.compile(r"\b(?:чому|скільки|яка|чи)\b", re.IGNORECASE)
+_PRICE_COST_SIGNAL_RE = re.compile(r"кошту\w*|цін\w*|варт\w*|дорог\w*|дешев\w*", re.IGNORECASE)
+_QUANTITY_PRICE_ACTION_VERB_ROOTS = (
+    "додай", "додати",
+    "запиши", "записати",
+    "купив", "купила", "купили", "придбав", "придбала", "взял", "взяв",
+) + expenses._EXPENSE_DELETE_VERBS
+_QUANTITY_PRICE_ACTION_VERB_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(root) for root in _QUANTITY_PRICE_ACTION_VERB_ROOTS) + r")\w*",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_quantity_price_informational_question(text):
+    """True when `text` reads as an informational price/cost question
+    ("Скільки коштує молоко 1 л?", "Яка ціна молока 1 л?", "Чому молоко
+    1 л коштує 5 zł?", "Чи дорого 5 zł за літр молока?", "Скільки буде
+    коштувати 2 л молока?") rather than an operational item+quantity+price
+    command — see this section's own module comment. Deterministic, zero
+    Gemini calls. Never True when an explicit operational action verb is
+    present anywhere in the text — those keep priority over question
+    phrasing."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if _QUANTITY_PRICE_ACTION_VERB_RE.search(text):
+        return False
+    return bool(_INFORMATIONAL_QUESTION_WORD_RE.search(text) and _PRICE_COST_SIGNAL_RE.search(text))
+
+
+def _route_quantity_price_informational_question(chat_id, user_id, display_name, text):
+    """Wired as message_dispatcher.py's CommandRouteDeps.quantity_price_
+    informational_route — checked immediately before quantity_price_
+    clarification_route (same CommandRouteDeps position). Returns True for
+    a genuine informational price/cost question
+    (_looks_like_quantity_price_informational_question) that ALSO carries
+    an explicit quantity OR a money signal — e.g. "Чому 1 л молока коштує
+    5,00 zł?" (both signals; post word-number normalization; live bug: this
+    used to wrongly create pending_quantity_price_intent), but also "Чи
+    дорого 5 zł за літр молока?" (money only — "за літр" has no digit
+    attached) and "Скільки буде коштувати 2 л молока?" (quantity only — no
+    currency marker at all). Deliberately OR, not AND, unlike _route_
+    quantity_price_clarification's own stricter gate: THAT route only
+    needs to catch the genuinely ambiguous item+quantity+price shape, but
+    THIS route also has to keep a single attached signal away from every
+    OTHER domain-blind gate further down the pipeline that reacts to just
+    one of the two (expenses._expense_command_gate fires on any bare zł
+    amount; household_router.gate()'s _PRICE_CONTEXT_RE fires on a bare
+    "коштувати"/price-story word) — either alone is enough to misroute an
+    informational question, so either alone is enough to redirect here.
+
+    A True result signals _dispatch_command_routes to report RouteOutcome.
+    DIRECT_GENERAL_AI_FALLBACK instead of RouteOutcome.HANDLED, so the
+    message skips every remaining command route below in this same slice —
+    including global_expense_command's own domain-blind bare zł-amount
+    gate, which would otherwise misread this exact informational question
+    as a brand-new expense command, answering with "Не зміг зрозуміти
+    витрату" instead of a real answer, and global_household_router's own
+    broad _PRICE_CONTEXT_RE, which would otherwise burn an extra Gemini
+    call resolving to intent="none" before general AI-chat ever got a turn
+    — AND Phase D's cooking_mode/meal_ideas/household_read/mini_action_
+    planner, landing directly and exactly once on the real general AI-chat
+    answer via _run_general_ai_fallback.
+
+    Sends no message and creates no state itself — this is a pure route
+    predicate, unlike _start_quantity_price_clarification.
+
+    Defers (False) whenever:
+      - NEITHER an explicit item quantity NOR a money amount is present at
+        all — a plain informational question with no numeric hint
+        whatsoever ("Чому молоко коштує дорожче?") keeps its exact
+        pre-existing routing, untouched by this route;
+      - _looks_like_quantity_price_informational_question itself declines
+        (no question word/construction + price-cost stem found, or an
+        explicit operational action verb is present anywhere in the text —
+        that verb always wins, e.g. "Можеш записати молоко 1 л за 5 zł?"
+        stays operational)."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if not quantities.looks_like_money_amount(text) and not quantities.looks_like_explicit_item_quantity(text):
+        return False
+    return _looks_like_quantity_price_informational_question(text)
+
+
 def _route_quantity_price_clarification(chat_id, user_id, display_name, text):
     """Global (no active saved-list context required) trigger for Quantity
     + Price Intent Clarification V1 — covers the main-menu case (see this
@@ -4222,7 +4331,13 @@ def _route_quantity_price_clarification(chat_id, user_id, display_name, text):
       - the message starts with an explicit "Запиши..." expense verb —
         already has its own unambiguous existing route
         (expenses._expense_command_gate's own "запиши витрату" prefix,
-        global_expense_command).
+        global_expense_command);
+      - the message reads as an informational price/cost question
+        (_looks_like_quantity_price_informational_question — "Чому один
+        літр молока коштує п'ять злотих?") with no operational action verb
+        — falls through to the rest of the pipeline and, if nothing else
+        claims it, the normal general AI-chat fallback answers it (never a
+        static household refusal, never a second Gemini call here).
     """
     if not isinstance(text, str) or not text.strip():
         return False
@@ -4234,6 +4349,8 @@ def _route_quantity_price_clarification(chat_id, user_id, display_name, text):
     if _AMBIGUOUS_ADD_PREFIX_RE.match(stripped):
         return False
     if _EXPLICIT_EXPENSE_VERB_RE.match(stripped):
+        return False
+    if _looks_like_quantity_price_informational_question(text):
         return False
     return _start_quantity_price_clarification(chat_id, user_id, display_name, text, ctx=None)
 
@@ -4565,11 +4682,20 @@ def _try_mini_action_planner(chat_id, user_id, display_name, text):
     household_text(text) (Word-number Quantity + Price V1) — a message
     general_ai_fallback would answer with the controlled QUANTITY_PRICE_
     PARSE_FAILURE_MSG must never first burn a classify() call here either;
-    same "defer, don't guess" reasoning as the two checks above."""
+    same "defer, don't guess" reasoning as the two checks above. Also
+    defers to _looks_like_quantity_price_informational_question(text)
+    (Informational Question Guard For Quantity + Price Intent V1) — an
+    informational price question ("Скільки коштує молоко 1 л?") still
+    carries a quantity+money signal that would otherwise make mini_action_
+    planner.looks_household_like(text) agree to try, burning a classify()
+    call this planner was never going to resolve as one of its five actions
+    anyway; the ONE Gemini call still happens, just in general_ai_fallback
+    below instead of here."""
     if (
         _looks_like_destructive_bulk_household_request(text)
         or _looks_like_unrouted_household_action(text)
         or _looks_like_unparsed_quantity_price_household_text(text)
+        or _looks_like_quantity_price_informational_question(text)
     ):
         return False
 
@@ -6210,6 +6336,14 @@ UNROUTED_HOUSEHOLD_ACTION_MSG = (
 # looks_like_money_amount/parse_word_money_amount both require a number
 # attached to a currency marker (or, for the word parser, at least a
 # fraction/grosze shape) — a bare topical word alone is never enough.
+#
+# Informational Question Guard For Quantity + Price Intent V1 addendum: a
+# question LIKE "Чому 1 л молока коштує 5,00 zł?" (post-normalization) DOES
+# carry both an attached quantity and an attached money amount, so it would
+# otherwise match here too — _run_general_ai_fallback's own call site below
+# additionally checks _looks_like_quantity_price_informational_question(text)
+# and skips this static message for that case, letting the question reach
+# the real Gemini answer instead.
 # =========================
 QUANTITY_PRICE_PARSE_FAILURE_MSG = (
     "Бачу товар, кількість і ціну, але не зміг точно розібрати числа.\n"
@@ -6266,7 +6400,7 @@ def _run_general_ai_fallback(chat_id, text):
         send_message(chat_id, UNROUTED_HOUSEHOLD_ACTION_MSG, reply_markup=keyboard)
         return
 
-    if _looks_like_unparsed_quantity_price_household_text(text):
+    if _looks_like_unparsed_quantity_price_household_text(text) and not _looks_like_quantity_price_informational_question(text):
         send_message(chat_id, QUANTITY_PRICE_PARSE_FAILURE_MSG, reply_markup=keyboard)
         return
 
@@ -6954,6 +7088,7 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
 # same patch.object(bot, ...) reasoning as every other callback container.
 _command_route_deps = message_dispatcher.CommandRouteDeps(
     active_list_context_route=lambda *a, **kw: _route_active_list_context_command(*a, **kw),
+    quantity_price_informational_route=lambda *a, **kw: _route_quantity_price_informational_question(*a, **kw),
     quantity_price_clarification_route=lambda *a, **kw: _route_quantity_price_clarification(*a, **kw),
     ambiguous_add_route=lambda *a, **kw: _route_ambiguous_add(*a, **kw),
     explicit_global_add=lambda *a, **kw: _route_global_explicit_add(*a, **kw),
@@ -7579,6 +7714,17 @@ def _looks_like_receipt_debug_request(text):
     if normalized.startswith("чому") and len(normalized) <= _RECEIPT_DEBUG_WHY_MAX_LEN:
         rest = normalized[len("чому"):].strip()
         if not rest or _RECEIPT_DEBUG_WHY_HINT_RE.search(rest):
+            # Informational Question Guard For Quantity + Price Intent V1 —
+            # a digit in `rest` alone can't tell "чому сир 2 штуки?" (a
+            # genuine receipt-line-item explanation request) apart from
+            # "чому молоко 1 л коштує 5 zł?" (a real-world price question,
+            # never something a receipt preview could explain). The latter
+            # always carries a price/cost verb stem ("кошту"/"цін"/"варт"/
+            # "дорог"/"дешев") the former never does, so that same
+            # compositional check (already reused by _route_quantity_
+            # price_informational_question) draws the line here too.
+            if _looks_like_quantity_price_informational_question(text):
+                return False
             return True
     return False
 
