@@ -240,6 +240,22 @@ class PendingRouteDeps:
     # preview in place, anything else still sends a controlled message —
     # never general AI, never a new command/route, never a database write.
     handle_global_household_edit: Callable = None
+    # Quantity + Price Intent Clarification V1 — awaiting one of the four
+    # choice replies ("🛒 Додати до покупок"/"💸 Записати витрату"/
+    # "✅ Уже купив"/"❌ Скасувати") for a pending_quantity_price_intent
+    # question. Optional (default None), same reasoning as every other
+    # Optional field above. While active, ANY text (that isn't the shared
+    # confirm/cancel button, checked earlier in V3B, or the exact undo
+    # button, checked earlier in this same V2A slice) is claimed here:
+    # continue_quantity_price_intent(chat_id, text) resolves a recognized
+    # choice into the corresponding existing domain preview (shopping-add/
+    # inventory-add-plus-expense/expense-add), or sends a controlled
+    # "didn't understand" message for anything else — never general AI,
+    # never a new command/route, never a database write of its own (only
+    # ever builds the NEXT existing preview, which still needs its own
+    # separate confirm).
+    pending_quantity_price_intent: dict = None
+    continue_quantity_price_intent: Callable = None
 
 
 @dataclass
@@ -357,6 +373,25 @@ class CommandRouteDeps:
     # narrow shape isn't recognized at all — in every one of those cases
     # routing continues exactly as it did before this route existed.
     active_list_context_route: Callable = None
+    # Quantity + Price Intent Clarification V1 — optional (default None),
+    # same reasoning as every other Optional field above. Checked right
+    # after active_list_context_route and BEFORE ambiguous_add_route/
+    # explicit_global_add/bare_global_add/global_household_router/
+    # global_expense_command: a message naming a product, an explicit
+    # quantity AND a money amount all at once ("Молоко 1 л 4,99 zł") with no
+    # disambiguating verb must be offered the four-choice clarification
+    # before global_expense_command's own bare zł-amount gate (or any other
+    # route below) can silently claim it as an expense-only (or item-only)
+    # preview. While a saved shopping/inventory list context is active,
+    # active_list_context_route's own money+quantity branch already builds
+    # this SAME clarification first, so this route is only ever reached for
+    # the "no active context" (main menu) case. Returns False immediately
+    # (no Gemini call, no message sent) whenever no quantity+money ambiguity
+    # is present at all, a purchase verb is present ("купив"/"взяли"/...),
+    # or the message starts with an explicit "Додай"/"Запиши" verb — see
+    # bot.py's own _route_quantity_price_clarification docstring for the
+    # full reasoning on each exclusion.
+    quantity_price_clarification_route: Callable = None
     saved_list_router: Callable = None
     general_ai_fallback: Callable = None
 
@@ -666,6 +701,17 @@ def _dispatch_pending_routes(deps, chat_id, user_id, display_name, text):
         routes.continue_add_destination_clarification(chat_id, text)
         return RouteOutcome.HANDLED
 
+    if routes.pending_quantity_price_intent is not None and chat_id in routes.pending_quantity_price_intent:
+        # Quantity + Price Intent Clarification V1 — awaiting one of the
+        # four choice replies. ANY text here is claimed: a recognized
+        # choice builds the corresponding existing domain preview (never
+        # touches the database itself — that preview still needs its own
+        # separate confirm); anything else gets a controlled "didn't
+        # understand" message. No other route (a new command, general AI,
+        # ...) is ever reached while this is active.
+        routes.continue_quantity_price_intent(chat_id, text)
+        return RouteOutcome.HANDLED
+
     if chat_id in routes.pending_undo_action or action_history.is_undo_command(text) or _undo_button_match:
         # Action History + Safe Undo v1 — while pending_undo_action is
         # already set, ANY other text here is intercepted too (never
@@ -709,6 +755,23 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # wins, but only ever claims a message it can positively, narrowly
         # resolve — everything else falls through to the exact same chain
         # below, unchanged.
+        return RouteOutcome.HANDLED
+
+    if (
+        routes.quantity_price_clarification_route is not None
+        and routes.quantity_price_clarification_route(chat_id, user_id, display_name, text)
+    ):
+        # Quantity + Price Intent Clarification V1 — see CommandRouteDeps.
+        # quantity_price_clarification_route's own docstring for the exact
+        # ordering reasoning. Checked right after active_list_context_route
+        # (which already covers the SAME ambiguity while a saved list
+        # context is active) and ahead of ambiguous_add_route/explicit_
+        # global_add/bare_global_add/global_household_router/global_
+        # expense_command, but only ever claims a message that is genuinely
+        # ambiguous (quantity AND money AND no disambiguating verb) —
+        # everything else, including every one of those explicit routes'
+        # own shapes, falls through to the exact same chain below,
+        # unchanged.
         return RouteOutcome.HANDLED
 
     if routes.ambiguous_add_route(chat_id, user_id, display_name, text):

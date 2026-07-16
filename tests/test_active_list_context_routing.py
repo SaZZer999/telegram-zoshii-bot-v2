@@ -57,6 +57,7 @@ from bot import (  # noqa: E402
     pending_cleanup_admin,
     pending_inventory_consumption,
     pending_expense,
+    pending_quantity_price_intent,
 )
 
 
@@ -99,6 +100,7 @@ class ActiveListContextTestCase(unittest.TestCase):
         self.addCleanup(pending_cleanup_admin.clear)
         self.addCleanup(pending_inventory_consumption.clear)
         self.addCleanup(pending_expense.clear)
+        self.addCleanup(pending_quantity_price_intent.clear)
 
         patcher_send = patch.object(bot, "send_message")
         self.mock_send = patcher_send.start()
@@ -330,6 +332,12 @@ class TestInventoryContextPartialConsume(ActiveListContextTestCase):
 class TestMoneyAndQuantityAmbiguityInContext(ActiveListContextTestCase):
     # 23/24/25/26. Shopping context: quantity + price -> controlled
     # clarification, no shopping pending, no expense pending, no DB write.
+    # Updated for Quantity + Price Intent Clarification V1: the static
+    # refusal is now an actionable four-choice clarification
+    # (pending_quantity_price_intent) instead of a dead-end message — see
+    # tests/test_quantity_price_intent_clarification.py for full coverage
+    # of that feature. Still zero Gemini calls, still no shopping/expense
+    # write before an explicit choice.
     def test_shopping_context_quantity_and_price_refusal(self):
         chat_id = 970201
         saved_list_context[chat_id] = "shopping_saved"
@@ -340,7 +348,8 @@ class TestMoneyAndQuantityAmbiguityInContext(ActiveListContextTestCase):
         self.assertNotIn(chat_id, pending_mark_batch)
         self.assertNotIn(chat_id, pending_expense)
         self.assertFalse(self.mock_delete_items_batch.called)
-        self.assertTrue(any("кількість товару" in t and "ціну" in t or "суму" in t for t in self._sent_texts()))
+        self.assertIn(chat_id, pending_quantity_price_intent)
+        self.assertTrue(any("товар" in t and "ціну" in t for t in self._sent_texts()))
 
     # 27. Same safe behavior for inventory context.
     def test_inventory_context_quantity_and_price_refusal(self):
@@ -352,6 +361,7 @@ class TestMoneyAndQuantityAmbiguityInContext(ActiveListContextTestCase):
         self.assertNotIn(chat_id, pending_inventory_consumption)
         self.assertNotIn(chat_id, pending_cleanup_admin)
         self.assertNotIn(chat_id, pending_expense)
+        self.assertIn(chat_id, pending_quantity_price_intent)
 
     # 28. Pure money, no item quantity, still creates an expense preview
     # (existing 6054fe2 behavior, unaffected).

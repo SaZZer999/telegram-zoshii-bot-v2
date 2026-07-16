@@ -77,6 +77,11 @@ class InteractionStateDeps:
     # Inventory Transform V1 — awaiting confirm/cancel on a lossy combine of
     # 2+ existing inventory rows into ONE new record.
     pending_inventory_transform: dict
+    # Quantity + Price Intent Clarification V1 — awaiting a choice reply
+    # ("🛒 Додати до покупок"/"💸 Записати витрату"/"✅ Уже купив"/
+    # "❌ Скасувати") for a message that named a product, quantity AND price
+    # all at once with no disambiguating verb.
+    pending_quantity_price_intent: dict
     pending_undo_action: dict
     # bot.py-owned shared context dicts
     active_list_context: dict
@@ -138,6 +143,11 @@ def _alias_gate_blocking_states(deps):
         # other gate/flow may start a new preview, touch the database, or
         # reach general AI-chat.
         deps.pending_inventory_transform,
+        # Quantity + Price Intent Clarification V1's own choice question —
+        # same reasoning: while a "🛒"/"💸"/"✅ Уже купив"/"❌" choice is
+        # unanswered, no other gate/flow may start a new preview, touch the
+        # database, or reach general AI-chat.
+        deps.pending_quantity_price_intent,
     )
 
 
@@ -282,6 +292,7 @@ def clear_interaction_state(deps, chat_id):
     deps.pending_cleanup_admin_disambiguation.pop(chat_id, None)
     deps.pending_destructive_guard.pop(chat_id, None)
     deps.pending_inventory_transform.pop(chat_id, None)
+    deps.pending_quantity_price_intent.pop(chat_id, None)
     deps.pending_undo_action.pop(chat_id, None)
 
 

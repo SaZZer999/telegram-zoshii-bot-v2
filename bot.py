@@ -314,6 +314,25 @@ pending_inventory_representation_clarification = {}  # chat_id -> {household_id,
 # household_router.build_add_preview_from_items without a second Gemini call.
 pending_add_destination_clarification = {}  # chat_id -> {household_id, user_db_id, origin, validated_items}
 
+# Quantity + Price Intent Clarification V1 — short-lived RAM-only
+# continuation state for a message that names a product, an explicit
+# quantity AND a money amount all at once ("Молоко 1 л 4,99 zł"), with no
+# purchase verb ("купив"/"взяли") and no explicit destination/expense verb
+# ("Додай"/"Запиши") to disambiguate it deterministically. Holds only
+# already-deterministically-parsed structured data (item name/quantity/
+# amount), never raw Gemini history or a database id — the four-choice
+# reply ("🛒 Додати до покупок"/"💸 Записати витрату"/"✅ Уже купив"/
+# "❌ Скасувати") is resolved entirely from this dict, without a second
+# Gemini call and without ever guessing which of the three domains the
+# user actually meant. No shopping/inventory item, no expense, and no
+# database write happens until ONE of those three action choices is made
+# AND the resulting domain preview (pending_global_household for "🛒"/"✅ "
+# reused, pending_expense for "💸") is itself separately confirmed — this
+# dict only ever produces that next preview, never writes to the database
+# directly.
+pending_quantity_price_intent = {}  # chat_id -> {item_name, quantity_value, quantity_unit,
+                                #             quantity_text, amount, household_id, user_db_id, origin}
+
 # Action History + Safe Undo v1 — awaiting confirm/cancel on an "↩️ Скасувати
 # останню дію" preview. Holds only the journal row id and the identity
 # needed to re-verify it belongs to this same user/household at confirm
@@ -369,6 +388,7 @@ def _has_active_pending_clarification_or_preview(chat_id):
         or chat_id in pending_cleanup_admin_disambiguation
         or chat_id in pending_destructive_guard
         or chat_id in pending_inventory_transform
+        or chat_id in pending_quantity_price_intent
     )
 
 
@@ -418,6 +438,9 @@ def _cancel_active_pending_operation(chat_id):
         keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
     elif chat_id in pending_inventory_transform:
         data = pending_inventory_transform.pop(chat_id, None)
+        keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
+    elif chat_id in pending_quantity_price_intent:
+        data = pending_quantity_price_intent.pop(chat_id, None)
         keyboard = household_router.origin_keyboard((data or {}).get("origin", "global"))
     else:
         keyboard = MAIN_KEYBOARD
@@ -3875,6 +3898,14 @@ def _route_active_list_context_command(chat_id, user_id, display_name, text):
 
     if quantities.looks_like_money_amount(text) and not legacy_shopping_flow._PURCHASE_VERB_RE.search(text):
         if quantities.looks_like_explicit_item_quantity(text):
+            # Quantity + Price Intent Clarification V1 — upgrades the old
+            # Context Intent Safety V1 static refusal into an actionable
+            # four-choice clarification (see that section's own module
+            # comment below). Falls back to the original static refusal
+            # only if the raw text couldn't be safely split into item name/
+            # quantity/amount at all (never silently drops the ambiguity).
+            if _start_quantity_price_clarification(chat_id, user_id, display_name, text, ctx):
+                return True
             keyboard = SHOPPING_KEYBOARD if ctx == "shopping_saved" else INVENTORY_KEYBOARD
             send_message(chat_id, legacy_shopping_flow._MONEY_AND_QUANTITY_CLARIFY_MSG, reply_markup=keyboard)
             return True
@@ -3885,6 +3916,316 @@ def _route_active_list_context_command(chat_id, user_id, display_name, text):
     if ctx == "shopping_saved":
         return _try_active_shopping_context_local_action(chat_id, user_id, display_name, text)
     return _try_active_inventory_context_local_action(chat_id, user_id, display_name, text)
+
+
+# =========================
+# QUANTITY + PRICE INTENT CLARIFICATION V1 — a message naming a product, an
+# EXPLICIT quantity, AND a money amount all at once ("Молоко 1 л 4,99 zł")
+# is genuinely ambiguous: item add, expense, or both (already bought)? V1
+# used to send a static refusal asking the user to split it into two
+# messages (see legacy_shopping_flow._MONEY_AND_QUANTITY_CLARIFY_MSG,
+# Context Intent Safety V1/6054fe2) — this section upgrades that into an
+# actionable four-choice clarification that resolves directly into the
+# matching EXISTING domain preview, without ever guessing or writing to the
+# database before an explicit choice AND that preview's own separate
+# confirm.
+#
+#   🛒 Додати до покупок      -> household_router.build_add_preview_from_
+#                                 items("add_shopping", ...) — the SAME
+#                                 preview/pending_global_household/confirm
+#                                 path Global Explicit/Bare Add already use.
+#                                 The price is never stored anywhere (no
+#                                 schema change) — the preview note says so
+#                                 explicitly instead of silently dropping it.
+#   💸 Записати витрату        -> expenses.build_receipt_expense_preview —
+#                                 the SAME pending_expense/confirm path photo
+#                                 receipts already use for pre-validated
+#                                 data. No shopping/inventory item is ever
+#                                 created for this choice.
+#   ✅ Уже купив                -> household_router.build_add_preview_from_
+#                                 items("add_inventory", ...) (SAME
+#                                 Inventory Representation Guard safety
+#                                 checks Global Explicit/Bare Add already
+#                                 run), with new_expenses/new_expense set on
+#                                 the SAME payload before it reaches
+#                                 _handle_household_router_result — one
+#                                 COMBINED pending_global_household preview,
+#                                 applied atomically by the SAME
+#                                 apply_global_household_operations
+#                                 transaction "Купив X за Y zł" already uses.
+#                                 No new DB write path, no new executor.
+#                                 KNOWN LIMITATION: does not search for or
+#                                 remove/mark a matching shopping-list entry
+#                                 — no existing function does that
+#                                 automatically today, and building one is
+#                                 out of scope for this focused fix (see
+#                                 docs/PROJECT_STATE.md). The preview only
+#                                 ever promises exactly what it does: add to
+#                                 inventory + record the expense, nothing
+#                                 about the shopping list.
+#   ❌ Скасувати                -> the existing shared cancel button/handler
+#                                 (see the giant pending_XXX cancel elif-
+#                                 chain) — nothing created, nothing written.
+#
+# A purchase verb ("купив"/"взяли"/...) or an explicit "Додай"/"Запиши" verb
+# bypasses this clarification entirely (see _route_quantity_price_
+# clarification's own docstring) — those already have their own correct,
+# unambiguous existing routes. Zero Gemini calls: every field this section
+# needs (item name/quantity/amount) is already fully recoverable
+# deterministically from the raw text via the exact same regexes
+# quantities.looks_like_money_amount/looks_like_explicit_item_quantity
+# already use to DETECT the ambiguity in the first place.
+# =========================
+
+QUANTITY_PRICE_CHOICE_SHOPPING = "🛒 Додати до покупок"
+QUANTITY_PRICE_CHOICE_EXPENSE = "💸 Записати витрату"
+QUANTITY_PRICE_CHOICE_ALREADY_BOUGHT = "✅ Уже купив"
+
+QUANTITY_PRICE_CLARIFY_MSG = (
+    "Бачу товар, кількість і ціну. Що зробити?\n\n"
+    f"{QUANTITY_PRICE_CHOICE_SHOPPING}\n"
+    f"{QUANTITY_PRICE_CHOICE_EXPENSE}\n"
+    f"{QUANTITY_PRICE_CHOICE_ALREADY_BOUGHT}\n"
+    "❌ Скасувати"
+)
+QUANTITY_PRICE_CLARIFY_KEYBOARD = {
+    "keyboard": [
+        [QUANTITY_PRICE_CHOICE_SHOPPING],
+        [QUANTITY_PRICE_CHOICE_EXPENSE],
+        [QUANTITY_PRICE_CHOICE_ALREADY_BOUGHT],
+        ["❌ Скасувати"],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+QUANTITY_PRICE_UNRECOGNIZED_CHOICE_MSG = (
+    "Не зрозумів вибір. Натисни одну з кнопок нижче або «❌ Скасувати»."
+)
+
+
+def _extract_quantity_price_intent_fields(text):
+    """Deterministically split `text` into item_name/quantity_value/
+    quantity_unit/quantity_text/amount, or return None if either the
+    quantity or the money span can't be safely isolated/parsed, or nothing
+    but those two spans was sent (no item name left). Reuses the exact same
+    regexes/parsers quantities.looks_like_money_amount/looks_like_explicit_
+    item_quantity already use to DETECT that both are present
+    (quantities._QUANTITY_UNIT_RE/parse_structured_quantity,
+    expenses._EXPENSE_AMOUNT_RE/_parse_expense_amount) — just now used to
+    ISOLATE and remove both spans instead of merely detecting them. Never
+    calls Gemini."""
+    qty_match = quantities._QUANTITY_UNIT_RE.search(text)
+    money_match = expenses._EXPENSE_AMOUNT_RE.search(text)
+    if qty_match is None or money_match is None:
+        return None
+    value, unit = quantities.parse_structured_quantity(qty_match.group(0))
+    amount = expenses._parse_expense_amount(money_match.group(0))
+    if value is None or unit is None or amount is None:
+        return None
+
+    name = text
+    for start, end in sorted([qty_match.span(), money_match.span()], reverse=True):
+        name = name[:start] + " " + name[end:]
+    name = re.sub(r"\s+", " ", name).strip().rstrip(",.!?").strip()
+    if not name:
+        return None
+
+    return {
+        "item_name": name, "quantity_value": value, "quantity_unit": unit,
+        "quantity_text": format_quantity_display(value, unit), "amount": amount,
+    }
+
+
+def _start_quantity_price_clarification(chat_id, user_id, display_name, text, ctx):
+    """Builds pending_quantity_price_intent from `text` (deterministic,
+    zero Gemini calls) and sends the four-choice clarification. Returns
+    False (never sends a message, never creates the pending state) if the
+    raw text couldn't be safely split into item name/quantity/amount —
+    callers must fall back to their own existing guard/message in that
+    case, never silently drop the ambiguity."""
+    fields = _extract_quantity_price_intent_fields(text)
+    if fields is None:
+        return False
+    origin = household_router.current_origin(chat_id)
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+    except Exception:
+        send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.")
+        return True
+    pending_quantity_price_intent[chat_id] = {
+        **fields,
+        "household_id": household_id, "user_db_id": user_db_id, "origin": origin, "ctx": ctx,
+    }
+    send_message(chat_id, QUANTITY_PRICE_CLARIFY_MSG, reply_markup=QUANTITY_PRICE_CLARIFY_KEYBOARD)
+    return True
+
+
+def _apply_quantity_price_choice_add_shopping(chat_id, data):
+    """"🛒 Додати до покупок" choice — builds the SAME shopping add-preview
+    Global Explicit/Bare Add already use (household_router.build_add_
+    preview_from_items), with an honest note that the price was NOT
+    recorded anywhere (no schema change, no hidden field)."""
+    origin = data["origin"]
+    keyboard = household_router.origin_keyboard(origin)
+    try:
+        household_id = data["household_id"]
+        user_db_id = data["user_db_id"]
+        alias_map = get_household_alias_map(household_id)
+        raw_item = {"name": data["item_name"], "quantity_text": data["quantity_text"]}
+        validated_items = household_router.validate_mini_planner_add_items([raw_item], alias_map)
+        if not validated_items:
+            send_message(chat_id, "Не вдалося безпечно розпізнати товар. Спробуй написати команду ще раз.", reply_markup=keyboard)
+            return
+        kind, payload = household_router.build_add_preview_from_items("add_shopping", validated_items, [])
+        payload["expense_calculation_note"] = (
+            f"Ціну {expenses._format_expense_amount(data['amount'])} не записано — обрано лише «{QUANTITY_PRICE_CHOICE_SHOPPING}»."
+        )
+        _handle_household_router_result(chat_id, kind, payload, household_id, user_db_id, origin, keyboard)
+    except Exception:
+        send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+
+
+def _apply_quantity_price_choice_expense(chat_id, data):
+    """"💸 Записати витрату" choice — builds the SAME expense preview photo
+    receipts already use for pre-validated data (expenses.build_receipt_
+    expense_preview). No shopping/inventory item is ever created for this
+    choice. Category defaults to "Інше" (never guessed beyond that) since
+    no Gemini call classified it — same "не вдалося визначити точно" note
+    every other auto-defaulted expense category already shows."""
+    origin = data["origin"]
+    keyboard = household_router.origin_keyboard(origin)
+    try:
+        today = datetime.now(ZoneInfo("Europe/Warsaw")).date()
+        description = f"{data['item_name']} {data['quantity_text']}".strip()
+        expenses.build_receipt_expense_preview(
+            chat_id, data["household_id"], data["user_db_id"], origin,
+            data["amount"], "Інше", description, today, category_was_defaulted=True,
+        )
+    except Exception:
+        send_message(chat_id, "Не вдалося обробити витрату. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+
+
+def _apply_quantity_price_choice_already_bought(chat_id, data):
+    """"✅ Уже купив" choice — reuses household_router.build_add_preview_
+    from_items("add_inventory", ...) for the SAME Inventory Representation
+    Guard safety checks Global Explicit/Bare Add already run, then sets
+    new_expenses/new_expense on that SAME "ok" payload before handing it to
+    _handle_household_router_result — one COMBINED pending_global_household
+    preview, applied atomically by apply_global_household_operations (the
+    SAME transaction "Купив X за Y zł" already uses). If the representation
+    guard can't safely combine them (kind != "ok"), sends a controlled
+    message and writes NOTHING — never a partial add-only or expense-only
+    write for this choice. KNOWN LIMITATION: never searches for or removes/
+    marks a matching shopping-list entry (see this section's own module
+    comment) — the preview only ever promises inventory + expense."""
+    origin = data["origin"]
+    keyboard = household_router.origin_keyboard(origin)
+    try:
+        household_id = data["household_id"]
+        user_db_id = data["user_db_id"]
+        alias_map = get_household_alias_map(household_id)
+        inventory_items = get_inventory_items(household_id)
+        raw_item = {"name": data["item_name"], "quantity_text": data["quantity_text"]}
+        validated_items = household_router.validate_mini_planner_add_items([raw_item], alias_map)
+        if not validated_items:
+            send_message(chat_id, "Не вдалося безпечно розпізнати товар. Спробуй написати команду ще раз.", reply_markup=keyboard)
+            return
+        kind, payload = household_router.build_add_preview_from_items("add_inventory", validated_items, inventory_items)
+        if kind != "ok":
+            send_message(
+                chat_id,
+                "Не зміг безпечно об'єднати покупку в один план — кількість товару конфліктує з тим, що вже є в "
+                "запасах. Додай товар і витрату окремими командами.",
+                reply_markup=keyboard,
+            )
+            return
+        today = datetime.now(ZoneInfo("Europe/Warsaw")).date()
+        expense_entry = {
+            "amount": data["amount"], "currency": "PLN", "category": "Інше",
+            "category_was_defaulted": True, "description": data["item_name"], "expense_date": today,
+        }
+        payload["new_expenses"] = [expense_entry]
+        payload["new_expense"] = expense_entry
+        _handle_household_router_result(chat_id, kind, payload, household_id, user_db_id, origin, keyboard)
+    except Exception:
+        send_message(chat_id, "Не вдалося обробити команду. Спробуй ще раз трохи пізніше.", reply_markup=keyboard)
+
+
+def _continue_quantity_price_intent(chat_id, text):
+    """Wired as message_dispatcher.py's PendingRouteDeps.continue_
+    quantity_price_intent — resolves ANY text while pending_quantity_
+    price_intent is active. A recognized choice pops the pending state
+    FIRST (duplicate-press protection, same convention as every other
+    confirm handler in this file) and builds the matching existing domain
+    preview; anything else (including a stray "❌ Скасувати" — already
+    intercepted earlier in V3B/the shared cancel elif-chain before this is
+    ever reached) gets a controlled "didn't understand" message, the
+    pending state left untouched."""
+    data = pending_quantity_price_intent.get(chat_id)
+    if data is None:
+        return
+    stripped = (text or "").strip()
+    if stripped == QUANTITY_PRICE_CHOICE_SHOPPING:
+        pending_quantity_price_intent.pop(chat_id, None)
+        _apply_quantity_price_choice_add_shopping(chat_id, data)
+        return
+    if stripped == QUANTITY_PRICE_CHOICE_EXPENSE:
+        pending_quantity_price_intent.pop(chat_id, None)
+        _apply_quantity_price_choice_expense(chat_id, data)
+        return
+    if stripped == QUANTITY_PRICE_CHOICE_ALREADY_BOUGHT:
+        pending_quantity_price_intent.pop(chat_id, None)
+        _apply_quantity_price_choice_already_bought(chat_id, data)
+        return
+    send_message(chat_id, QUANTITY_PRICE_UNRECOGNIZED_CHOICE_MSG, reply_markup=QUANTITY_PRICE_CLARIFY_KEYBOARD)
+
+
+_EXPLICIT_EXPENSE_VERB_RE = re.compile(r"^запиши\w*\b", re.IGNORECASE)
+
+
+def _route_quantity_price_clarification(chat_id, user_id, display_name, text):
+    """Global (no active saved-list context required) trigger for Quantity
+    + Price Intent Clarification V1 — covers the main-menu case (see this
+    section's own module comment). While a saved shopping/inventory list
+    context IS active, _route_active_list_context_command's own money+
+    quantity branch already builds this SAME clarification first (checked
+    earlier in _dispatch_command_routes — see CommandRouteDeps.active_
+    list_context_route), so this route is only ever reached when no context
+    claimed the message.
+
+    Defers (returns False, never sends a message) whenever:
+      - no explicit item quantity or no money amount is present at all
+        (quantities.looks_like_money_amount/looks_like_explicit_item_
+        quantity — the exact same detection Context Intent Safety V1
+        already uses);
+      - a purchase verb is present ("купив"/"взяли"/... —
+        legacy_shopping_flow._PURCHASE_VERB_RE) — the message already has
+        its own unambiguous existing route: household_router.gate()'s
+        _BOUGHT_RE match into the Global Household Router's combined
+        buy+expense compound preview;
+      - the message starts with an explicit "Додай"/"Додайте"/"Додати" add
+        verb — already has its own existing disambiguation
+        (_is_ambiguous_add_with_price/AMBIGUOUS_ADD_WITH_PRICE_MSG, checked
+        right after this route in _dispatch_command_routes) or, if it names
+        an explicit destination, an existing unambiguous shopping/inventory
+        add route entirely (explicit_global_add/bare_global_add);
+      - the message starts with an explicit "Запиши..." expense verb —
+        already has its own unambiguous existing route
+        (expenses._expense_command_gate's own "запиши витрату" prefix,
+        global_expense_command).
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if not quantities.looks_like_money_amount(text) or not quantities.looks_like_explicit_item_quantity(text):
+        return False
+    stripped = text.strip()
+    if legacy_shopping_flow._PURCHASE_VERB_RE.search(text):
+        return False
+    if _AMBIGUOUS_ADD_PREFIX_RE.match(stripped):
+        return False
+    if _EXPLICIT_EXPENSE_VERB_RE.match(stripped):
+        return False
+    return _start_quantity_price_clarification(chat_id, user_id, display_name, text, ctx=None)
 
 
 def _apply_inventory_transform_confirm(chat_id):
@@ -5244,6 +5585,7 @@ _interaction_state_deps = interaction_state.InteractionStateDeps(
     pending_cleanup_admin_disambiguation=pending_cleanup_admin_disambiguation,
     pending_destructive_guard=pending_destructive_guard,
     pending_inventory_transform=pending_inventory_transform,
+    pending_quantity_price_intent=pending_quantity_price_intent,
     pending_undo_action=pending_undo_action,
     active_list_context=active_list_context,
     saved_list_context=saved_list_context,
@@ -5295,6 +5637,10 @@ _pending_route_deps = message_dispatcher.PendingRouteDeps(
     # Preview Edit V2 — pending_global_household add previews (shopping_add/
     # inventory_add) support safe text edits (see preview_editing.py).
     handle_global_household_edit=lambda *a, **kw: _handle_global_household_edit_text(*a, **kw),
+    # Quantity + Price Intent Clarification V1 — awaiting one of the four
+    # choice replies for a pending_quantity_price_intent question.
+    pending_quantity_price_intent=pending_quantity_price_intent,
+    continue_quantity_price_intent=lambda *a, **kw: _continue_quantity_price_intent(*a, **kw),
 )
 
 # =========================
@@ -6187,6 +6533,10 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
             data = pending_destructive_guard.pop(chat_id, None)
             origin = (data or {}).get("origin", "global")
             send_message(chat_id, DESTRUCTIVE_GUARD_CANCELLED_MSG, reply_markup=household_router.origin_keyboard(origin))
+        elif chat_id in pending_quantity_price_intent:
+            data = pending_quantity_price_intent.pop(chat_id, None)
+            origin = (data or {}).get("origin", "global")
+            send_message(chat_id, "Уточнення скасовано.", reply_markup=household_router.origin_keyboard(origin))
         elif chat_id in pending_undo_action:
             pending_undo_action.pop(chat_id, None)
             send_message(chat_id, action_history.UNDO_CANCELLED_MSG, reply_markup=MAIN_KEYBOARD)
@@ -6529,6 +6879,7 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
 # same patch.object(bot, ...) reasoning as every other callback container.
 _command_route_deps = message_dispatcher.CommandRouteDeps(
     active_list_context_route=lambda *a, **kw: _route_active_list_context_command(*a, **kw),
+    quantity_price_clarification_route=lambda *a, **kw: _route_quantity_price_clarification(*a, **kw),
     ambiguous_add_route=lambda *a, **kw: _route_ambiguous_add(*a, **kw),
     explicit_global_add=lambda *a, **kw: _route_global_explicit_add(*a, **kw),
     bare_global_add=lambda *a, **kw: _route_global_bare_add(*a, **kw),

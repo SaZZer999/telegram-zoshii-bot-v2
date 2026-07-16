@@ -251,7 +251,9 @@ def handle_start_inventory_remove(deps, chat_id, user_id, display_name):
 # Context Intent Safety V1 — same purchase-verb exclusion as legacy_shopping_
 # flow._PURCHASE_VERB_RE (see its own docstring for the full rationale: a
 # "Купив X за Y zł" compound phrasing stays inside active mode, unchanged).
-_PURCHASE_VERB_RE = re.compile(r"купив|купила|купили|придбав|придбала", re.IGNORECASE)
+# "взял\w*"/"взяв" added by Quantity + Price Intent Clarification V1 — kept
+# in sync with household_router._BOUGHT_RE's own identical addition.
+_PURCHASE_VERB_RE = re.compile(r"купив|купила|купили|придбав|придбала|взял\w*|взяв", re.IGNORECASE)
 
 # Context Intent Safety V1 — same controlled refusal as legacy_shopping_
 # flow.py's own _MONEY_AND_QUANTITY_CLARIFY_MSG, duplicated on purpose (same

@@ -66,6 +66,7 @@ def _make_fake_deps(**overrides):
         pending_cleanup_admin_disambiguation={},
         pending_destructive_guard={},
         pending_inventory_transform={},
+        pending_quantity_price_intent={},
         pending_undo_action={},
         active_list_context={},
         saved_list_context={},

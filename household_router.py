@@ -102,7 +102,13 @@ def origin_keyboard(origin):
 # correctly today.
 # =========================
 _BUY_PLAN_RE = re.compile(r"планую купити|хочу купити|треба купити|потрібно купити", re.IGNORECASE)
-_BOUGHT_RE = re.compile(r"купив|купила|купили|придбав|придбала", re.IGNORECASE)
+# Quantity + Price Intent Clarification V1 — "взял\w*"/"взяв" added (covers
+# "взяли"/"взяла"/"взяв") so "Взяли сир 500 г за 12 zł" is recognized as the
+# same compound purchase phrasing "Купив ..."/"Придбав ..." already is,
+# matching shopping_action_planner.py's own _BOUGHT_OR_TAKEN_VERB_ROOTS
+# (which already treats "взял"/"взяв" as a bought/taken verb root for its
+# own, unrelated "already marked bought" shape).
+_BOUGHT_RE = re.compile(r"купив|купила|купили|придбав|придбала|взял\w*|взяв", re.IGNORECASE)
 _CONSUME_RE = re.compile(
     r"з[’']?їв|з[’']?їла|з[’']?їли|використав|використала|використали|"
     r"спожив|спожила|спожили|доїв|доїла",

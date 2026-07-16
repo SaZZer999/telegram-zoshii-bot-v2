@@ -218,8 +218,10 @@ def handle_start_delete(deps, chat_id, user_id, display_name):
 # documented priority over it (see test_global_household_operations.py's
 # "active_selection_mode_has_priority") and this fix must not change that —
 # it only targets a plain "item name + price" statement with no purchase
-# verb, never this compound shape.
-_PURCHASE_VERB_RE = re.compile(r"купив|купила|купили|придбав|придбала", re.IGNORECASE)
+# verb, never this compound shape. "взял\w*"/"взяв" added by Quantity +
+# Price Intent Clarification V1 — kept in sync with household_router.
+# _BOUGHT_RE's own identical addition (see that regex's own comment).
+_PURCHASE_VERB_RE = re.compile(r"купив|купила|купили|придбав|придбала|взял\w*|взяв", re.IGNORECASE)
 
 # Context Intent Safety V1 — controlled refusal for an ambiguous "item
 # quantity + price in one message" shape (e.g. "Молоко 1 л 4,99 zł"): V1
