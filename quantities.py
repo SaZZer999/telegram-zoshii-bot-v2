@@ -45,6 +45,10 @@ _UNIT_ALIASES = {
     "грамм": "г", "граммов": "г",
     "кг": "кг", "кілограм": "кг", "кілограми": "кг", "кілограмів": "кг", "kg": "кг",
     "килограмм": "кг", "килограмов": "кг",
+    # Word-number Quantity + Price V1 — "литр" (Russian spelling, "и"
+    # instead of "і") is one of the explicitly required Whisper-transcript
+    # forms for this feature.
+    "литр": "л", "литра": "л",
 }
 
 # Cross-unit merge groups: units within the same group ("mass"/"volume") are
@@ -252,3 +256,277 @@ def merge_quantity_values(value_a, unit_a, value_b, unit_b):
         return None
     converted_b = (dec_b * group_b[1]) / group_a[1]
     return dec_a + converted_b, unit_a
+
+
+# =========================
+# WORD-NUMBER QUANTITY + PRICE V1 — a small, deterministic, compositional
+# Ukrainian/Russian number-word parser (0-999 whole part, 0-99 fractional/
+# grosze part) for household quantity ("один літр", "двісті п'ятдесят
+# грамів") and PLN money ("чотири дев'яносто дев'ять злотих", "дванадцять
+# злотих") phrases spoken/transcribed as words instead of digits — NOT a
+# general-purpose number-to-words calculator. Fixes a live bug: "Тестове
+# молоко один літр за чотири дев'яносто дев'ять злотих" fell all the way
+# through to general AI-chat (which fabricated "I can't write to a
+# database") because neither the digit-based quantities.looks_like_money_
+# amount/looks_like_explicit_item_quantity detection nor bot.py's Quantity
+# + Price Intent Clarification V1 (545113e) recognize spelled-out numbers
+# at all — both only ever look for an actual digit.
+#
+# normalize_word_number_measurements(text) is the single public entrypoint
+# most callers should use — it rewrites word-number quantity/money phrases
+# into the SAME digit+unit/digit+currency shapes the existing numeric
+# pipeline already understands ("Тестове молоко один літр за чотири
+# дев'яносто дев'ять злотих" -> "Тестове молоко 1 л за 4,99 zł"), so every
+# downstream route (pending_quantity_price_intent, the Global Household
+# Router's own "Купив X за Y zł" purchase gate, ...) keeps working
+# completely unchanged on a plain digit-normalized string — never a second
+# Gemini call, never a new pending-state shape, never a new Gemini prompt.
+# =========================
+_WORD_NUMBER_ONES = {
+    "нуль": 0, "один": 1, "одна": 1, "одне": 1, "одну": 1, "одної": 1,
+    "два": 2, "дві": 2,
+    "три": 3,
+    "чотири": 4,
+    "пять": 5,
+    "шість": 6,
+    "сім": 7,
+    "вісім": 8,
+    "девять": 9,
+}
+_WORD_NUMBER_TEENS = {
+    "десять": 10, "одинадцять": 11, "дванадцять": 12, "тринадцять": 13,
+    "чотирнадцять": 14, "пятнадцять": 15, "шістнадцять": 16, "сімнадцять": 17,
+    "вісімнадцять": 18, "девятнадцять": 19,
+}
+_WORD_NUMBER_TENS = {
+    "двадцять": 20, "тридцять": 30, "сорок": 40, "пятдесят": 50,
+    "шістдесят": 60, "сімдесят": 70, "вісімдесят": 80, "девяносто": 90,
+}
+_WORD_NUMBER_HUNDREDS = {
+    "сто": 100, "двісті": 200, "триста": 300, "чотириста": 400,
+    "пятсот": 500, "шістсот": 600, "сімсот": 700, "вісімсот": 800,
+    "девятсот": 900,
+}
+_HALF_QUANTITY_WORDS = {"пів", "половина", "половину", "половини"}
+# "злот..." stem — mirrors expenses._EXPENSE_AMOUNT_RE's own "злот\w*"
+# digit-side marker, so a word phrase is recognized as PLN by the exact
+# same currency vocabulary the digit pipeline already trusts.
+_CURRENCY_WORD_PREFIX = "злот"
+_GROSZE_WORDS = {"гроші", "гроша", "грошей", "копійок", "копійки", "копійка", "копійку"}
+_WORD_NUMBER_ZA_RE = re.compile(r"\bза\b", re.IGNORECASE)
+
+
+def _clean_word_number_token(word):
+    """Lowercase, strip trailing/leading punctuation and apostrophe
+    variants (Ukrainian "п'ять" is spelled with an ASCII "'", a typographic
+    "’", a modifier-letter "ʼ", or no apostrophe at all in mixed/Russian-
+    influenced speech) — used only for number/unit/currency-word DICT
+    LOOKUPS, never for the actual text spliced back into the normalized
+    result."""
+    cleaned = word.strip(".,!?;:").lower()
+    return cleaned.replace("'", "").replace("’", "").replace("ʼ", "")
+
+
+def _consume_word_number(cleaned_words, start):
+    """Greedily consume a run of number-words at `cleaned_words[start:]` —
+    an optional hundreds word, then EITHER a teens word OR a tens word
+    (optionally followed by an ones word) OR a bare ones word — summing
+    into one integer 0-999. Returns (value, next_index), or (None, start)
+    if `cleaned_words[start]` isn't a recognized number-word at all."""
+    idx = start
+    total = 0
+    matched = False
+
+    def word_at(i):
+        return cleaned_words[i] if i < len(cleaned_words) else None
+
+    w = word_at(idx)
+    if w in _WORD_NUMBER_HUNDREDS:
+        total += _WORD_NUMBER_HUNDREDS[w]
+        idx += 1
+        matched = True
+        w = word_at(idx)
+
+    if w in _WORD_NUMBER_TEENS:
+        total += _WORD_NUMBER_TEENS[w]
+        idx += 1
+        matched = True
+    elif w in _WORD_NUMBER_TENS:
+        total += _WORD_NUMBER_TENS[w]
+        idx += 1
+        matched = True
+        w = word_at(idx)
+        if w in _WORD_NUMBER_ONES:
+            total += _WORD_NUMBER_ONES[w]
+            idx += 1
+    elif w in _WORD_NUMBER_ONES:
+        total += _WORD_NUMBER_ONES[w]
+        idx += 1
+        matched = True
+
+    if not matched:
+        return None, start
+    return total, idx
+
+
+_WORD_NUMBER_TRAILING_PUNCT = ".,!?;:"
+
+
+def _tokenize_with_spans(text):
+    """Whitespace-delimited tokens with their character spans, TRAILING
+    punctuation (".,!?;:") excluded from both the returned word and its
+    span end — so a matched phrase's replacement span never accidentally
+    swallows a comma/period that belongs to the SURROUNDING sentence (e.g.
+    "одна штука, бо ..." — the comma right after "штука" must survive a
+    quantity-phrase replacement, since callers like inventory.py's own
+    _EXPLANATORY_TAIL_RE require that exact comma to still be there)."""
+    tokens = []
+    for m in re.finditer(r"\S+", text):
+        start = m.start()
+        trimmed = m.group(0).rstrip(_WORD_NUMBER_TRAILING_PUNCT)
+        tokens.append((trimmed, start, start + len(trimmed)))
+    return tokens
+
+
+def parse_word_quantity(text):
+    """Find the FIRST word-number household quantity phrase in `text`:
+    either a "пів"/"половина"/"половину"/"половини" + unit word half-phrase
+    (-> 0.5), or a number-word run (0-999) immediately followed by a
+    recognized structured-unit word (see _UNIT_ALIASES — шт/г/кг/мл/л and
+    every declined/Russian-spelling alias already registered there). Returns
+    (value: Decimal, unit: str, start: int, end: int) — the character span
+    in `text` this phrase occupies — or None if no such phrase exists.
+    Never guesses beyond an exact number-word + exact unit-word match."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    tokens = _tokenize_with_spans(text)
+    cleaned = [_clean_word_number_token(t[0]) for t in tokens]
+
+    for i, w in enumerate(cleaned):
+        if w in _HALF_QUANTITY_WORDS and i + 1 < len(cleaned):
+            unit = _UNIT_ALIASES.get(cleaned[i + 1])
+            if unit:
+                return Decimal("0.5"), unit, tokens[i][1], tokens[i + 1][2]
+
+    i = 0
+    while i < len(cleaned):
+        value, next_i = _consume_word_number(cleaned, i)
+        if value is not None and next_i < len(cleaned):
+            unit = _UNIT_ALIASES.get(cleaned[next_i])
+            if unit:
+                return Decimal(value), unit, tokens[i][1], tokens[next_i][2]
+        i += 1
+    return None
+
+
+def parse_word_money_amount(text, require_currency_marker=True):
+    """Find the FIRST word-number PLN money phrase in `text`: a whole-part
+    number-word run (0-999), a "злот..." currency word (either right after
+    the whole part, e.g. "дванадцять злотих"/"п'ятдесят один злотий двадцять
+    три гроші", or right after the fractional part, e.g. "чотири дев'яносто
+    дев'ять злотих" — both orders appear in real speech), an optional
+    fractional-part number-word run (0-99, grosze), and an optional explicit
+    grosze word ("гроші"/"копійк...") right after that fractional part.
+
+    `require_currency_marker=True` (the default, for standalone use) rejects
+    a bare "N N" two-number-group phrase with no currency/grosze word
+    anywhere — too ambiguous outside a context that already established
+    "this is a price" (see normalize_word_number_measurements's own
+    "за"-splitting, which passes False there for exactly that reason, so a
+    colloquial "п'ять сорок дев'ять" — "5.49" with no "злотих" word at all —
+    is still trusted once "за" already said what follows is a price).
+
+    Returns (amount: Decimal, start: int, end: int) or None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    tokens = _tokenize_with_spans(text)
+    cleaned = [_clean_word_number_token(t[0]) for t in tokens]
+
+    i = 0
+    while i < len(cleaned):
+        whole, after_whole = _consume_word_number(cleaned, i)
+        if whole is None:
+            i += 1
+            continue
+        end_i = after_whole
+        saw_currency = False
+        if end_i < len(cleaned) and cleaned[end_i].startswith(_CURRENCY_WORD_PREFIX):
+            saw_currency = True
+            end_i += 1
+
+        fraction = 0
+        saw_fraction = False
+        frac_value, after_frac = _consume_word_number(cleaned, end_i)
+        if frac_value is not None and frac_value < 100:
+            fraction = frac_value
+            saw_fraction = True
+            end_i = after_frac
+            if not saw_currency and end_i < len(cleaned) and cleaned[end_i].startswith(_CURRENCY_WORD_PREFIX):
+                saw_currency = True
+                end_i += 1
+            if end_i < len(cleaned) and cleaned[end_i] in _GROSZE_WORDS:
+                end_i += 1
+
+        if not saw_currency and not saw_fraction:
+            i += 1
+            continue
+        if require_currency_marker and not saw_currency:
+            i += 1
+            continue
+
+        amount = Decimal(whole) + (Decimal(fraction) / Decimal(100) if saw_fraction else Decimal(0))
+        return amount, tokens[i][1], tokens[end_i - 1][2]
+    return None
+
+
+def _format_word_money_amount(amount):
+    """Comma-decimal "4,99 zł" display, same convention as expenses.py's
+    own _format_expense_amount — duplicated here as one tiny pure line
+    rather than importing expenses.py (which itself imports database.py;
+    quantities.py stays the dependency-free leaf module its own top-of-file
+    docstring already commits to)."""
+    return f"{amount.quantize(Decimal('0.01')):.2f}".replace(".", ",") + " zł"
+
+
+def normalize_word_number_measurements(text):
+    """Deterministically rewrite Ukrainian/Russian word-number quantity and
+    money phrases in `text` into the SAME digit+unit/digit+currency shapes
+    the existing numeric pipeline already understands ("Тестове молоко один
+    літр за чотири дев'яносто дев'ять злотих" -> "Тестове молоко 1 л за
+    4,99 zł") — see this section's own module comment for the full
+    reasoning. "за" splits the quantity search zone (everything before it)
+    from the money search zone (everything after it); the money search only
+    relaxes its currency-word requirement inside that zone — a bare "п'ять
+    сорок дев'ять" two-number shape is only trusted as a price once "за"
+    already said so. With no "за" at all, both searches run over the whole
+    text, and the money search still requires an explicit currency/grosze
+    word (never guessed from two bare numbers alone).
+
+    Returns `text` UNCHANGED if neither phrase is found — safe to call
+    unconditionally on every incoming message; a normal digit-only,
+    non-household, or already-numeric message round-trips untouched."""
+    if not isinstance(text, str) or not text.strip():
+        return text
+
+    za_match = _WORD_NUMBER_ZA_RE.search(text)
+    if za_match:
+        quantity_zone_end = za_match.start()
+        price_zone_start = za_match.end()
+    else:
+        quantity_zone_end = len(text)
+        price_zone_start = 0
+
+    result = text
+
+    money = parse_word_money_amount(text[price_zone_start:], require_currency_marker=(za_match is None))
+    if money is not None:
+        amount, rel_start, rel_end = money
+        abs_start, abs_end = price_zone_start + rel_start, price_zone_start + rel_end
+        result = result[:abs_start] + _format_word_money_amount(amount) + result[abs_end:]
+
+    quantity = parse_word_quantity(text[:quantity_zone_end])
+    if quantity is not None:
+        value, unit, q_start, q_end = quantity
+        result = result[:q_start] + format_quantity_display(value, unit) + result[q_end:]
+
+    return result

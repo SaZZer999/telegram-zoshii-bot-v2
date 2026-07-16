@@ -454,6 +454,27 @@ class DispatcherDeps:
     # exactly once, exactly as before this planner existed. Optional for
     # the same reason as every other field above.
     mini_action_planner: Callable = None
+    # Word-number Quantity + Price V1 — optional (default None), same
+    # reasoning as every other Optional field above. Applied ONCE, at the
+    # very top of dispatch() itself — BEFORE confirm/cancel, navigation,
+    # every pending route, every command route, AND Phase D (cooking_mode/
+    # meal_ideas/household_read/mini_action_planner/general_ai_fallback) —
+    # rewrites a spelled-out household quantity/money phrase ("Тестове
+    # молоко один літр за чотири дев'яносто дев'ять злотих") into the SAME
+    # digit+unit/digit+currency shape ("Тестове молоко 1 л за 4,99 zł") the
+    # existing numeric pipeline already understands. Deliberately NOT
+    # nested inside CommandRouteDeps (a first, narrower design put it at
+    # the top of _dispatch_command_routes only — but Phase D's general_ai_
+    # fallback/mini_action_planner read `dispatch()`'s OWN `text` parameter,
+    # never whatever _dispatch_command_routes reassigned its own local copy
+    # to, so a word-number message that reached Phase D unclaimed would
+    # have seen the RAW, un-normalized text there — this field's home at
+    # the DispatcherDeps level is what makes normalization visible
+    # everywhere, exactly once per update). A no-op (returns `text`
+    # unchanged) for any message with no word-number phrase at all, so
+    # every route's/Phase D's existing behavior for digit-only or unrelated
+    # text is 100% unaffected.
+    normalize_word_numbers: Callable = None
 
 
 def _dispatch_confirm_or_cancel(deps, chat_id, user_id, display_name, text):
@@ -1005,6 +1026,12 @@ def dispatch(deps, chat_id, user_id, display_name, text):
     returns `RouteOutcome.HANDLED` — Phase D always produces a response one
     way or another, so callers no longer need to branch on the result.
     """
+    if deps.normalize_word_numbers is not None:
+        # Word-number Quantity + Price V1 — see DispatcherDeps.normalize_
+        # word_numbers's own docstring for why this lives here (applied
+        # exactly once, before EVERYTHING below, including Phase D).
+        text = deps.normalize_word_numbers(text)
+
     outcome = _resolve_route_outcome(deps, chat_id, user_id, display_name, text)
 
     if deps.cooking_mode is None:

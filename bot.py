@@ -63,7 +63,10 @@ import expenses
 import household_router
 import action_history
 import quantities
-from quantities import STRUCTURED_UNITS, format_quantity_display, merge_quantity_values, _UNIT_ALIASES
+from quantities import (
+    STRUCTURED_UNITS, format_quantity_display, merge_quantity_values, _UNIT_ALIASES,
+    normalize_word_number_measurements, parse_word_quantity, parse_word_money_amount,
+)
 import inventory
 from inventory import (
     find_inventory_representation_matches,
@@ -4026,6 +4029,13 @@ def _extract_quantity_price_intent_fields(text):
     name = text
     for start, end in sorted([qty_match.span(), money_match.span()], reverse=True):
         name = name[:start] + " " + name[end:]
+    # Word-number Quantity + Price V1 — after quantities.normalize_word_
+    # number_measurements rewrites a spelled-out phrase, the "за" separator
+    # word ("Тестове молоко 1 л за 4,99 zł") is still sitting between the
+    # two spans just removed above; a bare "за" is never a legitimate part
+    # of an item name, so it's stripped here too (same treatment as the
+    # quantity/money spans themselves).
+    name = re.sub(r"\bза\b", " ", name, flags=re.IGNORECASE)
     name = re.sub(r"\s+", " ", name).strip().rstrip(",.!?").strip()
     if not name:
         return None
@@ -4551,8 +4561,16 @@ def _try_mini_action_planner(chat_id, user_id, display_name, text):
     згортається в каві?") down to the ONE Gemini call general_ai_fallback
     already makes, instead of burning a second, wasted classify() call on a
     message this planner was never going to recognize as one of its five
-    actions anyway."""
-    if _looks_like_destructive_bulk_household_request(text) or _looks_like_unrouted_household_action(text):
+    actions anyway. Also defers to _looks_like_unparsed_quantity_price_
+    household_text(text) (Word-number Quantity + Price V1) — a message
+    general_ai_fallback would answer with the controlled QUANTITY_PRICE_
+    PARSE_FAILURE_MSG must never first burn a classify() call here either;
+    same "defer, don't guess" reasoning as the two checks above."""
+    if (
+        _looks_like_destructive_bulk_household_request(text)
+        or _looks_like_unrouted_household_action(text)
+        or _looks_like_unparsed_quantity_price_household_text(text)
+    ):
         return False
 
     if not mini_action_planner.looks_household_like(text):
@@ -6165,6 +6183,59 @@ UNROUTED_HOUSEHOLD_ACTION_MSG = (
 )
 
 
+# =========================
+# WORD-NUMBER QUANTITY + PRICE V1 — operational fallback guard. Live bug:
+# "Тестове молоко один літр за чотири дев'яносто дев'ять злотих" fell all
+# the way through to general AI-chat, which fabricated "я не можу
+# самостійно записати цей товар або витрату до бази даних" — a lie: the
+# bot DOES have working preview/confirm flows for exactly this, Gemini
+# general-chat just has no idea they exist. quantities.normalize_word_
+# number_measurements (above, wired at the top of message_dispatcher.py's
+# _dispatch_command_routes) now handles every phrasing this V1 explicitly
+# supports — but it's deliberately narrow (0-999/0-99, a fixed number-word
+# vocabulary), so SOME operational quantity+price message can still fail to
+# fully normalize/parse. This guard is the safety net for exactly that
+# remainder: a message that plausibly names a product with BOTH a
+# quantity-like signal AND a money-like signal (digit-based OR word-based —
+# reuses the exact same detectors the digit/word pipelines already use,
+# never a new heuristic) must NEVER reach general AI-chat and get answered
+# with an invented "I can't write to the database" — it gets a short,
+# honest, controlled request to write the numbers as digits instead.
+# Deliberately requires BOTH signals together (not just one) so a plain
+# informational question that only mentions a unit word ("Скільки літрів
+# води треба пити?") or only a price-adjacent word ("Чому молоко коштує
+# дорожче?") — neither of which carries an attached NUMBER at all — never
+# matches: quantities.looks_like_explicit_item_quantity/parse_word_quantity
+# both require a number-word/digit immediately attached to the unit, and
+# looks_like_money_amount/parse_word_money_amount both require a number
+# attached to a currency marker (or, for the word parser, at least a
+# fraction/grosze shape) — a bare topical word alone is never enough.
+# =========================
+QUANTITY_PRICE_PARSE_FAILURE_MSG = (
+    "Бачу товар, кількість і ціну, але не зміг точно розібрати числа.\n"
+    "Напиши цифрами, наприклад: «Молоко 1 л 4,99 zł»."
+)
+
+
+def _looks_like_unparsed_quantity_price_household_text(text):
+    """True if `text` carries BOTH a quantity-like signal and a money-like
+    signal (digit-based or word-based) that the normalize_word_number_
+    measurements + Quantity Price Intent Clarification V1 pipeline still
+    couldn't turn into a usable preview/clarification by the time this
+    guard is reached — see this section's own module comment. Pure/local,
+    never calls Gemini."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    has_quantity_signal = (
+        quantities.looks_like_explicit_item_quantity(text) or parse_word_quantity(text) is not None
+    )
+    has_money_signal = (
+        quantities.looks_like_money_amount(text)
+        or parse_word_money_amount(text, require_currency_marker=False) is not None
+    )
+    return has_quantity_signal and has_money_signal
+
+
 def _run_general_ai_fallback(chat_id, text):
     """Exact, unchanged general AI-chat fallback (Gemini 3.1 Flash Lite) —
     extracted from webhook()'s final block into a named function so it can
@@ -6193,6 +6264,10 @@ def _run_general_ai_fallback(chat_id, text):
 
     if _looks_like_unrouted_household_action(text):
         send_message(chat_id, UNROUTED_HOUSEHOLD_ACTION_MSG, reply_markup=keyboard)
+        return
+
+    if _looks_like_unparsed_quantity_price_household_text(text):
+        send_message(chat_id, QUANTITY_PRICE_PARSE_FAILURE_MSG, reply_markup=keyboard)
         return
 
     if chat_id not in user_history:
@@ -6953,6 +7028,7 @@ _meal_ideas_deps = meal_ideas.MealIdeasDeps(
 # "_try_handle_special_button"/"_try_handle_cooking_mode"/
 # "_try_handle_confirm_or_cancel") keeps working through here too.
 _dispatcher_deps = message_dispatcher.DispatcherDeps(
+    normalize_word_numbers=lambda text: normalize_word_number_measurements(text),
     send_message=lambda *a, **kw: send_message(*a, **kw),
     clear_interaction_state=lambda *a, **kw: clear_interaction_state(*a, **kw),
     main_keyboard=MAIN_KEYBOARD,
