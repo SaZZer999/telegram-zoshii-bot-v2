@@ -350,6 +350,30 @@ class CommandRouteDeps:
     # for the DIRECT_GENERAL_AI_FALLBACK path) is ever reached. Checking it
     # here, ahead of direct_household_read, is what actually prevents that.
     destructive_bulk_guard: Callable = None
+    # Inventory Multi-Target Actions V1 — optional (default None), same
+    # reasoning as every other Optional field above. Checked right after
+    # destructive_bulk_guard and BEFORE active_list_context_route (and
+    # therefore before every domain-blind single-target inventory gate
+    # further down: inventory_transform_route/inventory_cleanup_route/
+    # inventory_admin_route/action_planner_route, all of which have their
+    # own single-target parsers that would otherwise swallow a multi-target
+    # message's ENTIRE remainder as one fake product name — see bot.py's
+    # own _try_inventory_multi_target docstring for the exact live bug this
+    # fixes: "Видали одне автокрісло, печиво і один хліб" got folded into a
+    # single "автокрісло, печиво і один хліб" name by inventory_admin_
+    # route's single-target parser before this route existed). Positioned
+    # ahead of active_list_context_route too so a multi-target command works
+    # identically whether or not a saved shopping/inventory list context is
+    # currently open. Its own pre-gate (inventory_multi_target.looks_like_
+    # inventory_multi_target) is a narrow, deterministic, no-Gemini check
+    # requiring an inventory change verb, a deterministic split into 2-10
+    # target phrases, and no shopping/expense/cross-domain marker — a
+    # single-target command, or one carrying an explicit cross-domain
+    # marker, never matches at all, so routing continues exactly as before
+    # this route existed in either case. At most ONE Gemini call per update
+    # (a fallback classifier, only reached when the deterministic splitter
+    # itself can't confidently produce a plan).
+    inventory_multi_target_route: Callable = None
     # Active List Context Routing Stabilization V1 — optional (default
     # None), same reasoning as every other Optional field above. Checked
     # right after destructive_bulk_guard and BEFORE every route below it
@@ -794,6 +818,21 @@ def _dispatch_command_routes(deps, chat_id, user_id, display_name, text):
         # "Очисти запаси" is intercepted before any route below, including
         # household_read's own Phase-D Gemini classifier (see this field's
         # own docstring on CommandRouteDeps).
+        return RouteOutcome.HANDLED
+
+    if (
+        routes.inventory_multi_target_route is not None
+        and routes.inventory_multi_target_route(chat_id, user_id, display_name, text)
+    ):
+        # Inventory Multi-Target Actions V1 — see CommandRouteDeps.
+        # inventory_multi_target_route's own docstring for the exact
+        # ordering reasoning. Checked right after destructive_bulk_guard and
+        # ahead of every single-target inventory gate/active-list-context
+        # route below, but only ever claims a message its own narrow,
+        # deterministic pre-gate positively recognized as a 2-10-target
+        # inventory batch command — everything else (including every
+        # single-target command) falls through to the exact same chain
+        # below, unchanged.
         return RouteOutcome.HANDLED
 
     if routes.active_list_context_route is not None and routes.active_list_context_route(chat_id, user_id, display_name, text):

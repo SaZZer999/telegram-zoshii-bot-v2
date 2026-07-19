@@ -102,6 +102,7 @@ import photo_receipts
 import mini_action_planner
 import action_planner
 import shopping_action_planner
+import inventory_multi_target
 import preview_edit_planner
 
 STALE_PREVIEW_MSG = "Список змінився з іншого пристрою. Онови список і повтори дію."
@@ -3618,6 +3619,227 @@ def _try_shopping_action_planner(chat_id, user_id, display_name, text):
 
 
 # =========================
+# INVENTORY MULTI-TARGET ACTIONS V1 — safe batch consume/delete of SEVERAL
+# named inventory positions from one text/voice command ("Видали одне
+# автокрісло, печиво і один хліб", "Спиши 200 г сиру, 1 л молока та 2
+# сосиски"). See inventory_multi_target.py's own module docstring for the
+# exact live bug this fixes (a single-target parser folding a whole
+# multi-target remainder into one fake product name) and the deterministic-
+# splitter/Gemini-fallback parsing strategy. Checked (message_dispatcher.py's
+# CommandRouteDeps.inventory_multi_target_route) right after
+# destructive_bulk_guard and BEFORE active_list_context_route/every
+# single-target inventory gate below it — those routes' own single-target
+# parsers would otherwise claim a multi-target message first.
+#
+# Reuses, WITHOUT any change: inventory.resolve_inventory_admin_candidates/
+# phrase_declension_matches/normalize_delete_quantity_hint (the exact same
+# candidate-resolution machinery inventory_admin_route/action_planner.py
+# already use), _resolve_consumption (the same partial-consume math
+# consume_inventory_quantity/the active-list-context partial-consume path
+# already use), and — critically — pending_global_household + database.
+# apply_global_household_operations (via _handle_household_router_result's
+# own "ok" branch) for the actual preview/confirm/cancel/atomic-transaction/
+# stale-protection/journal/undo path. NO new pending-state, NO new DB
+# executor, NO change to database.py/interaction_state.py.
+# =========================
+def _resolve_inventory_batch_candidates(chat_id, household_id, items, name_phrase, quantity_hint=None):
+    """Same declension-tolerant-first, admin-candidates-fallback priority as
+    _resolve_active_inventory_context_candidates, plus quantity_hint
+    narrowing on BOTH branches (that helper only narrows the fallback
+    branch, since its own caller never had a hint to narrow with)."""
+    declension_matches = [it for it in items if inventory.phrase_declension_matches(name_phrase, it.get("name") or "")]
+    normalized_hint = inventory.normalize_delete_quantity_hint(quantity_hint) if quantity_hint else None
+    if declension_matches:
+        if normalized_hint:
+            hint_norm = normalized_hint.strip().lower()
+            narrowed = [c for c in declension_matches if (c.get("quantity_text") or "").strip().lower() == hint_norm]
+            if narrowed:
+                return narrowed
+        return declension_matches
+    return _resolve_inventory_admin_candidates(chat_id, household_id, items, name_phrase, normalized_hint)
+
+
+INVENTORY_BATCH_DUPLICATE_MSG_TEMPLATE = (
+    "Позицію «{name}» названо двічі в одній команді. Уточни, будь ласка, окремо для кожної."
+)
+
+
+def _format_inventory_batch_missing_message(names):
+    lines = ["Не знайшов у запасах:"] + [f"• {n}" for n in names] + ["", "Знайдені позиції поки не змінюватиму."]
+    return "\n".join(lines)
+
+
+def _resolve_inventory_batch_targets(chat_id, household_id, items, targets):
+    """All-or-nothing resolution of a validated inventory_multi_target plan
+    against a LIVE inventory snapshot. Returns {"kind": "ok", "consume_
+    changes": [...]} or {"kind": "error", "message": str} — never partially
+    applies, never writes to the database (this function only ever builds
+    the consume_changes list a pending_global_household preview needs;
+    apply_global_household_operations does the actual atomic write, later,
+    only after an explicit confirm)."""
+    normalized_names = [t["item_name"].strip().lower() for t in targets]
+    for name in normalized_names:
+        if normalized_names.count(name) > 1:
+            display_name = next(t["item_name"] for t in targets if t["item_name"].strip().lower() == name)
+            return {"kind": "error", "message": INVENTORY_BATCH_DUPLICATE_MSG_TEMPLATE.format(name=display_name)}
+
+    has_explicit = any(t["quantity_hint"] for t in targets)
+    has_bare = any(not t["quantity_hint"] for t in targets)
+
+    if has_explicit and has_bare:
+        # Mixed batch — never assume a bare target means full delete while
+        # OTHER targets in the same message carry an explicit quantity (see
+        # this module's own "Семантика bare targets" requirement). Block the
+        # whole batch and name exactly the bare target(s), showing their
+        # CURRENT live quantity when unambiguous — never a generic "not
+        # found".
+        lines = ["Не вдалося підготувати всі зміни.", "", "Потрібно уточнити кількість:"]
+        for t in targets:
+            if t["quantity_hint"]:
+                continue
+            candidates = _resolve_inventory_batch_candidates(chat_id, household_id, items, t["item_name"])
+            if len(candidates) == 1:
+                qty = _effective_quantity(candidates[0])[2]
+                lines.append(f"• {candidates[0]['name']} — зараз {qty}" if qty else f"• {candidates[0]['name']}")
+            else:
+                lines.append(f"• {t['item_name']}")
+        lines.append("")
+        lines.append("Інші позиції поки не змінюватиму.")
+        return {"kind": "error", "message": "\n".join(lines)}
+
+    resolved = []
+    used_ids = set()
+    missing = []
+    for t in targets:
+        candidates = _resolve_inventory_batch_candidates(chat_id, household_id, items, t["item_name"], t["quantity_hint"])
+        candidates = [c for c in candidates if c["id"] not in used_ids]
+        if not candidates:
+            missing.append(t["item_name"])
+            continue
+        if len(candidates) > 1:
+            return {
+                "kind": "error",
+                "message": inventory.format_inventory_admin_ambiguous_message(candidates, _effective_quantity),
+            }
+        row = candidates[0]
+        used_ids.add(row["id"])
+        resolved.append({"target": t, "row": row})
+
+    if missing:
+        return {"kind": "error", "message": _format_inventory_batch_missing_message(missing)}
+
+    consume_changes = []
+    for entry in resolved:
+        row = entry["row"]
+        if not has_explicit:
+            # All-bare batch -> batch full-delete (same semantics as an
+            # existing single-target full delete, applied to every target at
+            # once).
+            consume_changes.append({
+                "item_id": row["id"], "name": row["name"],
+                "old_value": row.get("quantity_value"), "old_unit": row.get("quantity_unit"),
+                "old_display": _effective_quantity(row)[2],
+                "new_value": None, "new_unit": None, "new_display": None,
+                "will_remove": True,
+            })
+            continue
+
+        # All-explicit batch -> partial consume/decrement (the SAME
+        # _resolve_consumption math consume_inventory_quantity already
+        # uses; a quantity equal to the full remaining stock naturally
+        # collapses to will_remove=True below, exactly like that existing
+        # path already does).
+        hint = entry["target"]["quantity_hint"]
+        value, unit = inventory_multi_target.resolve_quantity_value(hint)
+        if value is None:
+            return {"kind": "error", "message": f"«{row['name']}» — не можу безпечно визначити кількість для списання."}
+        cur_value = row.get("quantity_value")
+        cur_unit = row.get("quantity_unit")
+        if cur_value is None or cur_unit is None:
+            return {
+                "kind": "error",
+                "message": f"«{row['name']}» — не вказана точна кількість, не можна безпечно списати частину.",
+            }
+        kind, remaining, remaining_unit = _resolve_consumption(cur_value, cur_unit, value, unit)
+        if kind == "incompatible_units":
+            return {"kind": "error", "message": f"«{row['name']}» — несумісні одиниці для списання."}
+        if kind == "insufficient":
+            available = format_quantity_display(cur_value, cur_unit)
+            requested = format_quantity_display(value, unit)
+            return {
+                "kind": "error",
+                "message": f"«{row['name']}» — у запасах лише {available}, а вказано {requested}.",
+            }
+        will_remove = remaining == 0
+        new_value = None if will_remove else float(remaining)
+        new_unit = None if will_remove else remaining_unit
+        consume_changes.append({
+            "item_id": row["id"], "name": row["name"],
+            "old_value": cur_value, "old_unit": cur_unit,
+            "old_display": format_quantity_display(cur_value, cur_unit),
+            "new_value": new_value, "new_unit": new_unit,
+            "new_display": None if will_remove else format_quantity_display(new_value, new_unit),
+            "will_remove": will_remove,
+        })
+
+    return {"kind": "ok", "consume_changes": consume_changes}
+
+
+def _try_inventory_multi_target(chat_id, user_id, display_name, text):
+    """Returns True if the message was fully handled (a batch preview, a
+    clarification, or a controlled error message was sent) — the caller
+    must not fall through to active_list_context_route/any single-target
+    inventory gate in that case. Returns False when the cheap pre-gate
+    rejects the message outright (a single-target command, or one carrying
+    an explicit cross-domain marker) — routing continues exactly as before
+    this route existed, without ever calling Gemini. Calls inventory_multi_
+    target.classify() at most once per message (only when the deterministic
+    splitter itself couldn't produce a plan), and never writes to the
+    database directly — the only outcome besides a controlled message is a
+    pending_global_household preview via _handle_household_router_result's
+    existing "ok" branch."""
+    if not inventory_multi_target.looks_like_inventory_multi_target(text):
+        return False
+
+    if _has_blocking_pending_state_for_reports(chat_id):
+        send_message(chat_id, GLOBAL_HOUSEHOLD_PREVIEW_GUARD_MSG)
+        return True
+
+    plan = inventory_multi_target.parse_multi_target_command(text)
+    if plan is None:
+        plan = inventory_multi_target.classify(text)
+
+    if plan["action"] == "clarify":
+        send_message(chat_id, plan["clarification_question"], reply_markup=INVENTORY_KEYBOARD)
+        return True
+    if plan["action"] != "inventory_batch_change":
+        send_message(chat_id, inventory_multi_target.UNSUPPORTED_MSG, reply_markup=INVENTORY_KEYBOARD)
+        return True
+
+    origin = household_router.current_origin(chat_id)
+    keyboard = household_router.origin_keyboard(origin)
+    try:
+        household_id, user_db_id = get_household_and_user(user_id, display_name)
+        items = get_inventory_items(household_id)
+    except Exception:
+        send_message(chat_id, INVENTORY_ERROR_MSG)
+        return True
+
+    result = _resolve_inventory_batch_targets(chat_id, household_id, items, plan["targets"])
+    if result["kind"] != "ok":
+        send_message(chat_id, result["message"], reply_markup=INVENTORY_KEYBOARD)
+        return True
+
+    pending_cleanup_notice.pop(chat_id, None)
+    payload = {
+        "add_shopping_items": [], "add_inventory_items": [],
+        "consume_changes": result["consume_changes"], "inventory_merge_targets": [],
+        "new_expenses": [], "new_expense": None, "delete_expense": None, "expense_notes": [],
+    }
+    return _handle_household_router_result(chat_id, "ok", payload, household_id, user_db_id, origin, keyboard)
+
+
+# =========================
 # ACTIVE LIST CONTEXT ROUTING STABILIZATION V1 — a narrow, deterministic
 # command route for the small set of shapes that should be interpreted
 # WITHIN the currently open saved shopping/inventory list context
@@ -7087,6 +7309,7 @@ def _try_handle_confirm_or_cancel(chat_id, user_id, display_name, text):
 # callback is a lambda-forward to one of the thin wrapper functions above,
 # same patch.object(bot, ...) reasoning as every other callback container.
 _command_route_deps = message_dispatcher.CommandRouteDeps(
+    inventory_multi_target_route=lambda *a, **kw: _try_inventory_multi_target(*a, **kw),
     active_list_context_route=lambda *a, **kw: _route_active_list_context_command(*a, **kw),
     quantity_price_informational_route=lambda *a, **kw: _route_quantity_price_informational_question(*a, **kw),
     quantity_price_clarification_route=lambda *a, **kw: _route_quantity_price_clarification(*a, **kw),
@@ -7887,6 +8110,14 @@ action_planner.configure(sys.modules[__name__])
 # action_planner.py above — see shopping_action_planner.py's own docstring
 # for why these stay three independent planners.
 shopping_action_planner.configure(sys.modules[__name__])
+
+# Wire inventory_multi_target.py's dependency (only call_gemini) the same
+# way — it never imports bot.py either (see its module docstring). A
+# separate module from action_planner.py/mini_action_planner.py/shopping_
+# action_planner.py above — see inventory_multi_target.py's own docstring
+# for why this stays its own narrow planner (2-10-target batch commands
+# only, never a single target).
+inventory_multi_target.configure(sys.modules[__name__])
 
 # Wire voice_transcript_normalizer.py's dependency (only call_gemini) the
 # same way — it never imports bot.py either (see its module docstring).
